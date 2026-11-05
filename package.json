@@ -1,0 +1,30 @@
+{
+  "name": "skill-observer",
+  "version": "0.1.0",
+  "author": "Razunter",
+  "description": "OMP extension: turns a session's skill signals into reviewable skill proposals via /observe.",
+  "license": "(MIT AND CC-BY-4.0)",
+  "type": "module",
+  "files": [
+    "src/",
+    "docs/",
+    "observer.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "omp": {
+    "extensions": ["./src/skill-observer.ts"]
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && vitest run"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0"
+  }
+}
