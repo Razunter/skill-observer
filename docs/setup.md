@@ -7,19 +7,20 @@
 - [OMP](https://github.com/can1357/oh-my-pi), with a configured model and an interactive main session for `/observe` and its approval questions.
 - Skills installed where the extension can identify them. User skills are read from `~/.agents/skills/`, managed skills from the active OMP agent directory, and enabled user-scope plugin skills from OMP's plugin registry. Project skills and project-scoped plugins have unknown provenance. See [skill provenance](observation.md#observe).
 - The `omp` executable on `PATH` for pattern-rule replay. If it cannot run, pattern rules are deferred; ordinary skill edits and on-read amendments remain available.
+- Git on `PATH` to install from the repository.
 
 There are no runtime npm packages to install and no build step. Keep `package.json`, `src/`, and `observer.md` together. The extension reads `observer.md` when an observation pass starts.
 
-## Load once
+## Install from Git
 
-The extension is not published on npm. Clone this repository with `git clone` using its clone URL, then open a shell at the checkout root:
+Run from your project directory:
 
 ```sh
-omp --version
-omp -e "$PWD"
+omp install https://github.com/Razunter/skill-observer.git
+omp
 ```
 
-OMP loads `src/skill-observer.ts` through the package's `omp.extensions` entry. For a checkout inside a larger repository, run these commands from the directory containing this extension's `package.json`.
+OMP installs and enables the package for your user. New sessions load `src/skill-observer.ts` through the package's `omp.extensions` entry, with no manual clone or configuration entry. If OMP is already running, restart it to load the extension. Git installs are user-scoped, not project-scoped.
 
 In the interactive OMP session, enter:
 
@@ -27,7 +28,7 @@ In the interactive OMP session, enter:
 /observe
 ```
 
-With a fresh session and no signals, skills, or stale amendments, it reports `No skill signals in this session: nothing to observe.` and starts no model turn. That response also confirms that the command loaded. No status hint in a quiet session is expected.
+With no signals, skills, or stale amendments in a fresh session, it reports `No skill signals in this session: nothing to observe.` and starts no model turn. This confirms the command loaded. A quiet session has no status hint.
 
 After working with a skill and correcting the agent, run `/observe` again. You can add your own focus or feedback:
 
@@ -35,13 +36,24 @@ After working with a skill and correcting the agent, run `/observe` again. You c
 /observe Focus on the upstream skills I corrected in this session.
 ```
 
-A note starts a normal model turn even without other signals. The extension reports `Observation pass started` with the signal, skill, and stale-amendment counts. The model reviews the evidence and offers eligible changes with previews and Apply, Later, or Decline choices. A note is not evidence that a mistake occurred, so a pass can finish without proposals. See [the observation workflow](observation.md).
+A note starts a normal model turn without other signals. The extension reports `Observation pass started` with the signal, skill, and stale-amendment counts. The model reviews the evidence and previews eligible changes with Apply, Later, or Decline choices. A note is not evidence of a mistake, so a pass can finish without proposals. See [the observation workflow](observation.md).
 
-There is no extension-managed download, service startup, or readiness queue. OMP loads the source in its own process. An observation pass uses the session's model and can incur its normal model-provider charges. Rule replay launches short-lived `omp ttsr test` processes; there is no background daemon to stop after OMP exits.
+OMP loads the source in its own process, with no extension-managed download, service startup, or readiness queue. A pass uses the session's model and can incur normal provider charges. Rule replay launches short-lived `omp ttsr test` processes. No background daemon remains after OMP exits.
+
+## Load once
+
+To try a checkout without installing it, clone this repository with `git clone`, then run from the directory containing the extension's `package.json`:
+
+```sh
+omp --version
+omp -e "$PWD"
+```
+
+This also applies to a checkout inside a larger repository. The extension is not published on npm.
 
 ## Load persistently
 
-Add the checkout directory to the `extensions` list in the active profile's OMP configuration. The default user file is `~/.omp/agent/config.yml`. Named profiles use `~/.omp/profiles/<name>/agent/config.yml`; an agent-directory override changes the default-profile location.
+Add the checkout directory to `extensions` in the active profile's OMP configuration. The default user file is `~/.omp/agent/config.yml`; named profiles use `~/.omp/profiles/<name>/agent/config.yml`. An agent-directory override changes the default-profile location.
 
 For example, for a checkout at `~/src/skill-observer`:
 
@@ -50,15 +62,17 @@ extensions:
   - ~/src/skill-observer
 ```
 
-Use your actual checkout path and preserve any other entries already in the list. OMP settings layers replace extension arrays rather than appending them. A project can instead list the extension in its `.omp/config.yml`.
+Use your checkout path and preserve existing entries. OMP settings layers replace extension arrays rather than append to them. A project can instead list the extension in `.omp/config.yml`.
 
-Restart OMP after adding a new extension path. You can then launch from your project's directory without passing `-e`. The directory OMP is working in defines the scope of project-fix proposals; loading the extension does not change that directory.
+Restart OMP after adding the path. You can then launch from your project without `-e`. OMP's working directory defines project-fix scope; loading the extension does not change it.
 
 ### Enable or disable in OMP
 
-The YAML configuration above loads the extension but does not add it to the installed OMP dashboard's catalog. Use `disabledExtensions` below for that setup.
+For a Git installation, use `omp plugin disable skill-observer` or `omp plugin enable skill-observer`, then restart OMP. The controls below apply to checkout loading.
 
-For dashboard control, instead place the checkout, or a symlink to it, at `<agent dir>/extensions/skill-observer`. The default-profile location is `~/.omp/agent/extensions/skill-observer`; use the active profile's agent directory if it differs. Remove the checkout's YAML `extensions` entry when switching to this discovery route, then restart OMP.
+The YAML configuration loads the extension without adding it to OMP's dashboard catalog. Use `disabledExtensions` below to control that setup.
+
+For dashboard control, place the checkout or a symlink at `<agent dir>/extensions/skill-observer`. The default is `~/.omp/agent/extensions/skill-observer`; other profiles use their active agent directory. Remove the checkout's YAML `extensions` entry, then restart OMP.
 
 Open `/extensions`, select the `skill-observer` extension module, and use Space or Enter to toggle it. The dashboard saves the enabled state. It controls discovered entries; it does not clone or install this repository.
 
@@ -69,7 +83,7 @@ disabledExtensions:
   - extension-module:skill-observer
 ```
 
-Preserve other disabled IDs. A module already loaded in the running session can be suspended or resumed when these settings change. If it was excluded at startup, enabling it requires a fresh OMP launch. Explicit-only `--no-extensions -e ...` sessions ignore these settings controls, and explicitly configured file paths bypass the name filter. Use the package directory, rather than its entry file, for the persistent setup above.
+Preserve other disabled IDs. Settings changes can suspend or resume an already loaded module. A module excluded at startup needs a fresh OMP launch when enabled. Explicit-only `--no-extensions -e ...` sessions ignore these controls; explicitly configured file paths bypass the name filter. Use the package directory, not its entry file, for persistent loading.
 
 Restart OMP to load source edits. `observer.md` is read on each `/observe`, so edits to those instructions affect the next pass without restarting.
 
@@ -87,6 +101,6 @@ Use each source project's installation instructions. OMP must be able to discove
 
 The extension stores its ledger, on-read amendments, and reference files under the active OMP agent directory's `skill-observer/` directory. Pattern amendments and barrier rules live in the agent directory's `rules/`. Skill decisions are shared across projects in that profile; project decisions are scoped to the canonical OMP working directory.
 
-Loading can migrate marked legacy observer rules to the current layout. This is separate from approving new proposals. Upstream skill updates leave separately stored amendments intact; the next `/observe` checks whether those amendments are stale. On-read amendment delivery requires this extension to stay loaded, including in later sessions.
+Loading can migrate marked legacy observer rules to the current layout, separately from proposal approval. Upstream updates preserve separately stored amendments; the next `/observe` checks for staleness. On-read delivery requires the extension to stay loaded in later sessions.
 
 See [amendment storage, delivery, and migration](amendments.md) and [ledger and approval details](development.md#ledger).

@@ -2,22 +2,22 @@
 
 An [OMP](https://github.com/can1357/oh-my-pi) extension for adjusting upstream skills without editing their installed files.
 
-Your adjustments live in separate **amendments**, so skill updates do not overwrite them. The extension delivers these alongside the skill when you invoke it with `/skill:<name>` or the agent reads its `SKILL.md`.
+Your adjustments live in separate **amendments** that survive skill updates. The extension delivers them when you invoke `/skill:<name>` or the agent reads the skill's `SKILL.md`.
 
-Run `/observe` to review session corrections and proposed fixes. When an upstream skill changes, the next `/observe` also reviews whether its amendments still apply. It can also propose improvements to local skills and project checks.
+Run `/observe` to review session corrections and proposed fixes. After an upstream skill changes, the next `/observe` checks whether its amendments still apply. It can also propose local skill improvements and project checks.
 
 **Status:** vibe-coded experiment.
 
 ## Requirements and first run
 
-Requires [OMP](https://github.com/can1357/oh-my-pi) with a configured model. Clone this repository with `git clone`, then run from the checkout root:
+Requires [OMP](https://github.com/can1357/oh-my-pi) with a configured model and Git on `PATH`. Install from the repository, then start OMP in your project:
 
 ```sh
-omp --version
-omp -e "$PWD"
+omp install https://github.com/Razunter/skill-observer.git
+omp
 ```
 
-The extension is not published on npm. No runtime npm packages or build step are needed. See [setup](docs/setup.md) for persistent loading, OMP's `/extensions` controls, and state locations.
+OMP installs and enables the extension for your user; no manual clone or configuration entry is needed. The extension is not published on npm and needs no runtime npm packages or build step. See [setup](docs/setup.md) for checkout loading, OMP's `/extensions` controls, and state locations.
 
 ## Use it
 
@@ -27,7 +27,7 @@ After working with a skill and correcting the agent, enter:
 /observe
 ```
 
-The model reviews the session evidence and offers proposed changes with previews and **Apply**, **Later**, or **Decline** choices. In a fresh session with nothing to review, the command reports that and starts no model turn.
+The model reviews session evidence and previews proposed changes with **Apply**, **Later**, or **Decline** choices. With nothing to review in a fresh session, the command reports that and starts no model turn.
 
 You can add feedback or a focus:
 
@@ -35,7 +35,7 @@ You can add feedback or a focus:
 /observe Focus on the upstream skills I corrected in this session.
 ```
 
-A note starts a review even without other signals, but the pass can finish without proposals if the evidence does not support a change. Observation runs only when you request it, not automatically at session exit.
+A note starts a review without other signals, but the pass can finish without proposals if evidence does not support a change. Observation runs only on request, never automatically at session exit.
 
 To see what the extension knows about the current branch without starting a review, enter:
 
@@ -43,14 +43,14 @@ To see what the extension knows about the current branch without starting a revi
 /observe-report
 ```
 
-It lists signal counts, loaded skills, remedy outcomes of applied fixes, stale amendments, the estimated size of the next `/observe` pass and the Later count. It calls no model and writes nothing.
+It lists signal counts, loaded skills, remedy outcomes of applied fixes, stale amendments, the next `/observe` pass's estimated size, and the Later count. It calls no model and writes nothing.
 
 ### Optional remote skills
 
 - [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, adds retrospective guidance for project-environment findings.
-- [`correct`](https://github.com/cursor/plugins/blob/main/harness/pstack/claude-code/skills/correct/SKILL.md), from Lauren Tan's pstack, can be offered as `/skill:correct` for a mistake class evidenced at least twice. Only you may invoke it; observer approval does not launch its repairs or authorize commits.
+- [`correct`](https://github.com/cursor/plugins/blob/main/harness/pstack/claude-code/skills/correct/SKILL.md), from Lauren Tan's pstack, can be offered as `/skill:correct` after at least two evidenced occurrences of a mistake class. Only you may invoke it; observer approval neither launches its repairs nor authorizes commits.
 
-These skills are installed separately. Ordinary observation remains usable without them. See [optional references](docs/observation.md#optional-references) for their behavior and [setup](docs/setup.md#optional-remote-skills) for source links.
+Install these skills separately. Ordinary observation works without them. See [optional references](docs/observation.md#optional-references) for their behavior and [setup](docs/setup.md#optional-remote-skills) for source links.
 
 ## Defaults and limits
 

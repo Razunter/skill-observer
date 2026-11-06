@@ -1,6 +1,6 @@
 {
   "name": "skill-observer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Razunter",
   "description": "OMP extension: turns a session's skill signals into reviewable skill proposals via /observe.",
   "license": "(MIT AND CC-BY-4.0)",
