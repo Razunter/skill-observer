@@ -234,13 +234,12 @@ const entryLine = (record: LedgerRecord) =>
   `- \`${record.kind === "project" ? record.target.path : record.skill}\` (${record.kind}), fingerprint \`${record.fingerprint}\`${record.kind === "project" ? `, mechanism ${JSON.stringify(record.target.mechanism)}` : ""}: ${record.gist}`;
 
 /**
- * The ledger part of the `/observe` message: declined proposals to suppress
- * and deferred ones to re-offer. Compactions are left out: an amendment over
- * the size limit is offered again from Rules in force.
+ * The ledger part of the `/observe` message: deferred proposals to re-offer.
+ * Declines are left out because Prepare already drops a scoped decline;
+ * compactions too, as an amendment over the size limit is offered again from
+ * Rules in force.
  */
 export function renderLedger(records: readonly LedgerRecord[]): string {
-  const list = (lines: string[]) => (lines.length > 0 ? lines.join("\n") : "None.");
-  const byOutcome = (outcome: ProposalOutcome) =>
-    list(records.filter((record) => record.outcome === outcome && !record.compaction).map(entryLine));
-  return ["## Proposal ledger", "", "### Declined", "", byOutcome("declined"), "", "### Later", "", byOutcome("later")].join("\n");
+  const later = records.filter((record) => record.outcome === "later" && !record.compaction).map(entryLine);
+  return ["## Proposal ledger", "", "### Later", "", later.length > 0 ? later.join("\n") : "None."].join("\n");
 }

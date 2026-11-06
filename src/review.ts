@@ -256,7 +256,8 @@ export function proposalRefSchema(z: SchemaBuilder) {
   return z.object({ reviewToolCallId: z.string(), candidateId: z.string(), contentHash: z.string() });
 }
 
-async function rankingModelUnavailable(pi: ExtensionAPI, ctx: ExtensionContext): Promise<string | undefined> {
+/** Why advisory ranking can't run on this host, or `undefined` when an explicit, available judge role assignment permits it. */
+export async function rankingModelUnavailable(pi: ExtensionAPI, ctx: ExtensionContext): Promise<string | undefined> {
   try {
     const host = pi.pi;
     if (!host?.settings?.getModelRole || !host.resolveScopedModels || !ctx.modelRegistry?.getAvailable) return "host explicit judge configuration or model resolution is unavailable";

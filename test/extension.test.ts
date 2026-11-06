@@ -26,6 +26,7 @@ import type {
 } from "../src/omp.js";
 import type { PatternDraft } from "../src/replay.js";
 import * as amendments from "../src/amendments.js";
+import { type Gate, INSTRUCTIONS_PATH, parseFragments } from "../src/payload.js";
 import { entries as fx } from "./fixtures.js";
 import { CE_PLUGIN, installPlugin, makeSkillHome, uninstallPlugin, writeSkill } from "./skill-home.js";
 
@@ -55,9 +56,10 @@ afterEach(() => {
 
 /**
  * Loads the extension against a fake OMP host whose home directory is a temp
- * skill home, and records what it shows and sends.
+ * skill home, and records what it shows and sends. The host has an explicit,
+ * available judge role unless `judge` is false.
  */
-function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" } = {}) {
+function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; judge?: boolean } = {}) {
   const skillHome = makeSkillHome();
   mkdirSync(skillHome.roots.cwd, { recursive: true });
   vi.stubEnv("HOME", skillHome.home);
@@ -92,7 +94,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" } 
     },
     zod,
     pi: {
-      settings: { getModelRole: (role) => role === "judge" ? "fixture/explicit-judge" : undefined },
+      settings: { getModelRole: (role) => role === "judge" && options.judge !== false ? "fixture/explicit-judge" : undefined },
       resolveScopedModels: async () => [{ model: { provider: "fixture", id: "explicit-judge" } }],
     },
   };
@@ -481,19 +483,32 @@ describe("/observe", () => {
 });
 
 describe("retrospective availability", () => {
-  it("discloses an unavailable retro reference while keeping normal observation usable", async () => {
+  const RETRO_BODY = "Look for missing checks, unclear docs and slow tools.";
+  const retroBranches = [
+    ["a workflow outline", fx.skillLessTurn, true],
+    ["a tool error", fx.skillTurnToolError, true],
+    ["only a correction", [...fx.plainUserMessage, ...fx.steeringUserMessage], false],
+  ] as const;
+
+  it.each(retroBranches)("with %s, discloses an unavailable retro reference only under the project gate, keeping normal observation usable", async (_label, branch, projectGate) => {
     const host = loadExtension();
-    host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
-    await host.runCommand("observe", "Review the existing project check");
-    expect(host.noticeEvents).toContainEqual({ type: "warning", message: expect.stringMatching(/retro.*unavailable/i) });
-    expect(host.sent).toHaveLength(1);
+    host.setBranch([...branch]);
+    await host.runCommand("observe");
+    const warned = host.noticeEvents.some((notice) => notice.type === "warning" && /retro.*unavailable/i.test(notice.message));
+    expect(warned).toBe(projectGate);
+    expect(String(host.sent[0]?.message.content).includes("## Retrospective reference")).toBe(projectGate);
     expect(host.activeTools()).toContain("observer_resolve");
   });
 
-  it("uses an installed retrospective reference without adding a separate pass", async () => {
+  it.each(retroBranches)("with %s, inlines the installed retro body without its frontmatter only under the project gate", async (_label, branch, projectGate) => {
     const host = loadExtension();
-    writeSkill(join(host.skillHome.roots.skillsDir, "retro"), "retro");
-    await host.runCommand("observe", "Review project navigation");
+    mkdirSync(join(host.skillHome.roots.skillsDir, "retro"), { recursive: true });
+    writeFileSync(join(host.skillHome.roots.skillsDir, "retro", "SKILL.md"), `---\nname: retro\ndescription: Run a retrospective.\ndisable-model-invocation: true\n---\n\n${RETRO_BODY}\n`);
+    host.setBranch([...branch]);
+    await host.runCommand("observe");
+    const content = String(host.sent[0]?.message.content);
+    expect(content.includes(RETRO_BODY)).toBe(projectGate);
+    expect(content).not.toContain("description: Run a retrospective.");
     expect(host.noticeEvents.filter((notice) => notice.type === "warning")).toEqual([]);
     expect(host.sent).toHaveLength(1);
   });
@@ -1763,7 +1778,7 @@ describe("observer_resolve", () => {
     mkdirSync(dirname(host.ledgerFile), { recursive: true });
     writeFileSync(host.ledgerFile, '{"fingerprint":"0123456789ab","skill":"tdd","outc');
     await host.callTool("observer_resolve", {
-      outcomes: [outcome("deploy-notes", "new", "Draft release notes from the jj log.", "declined")],
+      outcomes: [outcome("deploy-notes", "new", "Draft release notes from the jj log.", "later")],
     });
 
     host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
@@ -1785,11 +1800,11 @@ describe("project proposal decisions", () => {
     mkdirSync(a); mkdirSync(b);
     host.setCwd(a);
     await host.callTool("observer_resolve", { outcomes: [
-      { ...projectAnswer(a), gist: "Project A check." },
-      outcome("tdd", "upstream", "Global check.", "declined"),
+      { ...projectAnswer(a, "package.json", "later"), gist: "Project A check." },
+      outcome("tdd", "upstream", "Global check.", "later"),
     ] });
     host.setCwd(b);
-    await host.callTool("observer_resolve", { outcomes: [{ ...projectAnswer(b), gist: "Project B check." }] });
+    await host.callTool("observer_resolve", { outcomes: [{ ...projectAnswer(b, "package.json", "later"), gist: "Project B check." }] });
     await host.runCommand("observe", "Review checks");
     const message = String(host.sent[0]?.message.content);
     expect(message).toContain("Project B check.");
@@ -2142,7 +2157,7 @@ describe("/observe with answers from earlier passes", () => {
     expect(skillEntry(content, "implement-spec")).toContain("Run the typecheck before each commit.");
     const inForce = ledgerList(content, RULES_IN_FORCE);
     expect(inForce).not.toMatch(/jj-no-git-commit|Name the workspace|Read the spec|Ask one question/);
-    expect(ledgerList(content, "Declined")).toContain("Read the spec before the tickets.");
+    expect(content).not.toContain("Read the spec before the tickets.");
     expect(ledgerList(content, "Later")).toContain("Ask one question at a time.");
   });
 
@@ -2272,7 +2287,7 @@ describe("/observe with answers from earlier passes", () => {
     }
   });
 
-  it("lists declined proposals to suppress and deferred ones to re-offer, and leaves out applied ones for skills this session didn't load", async () => {
+  it("lists deferred proposals to re-offer, and leaves out declined ones and applied ones for skills this session didn't load", async () => {
     const host = loadExtension();
     await host.callTool("observer_resolve", {
       outcomes: [
@@ -2283,9 +2298,8 @@ describe("/observe with answers from earlier passes", () => {
     });
 
     const content = await observe(host);
-    const [declined, deferred] = ledgerRecords(host.ledgerFile);
-    expect(ledgerList(content, "Declined")).toContain("Draft release notes from the jj log.");
-    expect(ledgerList(content, "Declined")).toContain(String(declined?.fingerprint));
+    const [, deferred] = ledgerRecords(host.ledgerFile);
+    expect(content).not.toContain("Draft release notes from the jj log.");
     expect(ledgerList(content, "Later")).toContain("Run the typecheck before each commit.");
     expect(ledgerList(content, "Later")).toContain(String(deferred?.fingerprint));
     expect(content).not.toContain("Ask one question at a time.");
@@ -2307,7 +2321,6 @@ describe("/observe with answers from earlier passes", () => {
     });
 
     const content = await observe(host);
-    expect(ledgerList(content, "Declined")).not.toContain("Name the seam");
     expect(ledgerList(content, "Later")).toContain("Name the seam before the first test.");
     expect(content).not.toContain("Run the typecheck before each commit.");
   });
@@ -2329,7 +2342,7 @@ describe("/observe with answers from earlier passes", () => {
 
     const content = await observe(host);
     expect(ledgerList(content, "Later")).not.toContain("typecheck");
-    expect(ledgerList(content, "Declined")).toContain("Typecheck before committing.");
+    expect(content).not.toContain("Typecheck before committing.");
   });
 
   it("leaves out an applied fix whose rule file was deleted by other means, without writing to the ledger", async () => {
@@ -2362,7 +2375,7 @@ describe("/observe with answers from earlier passes", () => {
     expect(handWritten).not.toContain("tdd-amendment");
   });
 
-  it("lists a withdrawn fix neither as in force nor as a Later or Declined entry", async () => {
+  it("lists a withdrawn fix neither as in force nor as a Later entry", async () => {
     const host = loadExtension();
     splitAmendment(host, "tdd", "tdd-afk-seams");
     const [applied] = ledgerRecords(host.ledgerFile);
@@ -3133,7 +3146,7 @@ describe("compacting on-read amendments", () => {
     expect(ruleLine(await observe(host, tddLoaded), "tdd-amendment")).toContain(MARK);
   });
 
-  it("lists compaction records neither as fixes in force nor as Later or Declined entries", async () => {
+  it("lists compaction records neither as fixes in force nor as Later entries", async () => {
     const host = loadExtension();
     for (const skill of ["tdd", "domain-modeling", "grill-with-docs"]) {
       await addOnReadFix(host, skill, `First fix of ${skill}.`, section("First", 100));
@@ -4749,3 +4762,71 @@ function textOf(entries: SessionEntry[]): string {
   if (typeof content === "string") return content;
   return (content ?? []).map((block) => block.text ?? "").join("");
 }
+
+describe("evidence-gated instructions", () => {
+  const fragments = parseFragments(readFileSync(INSTRUCTIONS_PATH, "utf8"));
+  /** A correction with `tdd` (upstream) loaded: no gate's evidence. */
+  const base = [...fx.plainUserMessage, ...fx.steeringUserMessage, ...fx.skillUrlRead];
+  type Evidence = { branch: SessionEntry[]; note?: string };
+  type Setup = (host: ReturnType<typeof loadExtension>) => Evidence | Promise<Evidence>;
+  /** An on-read amendment of `skill` with no fix of the ledger in force under it. */
+  const amendmentWithoutFix = (host: ReturnType<typeof loadExtension>, skill: string) => {
+    splitAmendment(host, skill, `${skill}-amendment`);
+    rmSync(host.ledgerFile);
+  };
+  const appliedManagedEdit = (host: ReturnType<typeof loadExtension>) =>
+    host.callTool("observer_resolve", { outcomes: [outcome("implement-spec", "managed", "Run the typecheck before each commit.", "applied")] });
+
+  const table: Array<[string, Gate[], Setup, Setup, { judge?: boolean }?]> = [
+    ["stale: an amendment whose skill changed since its pin", ["stale"],
+      (host) => { splitAmendment(host, "domain-modeling", "dm-terms"); changeSkillFile(host, "domain-modeling"); return { branch: base }; },
+      (host) => { splitAmendment(host, "domain-modeling", "dm-terms"); return { branch: base }; }],
+    ["compaction: a loaded upstream skill with an on-read amendment", ["compaction"],
+      (host) => { amendmentWithoutFix(host, "tdd"); return { branch: base }; },
+      (host) => { amendmentWithoutFix(host, "grill-with-docs"); return { branch: base }; }],
+    ["project: a workflow outline", ["project"], () => ({ branch: [...base, ...fx.skillLessTurn] }), () => ({ branch: base })],
+    ["project: a tool error", ["project"], () => ({ branch: [...base, ...fx.skillTurnToolError] }), () => ({ branch: base })],
+    ["withdrawal: a fix in force for a loaded skill", ["withdrawal"],
+      async (host) => { await appliedManagedEdit(host); return { branch: [...base, ...fx.skillPromptManaged] }; },
+      () => ({ branch: [...base, ...fx.skillPromptManaged] })],
+    ["note and withdrawal: a User note", ["note", "withdrawal"], () => ({ branch: base, note: "tdd should name the seam first" }), () => ({ branch: base })],
+    ["ranking: an explicit, available judge role", ["ranking"], () => ({ branch: base }), () => ({ branch: base }), { judge: false }],
+  ];
+
+  /** The fragments of `observer.md` the payload `/observe` sends with `setup`'s evidence holds. */
+  async function present(setup: Setup, options?: { judge?: boolean }) {
+    const host = loadExtension(options);
+    const { branch, note = "" } = await setup(host);
+    host.setBranch(branch);
+    await host.runCommand("observe", note);
+    const content = String(host.sent[0]?.message.content);
+    return new Set(fragments.filter(({ text }) => content.includes(text)));
+  }
+
+  it.each(table)("%s turns on exactly its gated fragments", async (_label, gates, on, off, offOptions) => {
+    // Each host points HOME and the agent dir at its own temp home, so the two assemblies run one after the other.
+    const withEvidence = await present(on);
+    const without = await present(off, offOptions);
+    const gated = fragments.filter(({ gate }) => gate !== undefined && gates.includes(gate));
+    expect(gated.length).toBeGreaterThan(0);
+    for (const assembly of [withEvidence, without]) {
+      expect(fragments.filter(({ gate }) => gate === undefined).every((fragment) => assembly.has(fragment))).toBe(true);
+      expect([...assembly].filter(({ gate }) => gate === "tool-result")).toEqual([]);
+    }
+    expect([...withEvidence].filter((fragment) => !without.has(fragment))).toEqual(gated);
+    expect([...without].filter((fragment) => !withEvidence.has(fragment))).toEqual([]);
+  });
+
+  it("notifies the pass start with the payload estimate of each non-empty section", async () => {
+    const host = loadExtension();
+    host.setBranch(base);
+    await host.runCommand("observe");
+    const content = String(host.sent[0]?.message.content);
+    const notice = host.notices.at(-1) ?? "";
+    const [, total = "", list = ""] = /^Observation pass started: 1 signal\(s\), 1 loaded skill\(s\), 0 stale amendment\(s\); payload ≈ (\d+) tokens \((.*); chars\/4 estimate\)\.$/.exec(notice) ?? [];
+    const sections = list.split(", ").map((entry) => entry.split(" "));
+    expect(sections.map(([name]) => name)).toEqual(["instructions", "digest", "ledger", "rules-in-force"]);
+    expect(sections.reduce((sum, [, tokens]) => sum + Number(tokens), 0)).toBe(Number(total));
+    expect(Math.abs(Number(total) - content.length / 4)).toBeLessThanOrEqual(sections.length);
+  });
+});

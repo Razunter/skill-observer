@@ -77,7 +77,7 @@ Restart OMP to load source edits. `observer.md` is read on each `/observe`, so e
 
 These skills are installed separately, not downloaded or bundled by skill-observer:
 
-- [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, provides retrospective guidance for session-backed project-environment findings. Without it, `/observe` warns and continues ordinary observation.
+- [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, provides retrospective guidance for session-backed project-environment findings. Without it, a pass whose session has a workflow outline or tool error warns and continues ordinary observation.
 - [`correct`](https://github.com/cursor/plugins/blob/main/harness/pstack/claude-code/skills/correct/SKILL.md), from Lauren Tan's pstack, can be offered as `/skill:correct` after at least two distinct occurrences of the same mistake class. Only you may invoke it. Observer approval does not invoke it or authorize its repairs or commits.
 - [`writing-for-agents`](https://github.com/mattpocock/skills), from Matt Pocock's skills, is the drafting reference for agent-facing guidance. If it is unavailable, the pass discloses that and uses its inline drafting checks.
 

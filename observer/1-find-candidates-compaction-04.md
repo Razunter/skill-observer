@@ -1,0 +1,1 @@
+**Compaction.** An on-read amendment whose line says `over the compaction limit` is a compaction candidate. So is one whose body will be over 4,000 characters once this pass's on-read fixes for its skill are appended.

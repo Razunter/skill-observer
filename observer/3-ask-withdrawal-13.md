@@ -1,0 +1,1 @@
+A withdrawal's question names the fix, its skill and why it is taken back. Its options are **Apply**, whose `preview` is the prepared withdrawal's `preview` unchanged (the rule file deleted, or the amendment's new body, and the reference files written and deleted), and **Decline**, which keeps the fix in force.

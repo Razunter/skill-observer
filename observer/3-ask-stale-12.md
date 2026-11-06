@@ -1,0 +1,1 @@
+A stale amendment's question names the rule and the skill it amends. Its options are **Keep**, then **Update** and **Delete** for each of the proposal's `alternatives`, whose `preview` is that alternative's `preview` unchanged.

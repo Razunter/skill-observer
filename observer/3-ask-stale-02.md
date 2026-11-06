@@ -1,0 +1,1 @@
+- `stale-update` with the `rule` name, new `body` and, when they change, the complete `references`; `stale-delete` with the `rule` name. For a stale amendment you ask about, send both: Prepare joins them into one stale proposal;

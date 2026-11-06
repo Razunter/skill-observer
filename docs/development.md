@@ -49,7 +49,7 @@ One call's changes run in fixed phases across every skill it names: stale answer
 
 Rule, amendment and reference file changes and the ledger append are separate writes; no call is a transaction. When the append fails, the call still returns what it carried out, and `recording` says, for each record in order, whether it reached the ledger: `recorded`, `unrecorded` or `unknown`, with the error. The append reads the ledger once beforehand; a failure before it starts writing leaves every record `unrecorded`. After a failed write, one read of the file settles each record: one written whole (its JSON complete, with or without its newline) is `recorded`, one cut short or not reached is `unrecorded`, and when the file can't be read or no longer starts with its earlier bytes followed by a prefix of the append, every record is `unknown`. The exception alone settles nothing. An applied change whose record didn't reach the ledger is an Unrecorded publication: the result lists it as made, never as `later`, and tells the pass to report it and leave the ledger to the user, without calling again or redoing it. A `later` or `declined` record that didn't reach the ledger, answered so or deferred by the replay or coverage check, is listed apart: it wrote nothing and keeps its outcome, unrecorded. Nothing is retried, repaired or replayed at startup.
 
-`/observe` adds the ledger to its message: declined proposals, which the pass drops, and deferred ones, which it offers again, each with its fingerprint. A withdrawn fix appears in neither list, and neither does a compaction.
+`/observe` adds the ledger to its message: deferred proposals, which the pass offers again, each with its fingerprint. Declined proposals are left out because Prepare already drops a scoped decline. A withdrawn fix is not listed, and neither is a compaction.
 
 ### Project-local decisions
 
@@ -83,19 +83,41 @@ bun run typecheck
 
 This runs ordinary tests without launching the native OMP checks. See [Testing](#testing) for explicit native checks.
 
+### Instruction fragments
+
+[`observer.md`](../observer.md) is the one maintained source of the pass instructions. Gate markers in it name the evidence a part needs (see [Observation payload](observation.md#observation-payload)):
+
+```md
+<!-- when: stale -->
+- **Stale amendment**: pick your verdict. …
+<!-- end -->
+```
+
+A marker sits alone on its line and wraps whole paragraphs or whole list items, never part of a sentence or item. Gates are `stale`, `compaction`, `project`, `withdrawal`, `ranking`, `note` and `tool-result`; blocks don't nest. One parser, `parseFragments` in [`src/payload.ts`](../src/payload.ts), splits the file at its `##` headings and markers and throws on an unknown gate, an unbalanced or nested marker, or a block that splits a paragraph or list item. `/observe` runs it on every pass, so a malformed marker stops the pass with an error notice.
+
+After editing `observer.md`, regenerate the committed fragment files:
+
+```sh
+bun run generate
+```
+
+It writes `observer/<section>-<gate|core>-<n>.md`, one file per fragment, where `n` is the fragment's position in its section, so a reader can browse the gated parts. `/observe` assembles from `observer.md` itself, not from these files, so an approved edit to `observer.md` applies to the next pass without regenerating. A test in `test/payload.test.ts` regenerates the files in memory and fails when `observer/` differs.
+
 ### Package a local tarball
 
 ```sh
 bun pm pack
 ```
 
-Run this from the source checkout's extension root. It creates `skill-observer-0.1.0.tgz` using the `files` allowlist in `package.json`: runtime source, `observer.md`, reader documentation, the licence and third-party notices, the README, and changelog. It excludes tests, development configuration, and installed dependencies. Packing creates a local archive for distribution checks; it does not publish the package. Normal setup uses a Git checkout.
+Run this from the source checkout's extension root. It creates `skill-observer-0.1.0.tgz` using the `files` allowlist in `package.json`: runtime source, `observer.md` and its generated `observer/` fragments, reader documentation, the licence and third-party notices, the README, and changelog. It excludes tests, development configuration, and installed dependencies. Packing creates a local archive for distribution checks; it does not publish the package. Normal setup uses a Git checkout.
 
 ### Modules
 
 | File | Owns |
 | --- | --- |
-| [`src/skill-observer.ts`](../src/skill-observer.ts) | Entry: wires hooks, the status hint, `/observe` and the startup migration |
+| [`src/skill-observer.ts`](../src/skill-observer.ts) | Entry: wires hooks, the status hint, `/observe` with its observation payload assembly and the startup migration |
+| [`src/payload.ts`](../src/payload.ts) | Observation payload: the `observer.md` fragment parser, gates from pass evidence, gated instruction text, `tool-result` guidance and the chars/4 payload estimate |
+| [`scripts/generate-fragments.ts`](../scripts/generate-fragments.ts) | `bun run generate`: writes `observer/` from `observer.md` |
 | [`src/delivery.ts`](../src/delivery.ts) | On-read amendment delivery on both routes (`/skill:` reminder, `read` of the entry file) and the once-per-context-window rule |
 | [`src/reminder.ts`](../src/reminder.ts) | Delivery records: reminder markup, reminder message type, delivery entry type and their parsers |
 | [`src/amendments.ts`](../src/amendments.ts) | Observer rule files in both directories: reading, writing, pins, staleness and the load-time migration |

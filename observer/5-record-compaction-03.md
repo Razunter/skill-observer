@@ -1,0 +1,1 @@
+- `compactions`: one entry per compaction you asked about: the skill and the answer (`applied`, `later` or `declined`). An applied compaction carries the `approval` of its prepared compaction, the same way, and no `includes`, `body` or `references`: its prepared `includes`, body and reference files are what is written.

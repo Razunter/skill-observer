@@ -1,0 +1,1 @@
+- `withdrawal` of the applied fix named by the candidate's `fingerprint`, with the fix's skill, kind and recorded gist, and for a fix inside the on-read amendment the whole new `body` without it, empty when nothing else is left (and the complete `references`, when the fix's text sits in a reference file);

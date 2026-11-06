@@ -1,0 +1,1 @@
+- **Stale amendment**: pick your verdict. Keep, when the rule still adds what the updated skill lacks; update, with the rewritten body, when the rule still helps but no longer fits the skill; delete, when the updated skill covers or contradicts it, or the skill is no longer installed as an upstream or plugin skill.

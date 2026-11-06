@@ -1,0 +1,7 @@
+Successful `ask`, `observer_review`, `edit`, `write`, `manage_skill` and `bash` outputs during this pass include a JSON metadata block, `{"observerToolCallId":"<actual opaque host ID>"}`. Copy that exact value into the publication receipt or approval; a file snapshot tag such as `58EB`, command text, or a session-entry ID is not a tool-call ID. This metadata identifies the call only: the resolver independently checks its target, result, ordering and current file hash.
+
+Nested `eval` calls of `edit`, `write`, `bash` and `manage_skill` use the same native tools and IDs; the observer persists their hook-observed call/result pairs on the branch rather than inferring receipts from eval output. The review `ask` is the exception: call it directly, never through `eval`, since a nested Ask approves nothing and the user would have to answer the same questions again. A multi-file edit can support each included target when every edited path remains inside this project. Foreground Bash options may spell an absent service name as `null`; a named service is still ineligible.
+
+`observer_resolve` writes every rule that passes its replay check and carries out stale answers, in step 5.
+
+Done when every applied direct edit has an observed successful write and every applied project repair has observed target-specific verification, restored temporary inputs, actual write/check IDs and a current target SHA-256. Later, Decline and unanswered proposals leave target bytes unchanged.

@@ -26,13 +26,45 @@ A skill's line also names the on-read amendments delivered for it in this sessio
 
 Text after the command, as in `/observe tdd should run the one failing test first`, goes into the pass as a **User note** ahead of the digest: feedback the digest can't show, or a steer such as a skill to focus on. The model weighs each change it names like a correction-class signal. A note starts a pass even in a session without signals.
 
-With no note, no signals, no loaded skills and no stale amendments, `/observe` says so and starts no turn. Otherwise it sends one hidden message that starts a normal turn: the observer instructions (`observer.md`), the user note, the digest, the proposal ledger, the rules in force and the stale amendments. The model asks about at most 5 proposals, stale amendments it would update or delete, and compactions in one main `ask` batch (Apply / Later / Decline, or Keep / Update / Delete, with a preview), ranked stale amendments first, then User note points, then correction-class signals and repeats, then compactions. Each proposal fixes one mechanism, so a candidate that bundles two independent fixes is asked as two. Each proposal's question cites its evidence: the ids of the digest signals it rests on with their `(×N)` counts and a short exact quote, or `User note`, a Later entry's fingerprint or a stale amendment's rule. A barrier rule is asked about only once its pattern has passed the replay check (see [Replay](amendments.md#replay)), and its preview shows the rule, its scope and its samples. The model applies approved edits to local skills directly and to managed or new skills through `manage_skill`, then records every answer with `observer_resolve`, which also writes every rule: amendment rules for upstream skills and barrier rules for local and managed ones. `observer_resolve` and `observer_check` join the model's tools at the session's first `/observe`. [`observer.md`](../observer.md) is read on every run, so it is a local proposal target too. If an answer in the main batch retracts an applied fix, the pass prepares and selects its withdrawal, then asks about it in a separate follow-up `ask` in the same pass. See [Proposal approval](development.md#proposal-approval) and [Ledger](development.md#ledger) for the approval and recording rules.
+With no note, no signals, no loaded skills and no stale amendments, `/observe` says so and starts no turn. Otherwise it sends one hidden message, the [observation payload](#observation-payload), that starts a normal turn. The model asks about at most 5 proposals, stale amendments it would update or delete, and compactions in one main `ask` batch (Apply / Later / Decline, or Keep / Update / Delete, with a preview), ranked stale amendments first, then User note points, then correction-class signals and repeats, then compactions. Each proposal fixes one mechanism, so a candidate that bundles two independent fixes is asked as two. Each proposal's question cites its evidence: the ids of the digest signals it rests on with their `(×N)` counts and a short exact quote, or `User note`, a Later entry's fingerprint or a stale amendment's rule. A barrier rule is asked about only once its pattern has passed the replay check (see [Replay](amendments.md#replay)), and its preview shows the rule, its scope and its samples. The model applies approved edits to local skills directly and to managed or new skills through `manage_skill`, then records every answer with `observer_resolve`, which also writes every rule: amendment rules for upstream skills and barrier rules for local and managed ones. `observer_resolve` and `observer_check` join the model's tools at the session's first `/observe`. [`observer.md`](../observer.md) is read on every run, so it is a local proposal target too. If an answer in the main batch retracts an applied fix, the pass prepares and selects its withdrawal, then asks about it in a separate follow-up `ask` in the same pass. See [Proposal approval](development.md#proposal-approval) and [Ledger](development.md#ledger) for the approval and recording rules.
+
+## Observation payload
+
+The message that starts a pass holds these sections, in this order, leaving out any without text:
+
+- **instructions**: the parts of [`observer.md`](../observer.md) the session's evidence can reach, then the path of `observer.md` and the skills, managed-skills, user rules, on-read amendments and reference files directories;
+- **note**: the User note;
+- **digest**: the [session digest](#digest);
+- **ledger**: the proposal ledger's Later entries;
+- **outcomes**: the remedy outcomes of applied fixes;
+- **rules-in-force**: the [rules in force](#rules-in-force);
+- **project**: Project scope and the Recurring mistake workflow, under the `project` gate;
+- **retro**: the Retrospective reference, under the `project` gate;
+- **stale**: the stale amendments, when there are any.
+
+`observer.md` is parsed on every run, so an approved edit to it applies to the next pass. Gate markers in it, `<!-- when: <gate> -->` and `<!-- end -->` on their own lines, wrap the paragraphs and list items only some passes need; the rest is always on. `/observe` decides each gate from evidence it already has, and no instruction asks the model to read more of them on demand:
+
+| Gate | On when | Covers |
+|---|---|---|
+| `stale` | an amendment is stale | finding, drafting, asking about and recording stale amendments |
+| `compaction` | a loaded upstream or plugin skill has an on-read amendment | compaction candidates, drafts, questions and records |
+| `project` | the digest has a workflow outline or a tool error | the retrospective branch, project remedies, project files and project outcomes; the project and retro sections |
+| `withdrawal` | a fix is in force for a loaded skill, or there is a User note | withdrawal candidates and questions, and retracted fixes |
+| `ranking` | the host has an explicit, available `judge` role assignment | advisory ranking and Select's `rankings`; without it the pass calls Select without rankings |
+| `note` | there is a User note | how to weigh the User note |
+| `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, and with a note on Apply |
+
+Under the `project` gate the Retrospective reference holds the installed `retro` skill's text inline, without its frontmatter, after one line saying which parts apply: its candidate categories do; its own steps and Files section describe a standalone retrospective and do not. Without `retro` the section says the reference is unavailable and the UI warns. Without the gate neither the section nor the warning appears.
+
+A malformed gate marker in `observer.md` stops `/observe` with an error notice; no pass starts.
+
+The pass-start notice estimates the payload's size by section, as in `Observation pass started: 1 signal(s), 1 loaded skill(s), 0 stale amendment(s); payload ≈ 5848 tokens (instructions 5702, digest 110, ledger 9, rules-in-force 27; chars/4 estimate).` Each section counts ⌈characters / 4⌉, so the figure is an estimate, not the model's token count. Only the sections the message holds are listed.
 
 ## Optional references
 
-The extension can use separately installed remote skills. The same pass reviews session-backed project-environment findings, even when a skill was loaded. It reads [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, as a conditional reference rather than launching a separate retrospective. If that reference is unavailable, the UI warns and ordinary observation remains usable. Quiet lifecycle events still only refresh the hint; they initiate no retrospective scan or model call.
+The extension can use separately installed remote skills. The same pass reviews session-backed project-environment findings, even when a skill was loaded. When the digest has a workflow outline or a tool error, the pass carries the installed [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, inline as its retrospective reference rather than launching a separate retrospective (see [Observation payload](#observation-payload)). If that reference is unavailable then, the UI warns and ordinary observation remains usable. Quiet lifecycle events still only refresh the hint; they initiate no retrospective scan or model call.
 
-When [`correct`](https://github.com/cursor/plugins/blob/main/harness/pstack/claude-code/skills/correct/SKILL.md), from Lauren Tan's pstack, is installed, the pass reads it as reference and, for at least two distinct occurrences of the same agent mistake class, may offer `/skill:correct` as a separate next action citing their occurrence IDs. This skill favors architecture changes, types and enforceable checks, then tests, with docs last. Only the user may invoke it. Apply/Later/Decline grant no remediation or commit. Without `correct`, the pass says so and offers nothing.
+When [`correct`](https://github.com/cursor/plugins/blob/main/harness/pstack/claude-code/skills/correct/SKILL.md), from Lauren Tan's pstack, is installed, a pass whose digest has a workflow outline or a tool error names it as reference and, for at least two distinct occurrences of the same agent mistake class, may offer `/skill:correct` as a separate next action citing their occurrence IDs. This skill favors architecture changes, types and enforceable checks, then tests, with docs last. Only the user may invoke it. Apply/Later/Decline grant no remediation or commit. Without `correct`, the pass says so and offers nothing.
 
 ## Remedy selection
 

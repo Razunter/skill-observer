@@ -3,12 +3,13 @@ import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import skillObserver from "../src/skill-observer.js";
 import type { CommandHandler, CustomMessage, ExtensionAPI, ExtensionContext, Schema } from "../src/omp.js";
+import { entries } from "./fixtures.js";
 import { makeSkillHome } from "./skill-home.js";
 
 const homes: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true }); });
 
-it.each([true, false])("discovers the existing user-only correct reference only when available: %s", async (available) => {
+it.each([true, false])("discovers the existing user-only correct reference in a pass with a workflow outline only when available: %s", async (available) => {
   const { home, roots } = makeSkillHome(); homes.push(home);
   mkdirSync(roots.cwd, { recursive: true });
   vi.stubEnv("HOME", home); vi.stubEnv("PI_CODING_AGENT_DIR", join(home, ".omp/agent"));
@@ -25,7 +26,7 @@ it.each([true, false])("discovers the existing user-only correct reference only 
     zod: Object.fromEntries(["object", "array", "string", "number", "enum", "union", "record", "unknown"].map(key => [key, () => schema])),
   } as unknown as ExtensionAPI;
   skillObserver(pi);
-  const ctx = { hasUI: true, cwd: roots.cwd, agent: { kind: "main" }, sessionManager: { getBranch: () => [] }, ui: { notify() {} } } as unknown as ExtensionContext;
+  const ctx = { hasUI: true, cwd: roots.cwd, agent: { kind: "main" }, sessionManager: { getBranch: () => entries.skillLessTurn }, ui: { notify() {} } } as unknown as ExtensionContext;
   await observe!("inspect recurring errors", ctx);
   expect(sent).toHaveLength(1);
   expect(String(sent[0]!.content).includes(path)).toBe(available);

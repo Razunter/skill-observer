@@ -1,0 +1,1 @@
+Done when every signal and relevant note point is either an evidence-backed candidate with one mechanism, exact target, scope, remedy and verification method, or dismissed with its reason; cross-source duplicates are merged, gaps are disclosed, and every Later entry, stale amendment and marked compaction is accounted for.

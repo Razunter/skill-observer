@@ -2,7 +2,7 @@
 
 ## Licence scope
 
-The original TypeScript implementation, tests, and project documentation are licensed under the [MIT licence](LICENSE). The adapted instructions in [`observer.md`](observer.md) are licensed under CC BY 4.0 as described below. The package's `(MIT AND CC-BY-4.0)` expression records these separate scopes; it does not offer MIT as an alternative licence for upstream material.
+The original TypeScript implementation, tests, and project documentation are licensed under the [MIT licence](LICENSE). The adapted instructions in [`observer.md`](observer.md), and the fragments generated from it in `observer/`, are licensed under CC BY 4.0 as described below. The package's `(MIT AND CC-BY-4.0)` expression records these separate scopes; it does not offer MIT as an alternative licence for upstream material.
 
 ## task-observer / One Skill to Rule Them All
 

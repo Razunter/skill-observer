@@ -1,0 +1,1 @@
+Each entry under **Stale amendments** is a candidate too: an amendment rule whose upstream or plugin skill's files changed since it was pinned, or whose skill is no longer an upstream or plugin skill. Read its rule file, and the skill file when the entry names one.

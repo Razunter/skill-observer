@@ -1,0 +1,1 @@
+- `compaction` with its `includes` (the on-read appends of this Prepare it covers, each by gist or fingerprint), compacted `body` and complete `references`.

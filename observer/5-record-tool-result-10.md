@@ -1,0 +1,1 @@
+**A failed cleanup.** When `observer_resolve` lists a deletion as carried out but its cleanup as failed, the rule file is gone and its outcome is listed with the others; only the skill's reference folder may be left behind. Don't call `observer_resolve` again for it: inspect the folder it names and report what is left with the error, for the user to remove.

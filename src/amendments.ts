@@ -81,7 +81,7 @@ const FRONTMATTER = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/;
 const foreignRule = (path: string) => new Error(`\`${path}\` was not written by skill-observer, so it was left untouched`);
 
 /** Frontmatter as `key: value` lines; double-quoted values are YAML/JSON strings. */
-function parseFrontmatter(text: string): { frontmatter: Record<string, string>; body: string } | undefined {
+export function parseFrontmatter(text: string): { frontmatter: Record<string, string>; body: string } | undefined {
   const match = FRONTMATTER.exec(text);
   if (!match) return undefined;
   const frontmatter: Record<string, string> = {};

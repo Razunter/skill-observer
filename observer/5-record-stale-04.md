@@ -1,0 +1,1 @@
+- `stale`: one entry per stale amendment you kept or asked about: its rule name and the action. `keep`, for each Keep verdict and each Keep answer, carries nothing else: Keep only re-pins. `update` and `delete` carry the `approval` of the stale proposal, whose question the user answered **Update** or **Delete**; no `body` or `references`.

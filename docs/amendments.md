@@ -77,7 +77,7 @@ Reference files live in `<agent dir>/skill-observer/references/<skill>/`, next t
 
 The resolver carries out the call's stale answers, withdrawals, and additions first. It writes an applied compaction only when every fix its prepared `includes` names was applied in the same call, every on-read fix the call applied for the skill is among them, and no stale update or delete or withdrawal in the call changed the amendment. Then it replaces the folder's contents with exactly the prepared files and, after that, the amendment's body, leaving the frontmatter, pin included, as it is. Otherwise it records the compaction as `later`, writes nothing for it, and says why. The next pass drafts it again from the body actually written.
 
-A compaction's fingerprint is the first 12 hex digits of the SHA-256 of `compaction`, the skill, and the SHA-256 of the amendment's body as Prepare read it. The approval holds that body unchanged until the call's own writes. A declined compaction suppresses that version of the body only. The amendment loses its mark until any change to its body brings the offer back. Compaction records are never fixes in force and never Later or Declined entries. See the [ledger reference](development.md#ledger).
+A compaction's fingerprint is the first 12 hex digits of the SHA-256 of `compaction`, the skill, and the SHA-256 of the amendment's body as Prepare read it. The approval holds that body unchanged until the call's own writes. A declined compaction suppresses that version of the body only. The amendment loses its mark until any change to its body brings the offer back. Compaction records are never fixes in force and never listed as Later entries. See the [ledger reference](development.md#ledger).
 
 ### Reference replacement and deletion
 

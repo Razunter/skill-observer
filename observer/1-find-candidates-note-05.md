@@ -1,0 +1,1 @@
+A **User note** ahead of the digest, when present, is text the user typed after `/observe`: feedback on a skill, a correction the digest missed, or a steer for this pass. Each point in it that names a change is a candidate, weighed like a correction-class signal; a steer, such as a skill to focus on, applies to the whole pass.
