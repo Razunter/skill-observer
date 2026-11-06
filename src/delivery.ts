@@ -12,7 +12,7 @@
  */
 
 import { type ObserverRule, readOnReadAmendments } from "./amendments.js";
-import type { CustomMessage, ExtensionAPI, SessionEntry, ToolResultEvent, ToolResultEventResult } from "./omp.js";
+import type { CustomMessage, ExtensionAPI, ExtensionContext, SessionEntry, ToolResultEvent, ToolResultEventResult } from "./omp.js";
 import { createProvenanceResolver, defaultSkillRoots, type ProvenanceResolver } from "./provenance.js";
 import { AMENDMENT_DELIVERY_TYPE, AMENDMENT_REMINDER_TYPE, amendmentDelivery, renderReminder } from "./reminder.js";
 import { sessionToolEvidence } from "./session-tool-evidence.js";
@@ -21,12 +21,12 @@ import { sessionToolEvidence } from "./session-tool-evidence.js";
 export function registerAmendmentDelivery(pi: ExtensionAPI, amendmentsDir: () => string): void {
   // Runs in every session, UI or not: a skill needs its amendments wherever it is loaded.
   pi.on("before_agent_start", (event, ctx) => {
-    const message = amendmentReminder(event.prompt, ctx.sessionManager.getBranch(), amendmentsDir());
+    const message = amendmentReminder(event.prompt, ctx, amendmentsDir());
     return message ? { message } : undefined;
   });
   pi.on("tool_result", (event, ctx) => {
     try {
-      return readDelivery(pi, event, ctx.sessionManager.getBranch(), amendmentsDir(), createProvenanceResolver(defaultSkillRoots(ctx.cwd)));
+      return readDelivery(pi, event, ctx, amendmentsDir(), createProvenanceResolver(defaultSkillRoots(ctx.cwd)));
     } catch (error) {
       // The read itself succeeded; a failed delivery must not turn it into an error.
       console.error("skill-observer: delivering on-read amendments failed:", error);
@@ -43,20 +43,22 @@ const INVOKED_SKILL = /^\[IMPORTANT: User invoked the "([^"]+)" skill;/gm;
 
 /**
  * The hidden reminder for a submitted prompt: the on-read amendments of every
- * skill it starts, less those already delivered. `undefined` when none are left.
+ * skill it starts, less those already delivered, with one notice per skill.
+ * `undefined` when none are left.
  */
-function amendmentReminder(prompt: string, branch: readonly SessionEntry[], amendmentsDir: string): CustomMessage | undefined {
+function amendmentReminder(prompt: string, ctx: ExtensionContext, amendmentsDir: string): CustomMessage | undefined {
   const skills = new Set(Array.from(prompt.matchAll(INVOKED_SKILL), (match) => match[1] ?? ""));
   if (skills.size === 0) return undefined;
-  const rules = undelivered(readOnReadAmendments(amendmentsDir).filter((rule) => skills.has(rule.amends)), branch);
+  const rules = undelivered(readOnReadAmendments(amendmentsDir).filter((rule) => skills.has(rule.amends)), ctx.sessionManager.getBranch());
   if (rules.length === 0) return undefined;
-  const sections = Array.from(skills).flatMap((skill) => {
+  const deliveries = Array.from(skills).flatMap((skill) => {
     const skillRules = rules.filter((rule) => rule.amends === skill);
-    return skillRules.length > 0 ? [renderReminder(skill, skillRules)] : [];
+    return skillRules.length > 0 ? [{ skill, rules: skillRules }] : [];
   });
+  for (const delivery of deliveries) notifyDelivery(ctx, delivery.skill, delivery.rules);
   return {
     customType: AMENDMENT_REMINDER_TYPE,
-    content: sections.join("\n\n"),
+    content: deliveries.map((delivery) => renderReminder(delivery.skill, delivery.rules)).join("\n\n"),
     display: false,
     attribution: "agent",
     details: { rules: rules.map((rule) => rule.name) },
@@ -83,7 +85,7 @@ function entrySkill(path: string, provenance: ProvenanceResolver): string | unde
 function readDelivery(
   pi: ExtensionAPI,
   event: ToolResultEvent,
-  branch: readonly SessionEntry[],
+  ctx: ExtensionContext,
   amendmentsDir: string,
   provenance: ProvenanceResolver,
 ): ToolResultEventResult | undefined {
@@ -91,13 +93,25 @@ function readDelivery(
   if (event.toolName !== "read" || event.isError || typeof path !== "string") return undefined;
   const skill = entrySkill(path, provenance);
   if (skill === undefined) return undefined;
+  const branch = ctx.sessionManager.getBranch();
   const rules = undelivered(readOnReadAmendments(amendmentsDir).filter((rule) => rule.amends === skill), branch);
   if (rules.length === 0) return undefined;
   pi.appendEntry(AMENDMENT_DELIVERY_TYPE, { skill, rules: rules.map((rule) => rule.name) });
+  notifyDelivery(ctx, skill, rules);
   const text = renderReminder(skill, rules);
   return sessionToolEvidence(branch).isNativeCall(event.toolCallId, event.toolName)
     ? { additionalContext: text }
     : { content: [...event.content, { type: "text", text }] };
+}
+
+/** Tells a user with a UI which on-read amendments of `skill` one delivery added; a failed notice is logged and leaves the delivery standing. */
+function notifyDelivery(ctx: ExtensionContext, skill: string, rules: readonly ObserverRule[]): void {
+  if (!ctx.hasUI) return;
+  try {
+    ctx.ui.notify(`On-read amendment for \`${skill}\`: ${rules.map((rule) => rule.name).join(", ")}`, "info");
+  } catch (error) {
+    console.error("skill-observer: notifying on-read amendment delivery failed:", error);
+  }
 }
 
 /** `rules` less those a reminder or a read delivery already put in the current context window. */

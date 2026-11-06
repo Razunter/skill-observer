@@ -4720,6 +4720,87 @@ describe("amendments for skills read with the read tool", () => {
   });
 });
 
+describe("delivery notices for on-read amendments", () => {
+  /** A host whose `tdd` skill carries two on-read amendments. */
+  function withTwoTddAmendments(options?: Parameters<typeof loadExtension>[0]) {
+    const host = loadExtension(options);
+    splitAmendment(host, "tdd", "tdd-afk-seams", { body: SEAMS });
+    splitAmendment(host, "tdd", "tdd-red", { body: RED });
+    host.setBranch(fx.plainUserMessage);
+    return host;
+  }
+  const deliveries = (host: ReturnType<typeof loadExtension>) =>
+    host.getBranch().filter((entry) => entry.customType === AMENDMENT_DELIVERY_TYPE).map((entry) => entry.data);
+  const namesBoth = (skill: string) => expect.stringMatching(new RegExp(`\`${skill}\`.*(tdd-afk-seams, tdd-red|tdd-red, tdd-afk-seams)`));
+
+  it("tells the user once per read delivery, naming every rule delivered, and not again within the context window", async () => {
+    const host = withTwoTddAmendments();
+
+    await readSkill(host, "skill://tdd");
+    expect(deliveries(host)).toEqual([{ skill: "tdd", rules: expect.arrayContaining(["tdd-afk-seams", "tdd-red"]) }]);
+    expect(host.noticeEvents).toEqual([{ message: namesBoth("tdd"), type: "info" }]);
+
+    const second = await readSkill(host, "skill://tdd");
+    expect(second.additionalContext).toBeUndefined();
+    expect(deliveries(host)).toHaveLength(1);
+    expect(host.noticeEvents).toHaveLength(1);
+  });
+
+  it("tells the user again when a /clear reset makes the read deliver again", async () => {
+    const host = withTwoTddAmendments();
+    await readSkill(host, "skill://tdd");
+    host.getBranch().push({ type: "reset_boundary", id: "reset-1" });
+
+    await readSkill(host, "skill://tdd");
+
+    expect(host.noticeEvents).toEqual([{ message: namesBoth("tdd"), type: "info" }, { message: namesBoth("tdd"), type: "info" }]);
+  });
+
+  /** A host whose `domain-modeling` skill carries two on-read amendments, for the `/skill:` route. */
+  function withTwoDomainModelingAmendments(options?: Parameters<typeof loadExtension>[0]) {
+    const host = loadExtension(options);
+    splitAmendment(host, "domain-modeling", "dm-define-terms", { body: "Define each term first." });
+    splitAmendment(host, "domain-modeling", "dm-record-adrs", { body: "Record each decision as an ADR." });
+    host.setBranch(fx.plainUserMessage);
+    return host;
+  }
+
+  it("tells the user once which rules a /skill: reminder carries", async () => {
+    const host = withTwoDomainModelingAmendments();
+
+    const [reminder] = await host.startAgent(String(fx.skillPromptUpstream[0]?.content));
+
+    expect(reminder).toMatchObject({ details: { rules: expect.arrayContaining(["dm-define-terms", "dm-record-adrs"]) } });
+    expect(host.noticeEvents).toEqual([{ message: expect.stringContaining("`domain-modeling`"), type: "info" }]);
+    expect(host.notices[0]).toContain("dm-define-terms");
+    expect(host.notices[0]).toContain("dm-record-adrs");
+  });
+
+  it("delivers on both routes without a notice in a session without UI", async () => {
+    const readHost = withTwoTddAmendments({ hasUI: false });
+    expect((await readSkill(readHost, "skill://tdd")).additionalContext).toContain(SEAMS);
+    expect(readHost.notices).toEqual([]);
+
+    const promptHost = withTwoDomainModelingAmendments({ hasUI: false });
+    expect(await promptHost.startAgent(String(fx.skillPromptUpstream[0]?.content))).toHaveLength(1);
+    expect(promptHost.notices).toEqual([]);
+  });
+
+  it("keeps the delivery and logs the error when the notice fails", async () => {
+    const host = withTwoTddAmendments();
+    vi.spyOn(host.notices, "push").mockImplementation(() => { throw new Error("notify failed"); });
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const result = await readSkill(host, "skill://tdd");
+
+    expect(result).toMatchObject({ isError: false });
+    expect(result.additionalContext).toContain(SEAMS);
+    expect(deliveries(host)).toHaveLength(1);
+    expect(logged).toHaveBeenCalledWith(expect.stringContaining("notifying on-read amendment delivery failed"), expect.anything());
+    logged.mockRestore();
+  });
+});
+
 /**
  * Rules the writer produces, checked by OMP's own TTSR engine: `omp ttsr test`
  * with the rule in isolation. Skipped where `omp` is not installed.
@@ -4963,6 +5044,9 @@ describe("/observe-report", () => {
     await readSkill(host, "skill://missing-skill", { isError: true });
     host.setBranch([...host.getBranch(), TEST_RUN, TEST_RESULT, ...fx.steeringUserMessage, ...fx.ruleViolationInterrupt, ...fx.askSingleCustomInput,
       ...fx.askSingleOffRecommended, ...fx.skillTurnToolError, ...fx.skillLessTurn, ...fx.managedSkillCreated] as SessionEntry[]);
+    // The tdd read's delivery notice belongs to the setup, not to the report.
+    host.notices.length = 0;
+    host.noticeEvents.length = 0;
     return host;
   }
 

@@ -11,6 +11,7 @@
 - `observer_resolve` records `reoffer` on `later` answers (ignored on others, refused when blank), and the proposal ledger in the `/observe` message shows it as `Re-offer when: …`.
 - New `/observe-report` command: a model-free evidence report of the current branch (signal counts and digest-cap drops, loaded and attempted skills, remedy outcomes, stale amendments, the next pass's payload estimate, the Later count). It starts no turn, activates no tool and writes nothing.
 - Remedy outcomes of project-environment fixes are no longer always `inconclusive`: a matching check that fails or runs clean after the fix's ledger record reports `recurrence` or `exercised-clean`.
+- On-read amendment delivery is visible: in a session with a UI, each delivery on either route shows an info notice, `` On-read amendment for `<skill>`: <rule>, … ``, naming every rule delivered.
 
 ## 0.1.0
 

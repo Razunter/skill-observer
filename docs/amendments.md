@@ -63,6 +63,8 @@ The extension delivers a skill's on-read amendments itself, by either route the 
 
 Each amendment goes out once per context window across both routes. A `/skill:` reminder suppresses a later read delivery and the other way round, until a compaction or a `/clear` reset drops the earlier one from the context. Barrier rules need no delivery, since they fire on the mistake however the skill was loaded. Delivery also runs in sessions without UI and in subagents. A subagent without the `read` tool gets no read delivery.
 
+In a session with a UI, each delivery shows one info notice per skill, `` On-read amendment for `<skill>`: <rule>, <rule> ``, naming every rule it delivered. A read delivery shows it after its `skill-observer-amendment-delivery` entry is saved; a `/skill:` reminder shows it as the reminder is added. A re-delivery after a compaction or `/clear` shows it again. Print, headless and subagent sessions show none. The notice adds no transcript line and no entry, and a failed notice is logged without touching the delivery or the read.
+
 ## Compaction and reference files
 
 An on-read amendment whose body is over 4,000 characters, about 1k tokens, is marked under **Rules in force** as over the compaction limit. Reference files don't count toward this limit. The pass proposes a **compaction** for it. The pass also proposes one for an amendment that this pass's on-read fixes would bring over the limit. The draft covers the body with all of this pass's on-read fixes for the skill appended. Its question names them by gist, or says 'none'.
