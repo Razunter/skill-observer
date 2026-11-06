@@ -29,6 +29,7 @@ import {
   type ProjectPublication,
   type ProjectLedgerRecord,
   type SkillLedgerRecord,
+  laterReoffer,
   PROPOSAL_KINDS,
   PROPOSAL_OUTCOMES,
   type ProposalOutcome,
@@ -50,6 +51,9 @@ import { proposalRefSchema } from "./review.js";
 
 export const RESOLVE_TOOL_NAME = "observer_resolve";
 
+const REOFFER_DESCRIPTION =
+  "`later` only, ignored otherwise; never blank. For a `later` this pass records itself: which observation would change the decision, when it could arrive, and whether the deferred action is still possible. For the user's **Later**: only the user's own note.";
+
 /** Where the tool writes; the extension entry resolves them from OMP's agent dir. */
 export interface ObserverFiles {
   ledgerFile(): string;
@@ -59,7 +63,7 @@ export interface ObserverFiles {
   referencesDir(): string;
 }
 
-export interface ProposalAnswer extends Pick<SkillLedgerRecord, "skill" | "kind" | "gist"> {
+export interface ProposalAnswer extends Pick<SkillLedgerRecord, "skill" | "kind" | "gist" | "reoffer"> {
   outcome: AnswerOutcome;
   fingerprint?: string;
   /** For an applied on-read fix, pattern amendment or barrier rule, or a withdrawal: where the user's approval of its prepared proposal is saved on the branch, and for a fix, the reconciliation whose content is written instead, if any. */
@@ -74,6 +78,7 @@ interface ProjectAnswer {
   outcome: ProposalOutcome;
   fingerprint?: string;
   evidence?: Evidence[];
+  reoffer?: string;
   publication?: ProjectPublication;
   rule?: never;
 }
@@ -131,7 +136,7 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
       answer.rule !== undefined || "skill" in answer) throw new Error("project answers need a gist and Apply/Later/Decline; they are not skill amendments");
   if (answer.outcome === "applied") checkProjectPublication(target, answer.publication, branch);
   return { kind: "project", target, fingerprint, gist: answer.gist, outcome: answer.outcome,
-    ...(answer.evidence && { evidence: answer.evidence }),
+    ...(answer.evidence && { evidence: answer.evidence }), ...laterReoffer(answer),
     ...(answer.outcome === "applied" && { publication: answer.publication }), timestamp, sessionId };
 }
 
@@ -177,6 +182,10 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
               )
               .optional()
               .describe("What the proposal rests on, as cited in its question."),
+            reoffer: z
+              .string()
+              .optional()
+              .describe(REOFFER_DESCRIPTION),
           }),
           z.object({
             kind: z.enum(["project"]),
@@ -190,6 +199,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             outcome: z.enum(PROPOSAL_OUTCOMES),
             fingerprint: z.string().optional(),
             evidence: z.array(z.object({ quote: z.string(), count: z.number(), occurrenceIds: z.array(z.string()).optional() })).optional(),
+            reoffer: z.string().optional().describe(REOFFER_DESCRIPTION),
             publication: z.object({
               writeToolCallId: z.string(),
               checkToolCallIds: z.array(z.string()),
@@ -256,6 +266,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             throw new Error("project identity cannot be submitted as a global skill answer");
           }
           const withdraws = answer.outcome === "withdrawn";
+          laterReoffer(answer); // refuses a blank `reoffer` before anything is written
           if ((answer.outcome === "applied" || withdraws) && "rule" in answer) {
             throw new Error("an applied or withdrawn answer carries `approval`, not a `rule`: what it writes or takes back is what its approved proposal holds");
           }

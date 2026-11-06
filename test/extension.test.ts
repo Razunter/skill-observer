@@ -4884,3 +4884,60 @@ describe("error-path guidance in tool results", () => {
     expect(whatToDoNow(result.content.map((block) => block.text).join("\n"))).toEqual(expected);
   });
 });
+
+describe("re-offer conditions on Later entries", () => {
+  const reoffer = "a second session where the agent runs the whole suite again, any day now; `tdd` is still installed";
+  const projectLater = (root: string) => ({
+    kind: "project", target: { scope: "project", root, path: "package.json", mechanism: "Wire the existing typecheck." },
+    gist: "Wire the existing typecheck.", outcome: "later",
+  });
+  function projectHost() {
+    const host = loadExtension();
+    const root = mkdtempSync(join(host.skillHome.home, "reoffer-project-"));
+    host.setCwd(root);
+    return { host, root };
+  }
+
+  it("records `reoffer` on a skill or project Later, and the next pass shows it under Later", async () => {
+    const { host, root } = projectHost();
+    const result = await resolve(host, [
+      { ...outcome("tdd", "upstream", "Run the one failing test first.", "later"), reoffer },
+      { ...projectLater(root), reoffer },
+      outcome("grill-with-docs", "local", "Ask one question at a time.", "later"),
+    ]);
+    expect(failures(result)).toEqual([]);
+    const byGist = new Map(ledgerRecords(host.ledgerFile).map((record) => [record.gist, record]));
+    expect(byGist.get("Run the one failing test first.")).toMatchObject({ outcome: "later", reoffer });
+    expect(byGist.get("Wire the existing typecheck.")).toMatchObject({ kind: "project", outcome: "later", reoffer });
+    expect(byGist.get("Ask one question at a time.")).not.toHaveProperty("reoffer");
+
+    await host.runCommand("observe", "Review the deferred proposals");
+    const message = String(host.sent[0]?.message.content);
+    expect(message).toContain(`: Run the one failing test first. Re-offer when: ${reoffer}\n`);
+    expect(message).toContain(`: Wire the existing typecheck. Re-offer when: ${reoffer}\n`);
+    expect(message).toMatch(/: Ask one question at a time\.$/m);
+  });
+
+  it("records an Applied or Declined answer without its `reoffer`", async () => {
+    const host = loadExtension();
+    const result = await resolve(host, [
+      { ...outcome("implement-spec", "managed", "Run the typecheck before each commit.", "applied"), reoffer },
+      { ...outcome("grill-with-docs", "local", "Ask one question at a time.", "declined"), reoffer },
+    ]);
+    expect(failures(result)).toEqual([]);
+    const records = ledgerRecords(host.ledgerFile);
+    expect(records.map((record) => record.outcome)).toEqual(["applied", "declined"]);
+    for (const record of records) expect(record).not.toHaveProperty("reoffer");
+  });
+
+  it.each(["", " \n\t"])("refuses a Later whose `reoffer` is blank (%j), recording nothing", async (blank) => {
+    const { host, root } = projectHost();
+    const result = await resolve(host, [
+      { ...outcome("tdd", "upstream", "Run the one failing test first.", "later"), reoffer: blank },
+      { ...projectLater(root), reoffer: blank },
+    ]);
+    expect(result.isError).toBe(true);
+    expect(failures(result)).toEqual([expect.stringContaining("`reoffer` is blank"), expect.stringContaining("`reoffer` is blank")]);
+    expect(result.details).toMatchObject({ records: [] });
+  });
+});

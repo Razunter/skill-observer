@@ -35,7 +35,7 @@ The message that starts a pass holds these sections, in this order, leaving out 
 - **instructions**: the parts of [`observer.md`](../observer.md) the session's evidence can reach, then the path of `observer.md` and the skills, managed-skills, user rules, on-read amendments and reference files directories;
 - **note**: the User note;
 - **digest**: the [session digest](#digest);
-- **ledger**: the proposal ledger's Later entries;
+- **ledger**: the proposal ledger's Later entries, each with its re-offer condition (`Re-offer when: …`) when its record has one;
 - **outcomes**: the remedy outcomes of applied fixes;
 - **rules-in-force**: the [rules in force](#rules-in-force);
 - **project**: Project scope and the Recurring mistake workflow, under the `project` gate;

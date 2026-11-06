@@ -31,7 +31,7 @@ import {
   skillAmendment,
   skillAmendmentFingerprint,
 } from "./amendments.js";
-import { IN_FORCE_OUTCOMES, type LedgerRecord, type ProposalKind, type SkillLedgerRecord, STALE_OUTCOMES } from "./ledger.js";
+import { IN_FORCE_OUTCOMES, laterReoffer, type LedgerRecord, type ProposalKind, type SkillLedgerRecord, STALE_OUTCOMES } from "./ledger.js";
 import type { SessionEntry } from "./omp.js";
 import type { ProvenanceResolver } from "./provenance.js";
 import { type ApprovalEvidence, approvedChange, type ApprovedChange, TargetChangedError } from "./proposal-approval.js";
@@ -317,6 +317,7 @@ function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[]
       outcome,
       ...(rule && { rule }),
       ...(evidence && evidence.length > 0 && { evidence }),
+      ...laterReoffer(answer),
       timestamp,
       sessionId,
     };

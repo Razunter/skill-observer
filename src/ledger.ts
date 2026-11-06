@@ -50,6 +50,8 @@ interface LedgerEntry {
   compaction?: true;
   /** What the proposal rests on, as cited in its question. */
   evidence?: Evidence[];
+  /** On a `later` only: which observation would change the decision, when it could arrive, and whether the deferred action is still possible. */
+  reoffer?: string;
   timestamp: string;
   experimentResult?: { requestId: string; reference: string; hash: string };
   sessionId: string;
@@ -230,8 +232,16 @@ export function readLedger(file: string): LedgerRecord[] {
 /** Outcomes that leave a fix applied: applied, or its amendment kept or re-pinned at a stale check. */
 export const IN_FORCE_OUTCOMES: ReadonlySet<LedgerOutcome> = new Set(["applied", "kept", "updated"]);
 
+/** An answer's `reoffer` as its record keeps it: only on `later`, and refused when blank. */
+export function laterReoffer({ outcome, reoffer }: { outcome: string; reoffer?: string }): { reoffer?: string } {
+  if (outcome !== "later" || reoffer === undefined) return {};
+  if (!reoffer.trim()) throw new Error("`reoffer` is blank: name the observation that would change the decision, or leave `reoffer` out");
+  return { reoffer };
+}
+
 const entryLine = (record: LedgerRecord) =>
-  `- \`${record.kind === "project" ? record.target.path : record.skill}\` (${record.kind}), fingerprint \`${record.fingerprint}\`${record.kind === "project" ? `, mechanism ${JSON.stringify(record.target.mechanism)}` : ""}: ${record.gist}`;
+  `- \`${record.kind === "project" ? record.target.path : record.skill}\` (${record.kind}), fingerprint \`${record.fingerprint}\`${record.kind === "project" ? `, mechanism ${JSON.stringify(record.target.mechanism)}` : ""}: ${record.gist}` +
+  (record.reoffer ? ` Re-offer when: ${record.reoffer}` : "");
 
 /**
  * The ledger part of the `/observe` message: deferred proposals to re-offer.
