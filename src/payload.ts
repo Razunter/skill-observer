@@ -161,6 +161,11 @@ export function toolResultGuidance(condition: ToolResultCondition): string {
   return fragment.text;
 }
 
+/** The `## What to do now` section a tool result ends with: the guidance of each condition, in the order given. */
+export function whatToDoNow(conditions: readonly ToolResultCondition[]): string {
+  return ["## What to do now", ...conditions.map((condition) => toolResultGuidance(condition))].join("\n\n");
+}
+
 export type PayloadSectionName = "instructions" | "note" | "digest" | "ledger" | "outcomes" | "rules-in-force" | "project" | "retro" | "stale";
 
 export interface PayloadSection {

@@ -83,6 +83,15 @@ const APPLY = "Apply";
 /** A stale amendment's question offers each prepared alternative under its own option. */
 const STALE_OPTIONS = { "stale-update": "Update", "stale-delete": "Delete" } as const;
 
+/** A target that no longer holds what its approved change was prepared against: the answer needs a reconciliation or a new Ask, not a corrected call. */
+export class TargetChangedError extends Error {}
+
+/** Whether an answer of the Ask `details` holds selects Apply with a note or custom input, which approves nothing until the main agent judges it. */
+export function hasQualifiedApply(details: AskDetails | undefined): boolean {
+  const answers = details?.results ?? (details ? [details] : []);
+  return answers.some((answer) => answer.selectedOptions?.includes(APPLY) && (Boolean(answer.note) || answer.customInput !== undefined));
+}
+
 /**
  * The branch position of the message that started the current observation
  * pass, or `undefined` when no pass is current: a prompt the user typed, a
@@ -271,13 +280,13 @@ function checkTarget(change: ApprovedChange, since: string): void {
     (change.operation === "on-read-append" && text?.includes(change.section)) ||
     (pin !== undefined && text !== undefined && sha256(text.replace(/^skillHash:.*$/m, () => frontmatterField("skillHash", pin))) === target.sha256);
   const what = change.operation === "on-read-append" || change.operation === "compaction" ? "on-read amendment" : "rule";
-  if (!holds) throw new Error(`the ${what} \`${target.path}\` changed since ${since}`);
+  if (!holds) throw new TargetChangedError(`the ${what} \`${target.path}\` changed since ${since}`);
   const references = "references" in change ? change.references : undefined;
   if (!references) return;
   const [referencesDir, skill] = [dirname(references.folder), basename(references.folder)];
   if (!isDeepStrictEqual(readReferenceFiles(referencesDir, skill).map((path) => snapshot(path)), references.before) ||
       hasUnlistedReferenceEntries(referencesDir, skill)) {
-    throw new Error(`the reference files in \`${references.folder}\` changed since ${since}`);
+    throw new TargetChangedError(`the reference files in \`${references.folder}\` changed since ${since}`);
   }
 }
 

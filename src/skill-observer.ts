@@ -28,7 +28,7 @@ import {
 } from "./digest.js";
 import { registerAmendmentDelivery } from "./delivery.js";
 import { ledgerForProject, readLedger, renderLedger } from "./ledger.js";
-import type { ExtensionAPI, ExtensionContext } from "./omp.js";
+import type { AskDetails, ExtensionAPI, ExtensionContext } from "./omp.js";
 import {
   createProvenanceResolver,
   defaultSkillRoots,
@@ -36,14 +36,14 @@ import {
   type ProvenanceResolver,
   type SkillRoots,
 } from "./provenance.js";
-import { activeGates, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate } from "./payload.js";
+import { activeGates, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate, whatToDoNow } from "./payload.js";
 import { CHECK_TOOL_NAME, registerCheckTool } from "./replay.js";
 import { RESOLVE_TOOL_NAME, registerResolveTool } from "./resolve.js";
 import { rankingModelUnavailable, registerReviewTool, REVIEW_TOOL_NAME } from "./review.js";
 import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
 import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
 import { recordHookCall, recordHookResult } from "./session-tool-evidence.js";
-import { observationPassStart } from "./proposal-approval.js";
+import { hasQualifiedApply, observationPassStart } from "./proposal-approval.js";
 
 const STATUS_KEY = "skill-observer";
 /** Global, not per project: feedback about global skills gathers in one place. */
@@ -194,9 +194,10 @@ export default function skillObserver(pi: ExtensionAPI): void {
     const isReceiptTool = ["write", "edit", "bash", "manage_skill", "ask", REVIEW_TOOL_NAME].includes(event.toolName);
     recordHookResult(pi, event, ctx.sessionManager.getBranch());
     if (event.isError || !isReceiptTool || observationPassStart(ctx.sessionManager.getBranch()) === undefined) return;
+    const guidance = event.toolName === "ask" && hasQualifiedApply(event.details as AskDetails | undefined) ? [{ type: "text", text: whatToDoNow(["apply-note"]) }] : [];
     // Opaque host IDs are absent from ordinary model-visible outputs; snapshot tags and commands cannot identify branch receipts.
     return {
-      content: [...event.content, { type: "text", text: JSON.stringify({ observerToolCallId: event.toolCallId }) }],
+      content: [...event.content, { type: "text", text: JSON.stringify({ observerToolCallId: event.toolCallId }) }, ...guidance],
       details: event.details,
       isError: event.isError,
     };

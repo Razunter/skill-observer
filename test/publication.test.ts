@@ -13,6 +13,7 @@ import { replaceReferenceFiles } from "../src/references.js";
 import { buildDigest } from "../src/digest.js";
 import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
 import { remedyOutcomes } from "../src/outcomes.js";
+import { toolResultGuidance } from "../src/payload.js";
 import { createProvenanceResolver, skillHash } from "../src/provenance.js";
 import { makeSkillHome } from "./skill-home.js";
 
@@ -297,6 +298,8 @@ it("reports an applied addition as an unrecorded publication, not later, when th
   const text = result.content.map((part) => part.text).join("\n");
   expect(text).toMatch(/Unrecorded publication[\s\S]*applied `tdd`/);
   expect(text).toContain("Don't call `observer_resolve` again for the outcomes below or redo their changes");
+  expect(text.split("## What to do now")).toHaveLength(2);
+  expect(text.endsWith(`\n## What to do now\n\n${toolResultGuidance("ledger-append-failed")}`)).toBe(true);
 });
 it.each([
   ["every row", Infinity, ["recorded", "recorded"], ["first", "second"]],
@@ -383,6 +386,8 @@ it.each(["withdrawal", "stale Delete"])("reports a %s that deleted the amendment
   const text = result.content.map((part) => part.text).join("\n");
   expect(text).toContain("inspect");
   expect(text).not.toContain("call again");
+  expect(text.split("## What to do now")).toHaveLength(2);
+  expect(text.endsWith(`\n## What to do now\n\n${toolResultGuidance("cleanup-failed")}`)).toBe(true);
 });
 
 /** An on-read amendment of `tdd` pinned to an outdated skill hash, its body and reference file rich in whitespace and CRLF line ends. */

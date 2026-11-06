@@ -52,9 +52,11 @@ The message that starts a pass holds these sections, in this order, leaving out 
 | `withdrawal` | a fix is in force for a loaded skill, or there is a User note | withdrawal candidates and questions, and retracted fixes |
 | `ranking` | the host has an explicit, available `judge` role assignment | advisory ranking and Select's `rankings`; without it the pass calls Select without rankings |
 | `note` | there is a User note | how to weigh the User note |
-| `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, and with a note on Apply |
+| `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, and with a note on Apply; see below |
 
 Under the `project` gate the Retrospective reference holds the installed `retro` skill's text inline, without its frontmatter, after one line saying which parts apply: its candidate categories do; its own steps and Files section describe a standalone retrospective and do not. Without `retro` the section says the reference is unavailable and the UI warns. Without the gate neither the section nor the warning appears.
+
+The `tool-result` paragraphs reach the model in the tool result that reports their condition, under a closing `## What to do now` heading. An `observer_resolve` result carries the paragraph for each condition it reports, once however many answers hit it: an answer not recorded because its rule, amendment or reference files changed since Prepare or the reconciliation, a failed ledger append, a failed cleanup. During a pass, an `ask` result in which the user selected **Apply** and added a note or custom input carries the note paragraph. A clean result, and a plain Apply, carry none.
 
 A malformed gate marker in `observer.md` stops `/observe` with an error notice; no pass starts.
 

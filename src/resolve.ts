@@ -44,7 +44,8 @@ import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
 import { checkProjectPublication } from "./project-publication.js";
-import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, type ProposalAnswerRef } from "./proposal-approval.js";
+import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
+import { type ToolResultCondition, whatToDoNow } from "./payload.js";
 import { proposalRefSchema } from "./review.js";
 
 export const RESOLVE_TOOL_NAME = "observer_resolve";
@@ -237,6 +238,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const ledger = files.ledgerFile();
       const records: LedgerRecord[] = [];
       const failures: string[] = [];
+      let targetChanged = false;
       const label = (answer: ProposalAnswer | ProjectAnswer) => `\`${answer.kind === "project" ? answer.target?.path : answer.skill}\` (${answer.gist})`;
       // The latest record per fingerprint wins: it holds the fix a withdrawal takes back, and the evidence an answer citing nothing keeps.
       const latest = new Map(readLedger(ledger).map((record) => [record.fingerprint, record]));
@@ -275,6 +277,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           claimed.set(fingerprint, answer.skill);
           return [checked];
         } catch (error) {
+          targetChanged ||= error instanceof TargetChangedError;
           failures.push(`${label(answer)}: ${(error as Error).message}`);
           return [];
         }
@@ -287,9 +290,11 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       // A cancelled call turns every replay into `unchecked`; nothing after this point waits, so stop before anything is written.
       signal?.throwIfAborted();
       // Approvals are checked again from the branch and the targets as they are now, with nothing awaited before the writes: during the replay wait the user may have spoken, the pass ended or a target changed. Any later change to a target is this call's own composition.
-      const { records: carriedOut, publications, failures: refused, cleanup, deferred, approvals } = transitions.resolve(verdicts, ctx.sessionManager.getBranch());
+      const resolution = transitions.resolve(verdicts, ctx.sessionManager.getBranch());
+      const { records: carriedOut, publications, failures: refused, cleanup, deferred, approvals } = resolution;
       records.push(...carriedOut);
       failures.push(...refused);
+      targetChanged ||= resolution.targetChanged;
 
       for (const record of records) {
         const carried = record.evidence ? undefined : latest.get(record.fingerprint)?.evidence;
@@ -354,6 +359,11 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         text.push("", `Not recorded, ${failures.length} answer(s); fix each and call again with only these:`);
         text.push(...failures.map((failure) => `- ${failure}`));
       }
+      const guidance: ToolResultCondition[] = [];
+      if (unsettled) guidance.push("ledger-append-failed");
+      if (cleanup.length > 0) guidance.push("cleanup-failed");
+      if (targetChanged) guidance.push("changed-target");
+      if (guidance.length > 0) text.push("", whatToDoNow(guidance));
       return {
         content: [{ type: "text", text: text.join("\n") }],
         details: { ledger, records, recording, failures, cleanup, deferred, approvals, publications },

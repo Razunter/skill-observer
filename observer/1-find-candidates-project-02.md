@@ -1,1 +1,1 @@
-For the retrospective branch, read the file under **Retrospective reference** when available.
+For the retrospective branch, use the reference inlined under **Retrospective reference** when available.

@@ -26,7 +26,7 @@ import type {
 } from "../src/omp.js";
 import type { PatternDraft } from "../src/replay.js";
 import * as amendments from "../src/amendments.js";
-import { type Gate, INSTRUCTIONS_PATH, parseFragments } from "../src/payload.js";
+import { type Gate, INSTRUCTIONS_PATH, parseFragments, type ToolResultCondition, toolResultGuidance } from "../src/payload.js";
 import { entries as fx } from "./fixtures.js";
 import { CE_PLUGIN, installPlugin, makeSkillHome, uninstallPlugin, writeSkill } from "./skill-home.js";
 
@@ -4828,5 +4828,59 @@ describe("evidence-gated instructions", () => {
     expect(sections.map(([name]) => name)).toEqual(["instructions", "digest", "ledger", "rules-in-force"]);
     expect(sections.reduce((sum, [, tokens]) => sum + Number(tokens), 0)).toBe(Number(total));
     expect(Math.abs(Number(total) - content.length / 4)).toBeLessThanOrEqual(sections.length);
+  });
+});
+
+describe("error-path guidance in tool results", () => {
+  const CONDITIONS: readonly ToolResultCondition[] = ["changed-target", "ledger-append-failed", "cleanup-failed", "apply-note"];
+  /** Each `## What to do now` section of `text`, as the conditions whose guidance paragraphs it holds, in order; any other paragraph stays text. */
+  const whatToDoNow = (text: string) => text.split("\n## What to do now\n\n").slice(1)
+    .map((section) => section.split("\n\n").map((paragraph) => CONDITIONS.find((condition) => toolResultGuidance(condition) === paragraph) ?? paragraph));
+
+  it.each<[string, number, (host: ReturnType<typeof loadExtension>) => Promise<Record<string, unknown>>]>([
+    ["two on-read appends", 2, async (host) => {
+      await addOnReadFix(host, "tdd", "Name the seam before the first test.", SEAMS);
+      const outcomes = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }, { gist: "Test one behaviour per test.", section: ONE_BEHAVIOUR }]);
+      appendFileSync(join(host.amendmentsDir, "tdd-amendment.md"), "\n## Mine\n\nThe user's own words.\n");
+      return { outcomes };
+    }],
+    ["a stale Delete, checked again as it is carried out,", 1, async (host) => {
+      splitAmendment(host, "tdd", "tdd-afk-seams");
+      changeSkillFile(host, "tdd");
+      const approved = await approveAll(host, { stale: [{ rule: "tdd-afk-seams", select: "Delete" }] });
+      appendFileSync(join(host.amendmentsDir, "tdd-afk-seams.md"), "\nThe user's unrelated line.\n");
+      return approved;
+    }],
+  ])("ends a resolve whose %s hit a changed target with the changed-target guidance once", async (_label, refused, changed) => {
+    const host = loadExtension();
+    const result = await host.callTool("observer_resolve", await changed(host));
+    expect(failures(result)).toEqual(Array.from({ length: refused }, () => expect.stringContaining("changed since Prepare")));
+    expect(whatToDoNow(resultText(result))).toEqual([["changed-target"]]);
+  });
+
+  it("adds no guidance to a clean resolve, nor to a refusal whose target did not change", async () => {
+    const host = loadExtension();
+    const clean = await addOnReadFix(host, "tdd", "Name the seam before the first test.", SEAMS);
+    const unclassified = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }],
+      () => ({ selectedOptions: ["Apply"], note: "Only in unit tests.", noteOption: "Apply" }));
+    const refused = await resolve(host, unclassified);
+    expect(failures(refused)).toEqual([expect.stringContaining("has not classified")]);
+    expect([whatToDoNow(resultText(clean)), whatToDoNow(resultText(refused))]).toEqual([[], []]);
+  });
+
+  it.each<[string, AskDetails, ToolResultCondition[][], boolean?]>([
+    ["Apply with a note", { selectedOptions: ["Apply"], note: "Thanks, this keeps biting me.", noteOption: "Apply" }, [["apply-note"]]],
+    ["a batch holding Apply with custom input and Apply with a note", { results: [
+      { id: "plain", ...APPLY }, { id: "custom", selectedOptions: ["Apply"], customInput: "Only for unit tests." }, { id: "noted", selectedOptions: ["Apply"], note: "Thanks." },
+    ] }, [["apply-note"]]],
+    ["a plain Apply", APPLY, []],
+    ["a note on Later", { selectedOptions: ["Later"], note: "Next week.", noteOption: "Later" }, []],
+    ["Apply with a note, outside a pass", { selectedOptions: ["Apply"], note: "Thanks.", noteOption: "Apply" }, [], false],
+  ])("gives an ask result answered with %s the apply-note guidance only during a pass and when an Apply carries a note or custom input", async (_label, details, expected, inPass = true) => {
+    const host = loadExtension();
+    if (inPass) startPass(host);
+    const result = await host.toolResult({ toolName: "ask", toolCallId: "ask-answered", content: [{ type: "text", text: "User answers" }], details, isError: false });
+    expect(result.content[0]).toEqual({ type: "text", text: "User answers" });
+    expect(whatToDoNow(result.content.map((block) => block.text).join("\n"))).toEqual(expected);
   });
 });

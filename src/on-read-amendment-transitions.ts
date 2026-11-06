@@ -34,7 +34,7 @@ import {
 import { IN_FORCE_OUTCOMES, type LedgerRecord, type ProposalKind, type SkillLedgerRecord, STALE_OUTCOMES } from "./ledger.js";
 import type { SessionEntry } from "./omp.js";
 import type { ProvenanceResolver } from "./provenance.js";
-import { type ApprovalEvidence, approvedChange, type ApprovedChange } from "./proposal-approval.js";
+import { type ApprovalEvidence, approvedChange, type ApprovedChange, TargetChangedError } from "./proposal-approval.js";
 import { type FixRule, publishFix } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, readReferenceFiles, type ReferenceFile, replaceReferenceFiles } from "./references.js";
 import { describeVerdict, type ReplayCase, type Verdict } from "./replay.js";
@@ -89,6 +89,8 @@ export interface AmendmentResolution {
   publications: Publication[];
   /** Answers that wrote and recorded nothing, each with the reason. */
   failures: string[];
+  /** Whether a failure is an approval whose target changed since it was prepared. */
+  targetChanged: boolean;
   /** Deletions carried out and recorded whose reference cleanup failed afterwards, each with what is left. */
   cleanup: string[];
   /** Applied answers recorded as `later` without writing, each with the reason. */
@@ -119,6 +121,7 @@ export interface AmendmentTransitions {
 export function onReadAmendmentTransitions(invocation: AmendmentInvocation, context: AmendmentContext): AmendmentTransitions {
   const { dirs, referencesDir, latest, provenance } = context;
   const failures: string[] = [];
+  let targetChanged = false;
   const prepared = invocation.answers.flatMap(({ answer, fingerprint, fix, withdrawal: change }): ScheduledAnswer[] => {
     if (!change) return [{ answer, fingerprint, fix }];
     try {
@@ -158,13 +161,14 @@ export function onReadAmendmentTransitions(invocation: AmendmentInvocation, cont
     try {
       return [compaction(answer, context.branch, dirs.amendmentsDir, provenance)];
     } catch (error) {
+      targetChanged ||= error instanceof TargetChangedError;
       failures.push(`compaction of \`${answer.skill}\`: ${(error as Error).message}`);
       return [];
     }
   });
   return {
     replays: answers.map(({ fix }) => fix?.replay),
-    resolve: (verdicts, branch) => carryOut({ answers, stale: invocation.stale, compactions, failures }, verdicts, branch, context),
+    resolve: (verdicts, branch) => carryOut({ answers, stale: invocation.stale, compactions, failures, targetChanged }, verdicts, branch, context),
   };
 }
 
@@ -182,6 +186,7 @@ interface Schedule {
   compactions: readonly Compaction[];
   /** Answers refused before anything was written. */
   failures: readonly string[];
+  targetChanged: boolean;
 }
 
 /**
@@ -192,12 +197,14 @@ interface Schedule {
 function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[], branch: readonly SessionEntry[], context: AmendmentContext): AmendmentResolution {
   const { dirs, referencesDir, latest, provenance, timestamp, sessionId } = context;
   const { answers, stale, compactions } = schedule;
-  const resolution: AmendmentResolution = { records: [], publications: [], failures: [...schedule.failures], cleanup: [], deferred: [], approvals: [] };
+  const resolution: AmendmentResolution = { records: [], publications: [], failures: [...schedule.failures], targetChanged: schedule.targetChanged, cleanup: [], deferred: [], approvals: [] };
   const { records, publications, failures, cleanup, deferred, approvals } = resolution;
+  // Every Error returned here becomes a failure below.
   const approvedNow = (answer: ProposalAnswer | StaleAnswer | CompactionAnswer) => {
     try {
       return approvedChange(answer, branch);
     } catch (error) {
+      resolution.targetChanged ||= error instanceof TargetChangedError;
       return error as Error;
     }
   };
