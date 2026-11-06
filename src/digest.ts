@@ -72,11 +72,24 @@ export interface DigestEnvironment {
   provenance: ProvenanceResolver;
 }
 
+/** A finished tool result outside an observation pass, which remedy outcomes compare with a fix's evidence. */
+export interface ToolExercise {
+  entryId: string;
+  tool: string;
+  /** The call's one string argument; empty when it had any other shape. */
+  args: string;
+  failed: boolean;
+  error?: string;
+  deliveredRules: string[];
+  /** When the result was saved; absent on an entry saved without a timestamp. */
+  at?: string;
+}
+
 export interface SessionDigest {
   /** Oldest first; a counted signal sits where it last occurred. */
   signals: SkillSignal[];
   skills: LoadedSkill[];
-  toolExercises?: Array<{ entryId: string; tool: string; args: string; failed: boolean; error?: string; deliveredRules: string[] }>;
+  toolExercises?: ToolExercise[];
   /** Reads requested, including failed and unresolved requests; never proof of loading. */
   attemptedSkills?: SkillProvenance[];
   /** Managed skills created with `manage_skill` in this session, by name. */
@@ -276,7 +289,7 @@ export function buildDigest(
 ): SessionDigest {
   entries = sessionToolEvidence(entries).digestEntries();
   const attemptedSkills = new Map<string, SkillProvenance>();
-  const toolExercises: NonNullable<SessionDigest["toolExercises"]> = [];
+  const toolExercises: ToolExercise[] = [];
   const skills = new Map<string, LoadedSkill>();
   const createdSkills = new Set<string>();
   // Keyed by identity; a repeat moves its signal to the end, where it last occurred.
@@ -434,7 +447,8 @@ export function buildDigest(
       if (call && !turn.observing && entry.id && !unfinished) {
         toolExercises.push({ entryId: entry.id, tool: call.name, args: call.exerciseArgs ?? "", failed: Boolean(message.isError),
           ...(message.isError ? { error: clip(textOf(message.content), ERROR_CHARS) } : {}),
-          deliveredRules: [...skills.values()].flatMap((skill) => skill.amendmentsDelivered ?? []) });
+          deliveredRules: [...skills.values()].flatMap((skill) => skill.amendmentsDelivered ?? []),
+          ...(entry.timestamp !== undefined && { at: entry.timestamp }) });
       }
       // A cancelled ask is an error result with empty details; it is no signal.
       const cancelledAsk =
@@ -523,12 +537,11 @@ function signalBody(signal: SkillSignal): string {
     case "ask-off-recommendation":
       return `Ask answered against the recommendation. Question: ${JSON.stringify(signal.question)} Recommended: ${JSON.stringify(signal.recommended)} Chosen: ${JSON.stringify(signal.selected.join(", "))}`;
     case "tool-error": {
-      const call = [`\`${signal.tool}\``, signal.args && JSON.stringify(signal.args)];
       const skills =
         signal.skills.length > 0
           ? `Skills loaded this turn: ${signal.skills.map((skill) => `\`${skill}\``).join(", ")}.`
           : "No skill loaded this turn.";
-      return `Tool error in ${call.filter(Boolean).join(" ")}: ${JSON.stringify(signal.error)} ${skills}`;
+      return `${toolErrorText(signal.tool, signal.args, signal.error)} ${skills}`;
     }
     case "workflow":
       return [
@@ -547,6 +560,15 @@ function renderSignal(signal: SkillSignal): string {
   return `${count}${signalBody(signal)}${occurrences}${before}`;
 }
 
+/**
+ * How the digest quotes a failed call, and so how a proposal's evidence quotes
+ * it: without `error`, the prefix that names the call alone.
+ */
+export function toolErrorText(tool: string, args: string, error?: string): string {
+  const call = [`\`${tool}\``, args && JSON.stringify(args)].filter(Boolean).join(" ");
+  return `Tool error in ${call}:${error === undefined ? "" : ` ${JSON.stringify(error)}`}`;
+}
+
 /** The rendered digest stays within this many tokens. */
 export const DIGEST_TOKEN_CAP = 12_000;
 /** Tokens are estimated from characters; exact tokenisation is not needed. */
@@ -561,6 +583,28 @@ const DROP_NOTE_CHARS = 120;
  * one, which the pass's proposals cite; ids hold only within one pass.
  */
 export function renderDigest(digest: SessionDigest, tokenCap = DIGEST_TOKEN_CAP): string {
+  const { head, bodies } = digestParts(digest);
+  if (bodies.length === 0) return `${head}\nNone.`;
+
+  const first = droppedCount(head, bodies, tokenCap);
+  const kept = bodies.slice(first).map((body, index) => `- S${index + 1}: ${body}`);
+  const dropped =
+    first > 0
+      ? [
+          `${first} older signal${first === 1 ? " was" : "s were"} dropped to keep the digest under its cap.`,
+          "",
+        ]
+      : [];
+  return [head, ...dropped, ...kept].join("\n");
+}
+
+/** How many of the oldest signals {@link renderDigest} leaves out to stay within `tokenCap`. */
+export function droppedSignalCount(digest: SessionDigest, tokenCap = DIGEST_TOKEN_CAP): number {
+  const { head, bodies } = digestParts(digest);
+  return droppedCount(head, bodies, tokenCap);
+}
+
+function digestParts(digest: SessionDigest): { head: string; bodies: string[] } {
   const skills = digest.skills.length > 0 ? digest.skills.map(renderSkill) : ["None."];
   const created =
     digest.createdSkills.length > 0
@@ -578,9 +622,11 @@ export function renderDigest(digest: SessionDigest, tokenCap = DIGEST_TOKEN_CAP)
     "### Signals",
     "",
   ].join("\n");
-  if (digest.signals.length === 0) return `${head}\nNone.`;
+  return { head, bodies: digest.signals.map(renderSignal) };
+}
 
-  const bodies = digest.signals.map(renderSignal);
+/** The newest bodies that fit after `head` are kept; the count of the older rest. */
+function droppedCount(head: string, bodies: readonly string[], tokenCap: number): number {
   const linePrefixChars = `- S${bodies.length}: `.length + 1;
   let room = tokenCap * CHARS_PER_TOKEN - head.length - DROP_NOTE_CHARS;
   let first = bodies.length;
@@ -588,14 +634,5 @@ export function renderDigest(digest: SessionDigest, tokenCap = DIGEST_TOKEN_CAP)
     first -= 1;
     room -= bodies[first]!.length + linePrefixChars;
   }
-
-  const kept = bodies.slice(first).map((body, index) => `- S${index + 1}: ${body}`);
-  const dropped =
-    first > 0
-      ? [
-          `${first} older signal${first === 1 ? " was" : "s were"} dropped to keep the digest under its cap.`,
-          "",
-        ]
-      : [];
-  return [head, ...dropped, ...kept].join("\n");
+  return first;
 }

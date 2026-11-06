@@ -117,7 +117,7 @@ Run this from the source checkout's extension root. It creates `skill-observer-0
 
 | File | Owns |
 | --- | --- |
-| [`src/skill-observer.ts`](../src/skill-observer.ts) | Entry: wires hooks, the status hint, `/observe` with its observation payload assembly and the startup migration |
+| [`src/skill-observer.ts`](../src/skill-observer.ts) | Entry: wires hooks, the status hint, `/observe` with its observation payload assembly, `/observe-report` and the startup migration |
 | [`src/payload.ts`](../src/payload.ts) | Observation payload: the `observer.md` fragment parser, gates from pass evidence, gated instruction text, `tool-result` guidance and the chars/4 payload estimate |
 | [`scripts/generate-fragments.ts`](../scripts/generate-fragments.ts) | `bun run generate`: writes `observer/` from `observer.md` |
 | [`src/delivery.ts`](../src/delivery.ts) | On-read amendment delivery on both routes (`/skill:` reminder, `read` of the entry file) and the once-per-context-window rule |
@@ -136,7 +136,8 @@ Run this from the source checkout's extension root. It creates `skill-observer-0
 | [`src/replay.ts`](../src/replay.ts) | `observer_check`: replays barrier-rule samples through `omp ttsr test` |
 | [`src/rules-in-force.ts`](../src/rules-in-force.ts) | The Rules in force section of the `/observe` message |
 | [`src/references.ts`](../src/references.ts) | Reference files of an on-read amendment and their atomic replacement |
-| [`src/outcomes.ts`](../src/outcomes.ts) | Remedy outcomes of applied fixes for the digest |
+| [`src/outcomes.ts`](../src/outcomes.ts) | Remedy outcomes of applied skill and project-environment fixes |
+| [`src/report.ts`](../src/report.ts) | The `/observe-report` evidence report and its rendering |
 | [`src/omp.ts`](../src/omp.ts) | The structural slice of OMP's extension API and session shapes |
 
 ### Testing

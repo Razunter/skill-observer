@@ -36,12 +36,13 @@ import {
   type ProvenanceResolver,
   type SkillRoots,
 } from "./provenance.js";
-import { activeGates, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate, whatToDoNow } from "./payload.js";
+import { activeGates, describePayloadEstimate, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate, whatToDoNow } from "./payload.js";
 import { CHECK_TOOL_NAME, registerCheckTool } from "./replay.js";
 import { RESOLVE_TOOL_NAME, registerResolveTool } from "./resolve.js";
 import { rankingModelUnavailable, registerReviewTool, REVIEW_TOOL_NAME } from "./review.js";
 import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
 import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
+import { evidenceReport, isEmptyEvidenceReport, renderEvidenceReport } from "./report.js";
 import { recordHookCall, recordHookResult } from "./session-tool-evidence.js";
 import { hasQualifiedApply, observationPassStart } from "./proposal-approval.js";
 
@@ -251,12 +252,31 @@ export default function skillObserver(pi: ExtensionAPI): void {
         { customType: OBSERVATION_MESSAGE_TYPE, content: payload.content, display: false, attribution: "user" },
         { triggerTurn: true, deliverAs: "followUp" },
       );
-      const { total, bySection } = payloadEstimate(payload.sections);
-      const estimate = Object.entries(bySection).map(([name, tokens]) => `${name} ${tokens}`).join(", ");
       ctx.ui.notify(
-        `Observation pass started: ${note ? "your note, " : ""}${digest.signals.length} signal(s), ${digest.skills.length} loaded skill(s), ${stale.length} stale amendment(s); payload ≈ ${total} tokens (${estimate}; chars/4 estimate).`,
+        `Observation pass started: ${note ? "your note, " : ""}${digest.signals.length} signal(s), ${digest.skills.length} loaded skill(s), ${stale.length} stale amendment(s); payload ${describePayloadEstimate(payloadEstimate(payload.sections))}.`,
         "info",
       );
+    },
+  });
+
+  pi.registerCommand("observe-report", {
+    description: "Show this branch's skill evidence and remedy outcomes without starting an observation pass",
+    handler: async (_args, ctx) => {
+      if (!isObservable(ctx)) return;
+      const roots = defaultSkillRoots(ctx.cwd);
+      const provenance = createProvenanceResolver(roots);
+      const digest = buildDigest(ctx.sessionManager.getBranch(), { provenance });
+      const stale = findStaleAmendments(ruleDirs(), provenance);
+      const report = evidenceReport({ digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale });
+      if (!isEmptyEvidenceReport(report)) {
+        try {
+          report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, roots, provenance })).sections);
+        } catch (error) {
+          ctx.ui.notify(`Evidence report not shown: ${error instanceof Error ? error.message : String(error)}`, "error");
+          return;
+        }
+      }
+      ctx.ui.notify(renderEvidenceReport(report), "info");
     },
   });
 }

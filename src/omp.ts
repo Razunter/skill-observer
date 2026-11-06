@@ -45,6 +45,8 @@ export interface SessionEntry {
   type: string;
   id?: string;
   parentId?: string | null;
+  /** When OMP saved the entry, as an ISO 8601 string. */
+  timestamp?: string;
   /** `message` entries. */
   message?: AgentMessage;
   /** `custom_message` entries. */

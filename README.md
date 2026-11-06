@@ -37,6 +37,14 @@ You can add feedback or a focus:
 
 A note starts a review even without other signals, but the pass can finish without proposals if the evidence does not support a change. Observation runs only when you request it, not automatically at session exit.
 
+To see what the extension knows about the current branch without starting a review, enter:
+
+```text
+/observe-report
+```
+
+It lists signal counts, loaded skills, remedy outcomes of applied fixes, stale amendments, the estimated size of the next `/observe` pass and the Later count. It calls no model and writes nothing.
+
 ### Optional remote skills
 
 - [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, adds retrospective guidance for project-environment findings.

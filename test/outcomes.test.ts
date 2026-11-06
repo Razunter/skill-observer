@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { remedyOutcomes } from "../src/outcomes.js";
-import { buildDigest, type SessionDigest } from "../src/digest.js";
+import { buildDigest, type SessionDigest, type ToolExercise } from "../src/digest.js";
 import type { LedgerRecord } from "../src/ledger.js";
 import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
 
@@ -42,5 +42,46 @@ describe("conservative remedy outcomes", () => {
   });
   it("does not count a command still running in the background as a clean exercise", () => {
     expect(remedyOutcomes([record], exercise({ async: { state: "running", jobId: "bg_1", type: "bash" } }))[0]?.status).toBe("delivered");
+  });
+});
+
+describe("project-environment remedy outcomes", () => {
+  const written = "2026-11-06T12:00:00.000Z";
+  const before = "2026-11-06T11:59:00.000Z";
+  const after = "2026-11-06T12:01:00.000Z";
+  const projectFix: LedgerRecord = {
+    fingerprint: "project-fix", gist: "Wire the existing typecheck.", outcome: "applied", kind: "project",
+    target: { scope: "project", root: "/repo", path: "package.json", mechanism: "Wire the existing typecheck." },
+    timestamp: written, sessionId: "fixture-session",
+    evidence: [{ quote: 'Tool error in `bash` "bun run typecheck": "tsc: command not found"', count: 1 }],
+  };
+  const check = { entryId: "check", tool: "bash", args: "bun run typecheck", failed: false, deliveredRules: [] };
+  const failing = { ...check, failed: true, error: "tsc: command not found" };
+  const status = (...toolExercises: ToolExercise[]) => remedyOutcomes([projectFix], { ...empty, toolExercises })[0]?.status;
+
+  it("reports recurrence when the quoted mechanism fails the same way after the fix was written", () => {
+    expect(status({ ...failing, at: after })).toBe("recurrence");
+  });
+  it("reports exercised-clean when the quoted mechanism succeeds after the fix was written", () => {
+    expect(status({ ...check, at: after })).toBe("exercised-clean");
+    expect(status({ ...check, args: "bun run lint", at: after })).toBe("inconclusive");
+  });
+  it("is inconclusive before any exercise, and never delivered", () => {
+    expect(status()).toBe("inconclusive");
+  });
+  it("counts neither an exercise saved before the fix nor one without a timestamp", () => {
+    expect(status({ ...failing, at: before }, { ...check, at: before })).toBe("inconclusive");
+    expect(status(failing, check)).toBe("inconclusive");
+  });
+  it("reads the exercise time from the saved tool result through the real digest boundary", () => {
+    const env = { provenance: { byName: (name: string) => ({ kind: "unknown" as const, name }),
+      byPath: (path: string) => ({ kind: "unknown" as const, name: path }) } };
+    const run = (id: string, timestamp: string) => [
+      { type: "message", id: `call-${id}`, timestamp, message: { role: "assistant", content: [{ type: "toolCall", id, name: "bash", arguments: { command: "bun run typecheck" } }] } },
+      { type: "message", id: `result-${id}`, timestamp, message: { role: "toolResult", toolCallId: id, toolName: "bash", content: "ok" } },
+    ];
+    const digest = buildDigest([...run("early", before), ...run("late", after)] as never, env);
+    expect(digest.toolExercises?.map((exercise) => exercise.at)).toEqual([before, after]);
+    expect(remedyOutcomes([projectFix], digest)[0]).toMatchObject({ status: "exercised-clean", evidence: ["tool-result:late"] });
   });
 });

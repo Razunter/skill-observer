@@ -173,9 +173,20 @@ export interface PayloadSection {
   text: string;
 }
 
+/** An observation payload's size in estimated tokens, in total and per section. */
+export interface PayloadEstimate {
+  total: number;
+  bySection: Record<string, number>;
+}
+
 /** Tokens estimated as ⌈chars/4⌉ per section, so a reader can add them up. */
-export function payloadEstimate(sections: readonly { name: string; text: string }[]): { total: number; bySection: Record<string, number> } {
+export function payloadEstimate(sections: readonly { name: string; text: string }[]): PayloadEstimate {
   const bySection: Record<string, number> = {};
   for (const { name, text } of sections) bySection[name] = (bySection[name] ?? 0) + Math.ceil(text.length / 4);
   return { total: Object.values(bySection).reduce((sum, tokens) => sum + tokens, 0), bySection };
+}
+
+/** The estimate as notices show it: `≈ N tokens (section N, …; chars/4 estimate)`. */
+export function describePayloadEstimate({ total, bySection }: PayloadEstimate): string {
+  return `≈ ${total} tokens (${Object.entries(bySection).map(([name, tokens]) => `${name} ${tokens}`).join(", ")}; chars/4 estimate)`;
 }

@@ -4941,3 +4941,110 @@ describe("re-offer conditions on Later entries", () => {
     expect(result.details).toMatchObject({ records: [] });
   });
 });
+
+describe("/observe-report", () => {
+  const TEST_RUN = { type: "message", id: "call-run-tests", message: { role: "assistant", content: [{ type: "toolCall", id: "run-tests", name: "bash", arguments: { command: "bun test" } }] } } as const;
+  const TEST_RESULT = { type: "message", id: "result-run-tests", message: { role: "toolResult", toolCallId: "run-tests", toolName: "bash", content: [{ type: "text", text: "12 passed" }] } } as const;
+
+  /**
+   * A branch with every signal kind, `tdd` read with two delivered amendments
+   * (one of whose fixes then ran clean), a skill read that failed, a managed
+   * skill created, and a stale amendment of an unloaded skill; one Later.
+   */
+  async function richHost() {
+    const host = loadExtension();
+    splitAmendment(host, "tdd", "tdd-afk-seams", { evidence: [{ quote: 'Tool error in `bash` "bun test": "1 failed"', count: 1 }] });
+    splitAmendment(host, "tdd", "tdd-red");
+    splitAmendment(host, "domain-modeling", "dm-terms");
+    changeSkillFile(host, "domain-modeling");
+    appendFileSync(host.ledgerFile, `${JSON.stringify({ fingerprint: "later-fix", skill: "tdd", kind: "upstream", gist: "Later gist.", outcome: "later", timestamp: new Date().toISOString(), sessionId: "fixture-session" })}\n`);
+    host.setBranch(fx.plainUserMessage);
+    await readSkill(host, "skill://tdd");
+    await readSkill(host, "skill://missing-skill", { isError: true });
+    host.setBranch([...host.getBranch(), TEST_RUN, TEST_RESULT, ...fx.steeringUserMessage, ...fx.ruleViolationInterrupt, ...fx.askSingleCustomInput,
+      ...fx.askSingleOffRecommended, ...fx.skillTurnToolError, ...fx.skillLessTurn, ...fx.managedSkillCreated] as SessionEntry[]);
+    return host;
+  }
+
+  it("prints the branch's evidence in one notice and starts, activates and writes nothing", async () => {
+    const host = await richHost();
+    const branch = structuredClone(host.getBranch());
+    const tools = [...host.activeTools()];
+    const ledger = readFileSync(host.ledgerFile, "utf8");
+
+    await host.runCommand("observe-report");
+
+    expect(host.sent).toEqual([]);
+    expect(host.getBranch()).toEqual(branch);
+    expect(host.activeTools()).toEqual(tools);
+    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(host.noticeEvents).toEqual([{ message: expect.any(String), type: "info" }]);
+    const report = host.notices[0]!;
+    const fingerprint = (skill: string, rule: string) => proposalFingerprint(skill, `Gist of ${rule}.`);
+    expect(report.split("\n")).toEqual([
+      "Evidence report (no observation pass started)",
+      "Signals: steering 1, rule-violation 1, ask-custom-input 1, ask-off-recommendation 1, tool-error 3, workflow 1; 0 older dropped by the digest cap",
+      "Skills loaded:",
+      "- tdd: upstream; read; amendments delivered: tdd-afk-seams, tdd-red",
+      "- impeccable: unknown; slash-command",
+      "Attempted, not loaded: missing-skill",
+      "Managed skills created: nested-worktree",
+      "Remedy outcomes:",
+      `- ${fingerprint("tdd", "tdd-red")}: delivered (tdd)`,
+      `- ${fingerprint("tdd", "tdd-afk-seams")}: exercised-clean (tdd)`,
+      `- ${fingerprint("domain-modeling", "dm-terms")}: inconclusive (domain-modeling)`,
+      "Stale amendments: dm-terms (domain-modeling)",
+      expect.stringMatching(/^Payload estimate for \/observe now: ≈ \d+ tokens \(instructions \d+, digest \d+, .*stale \d+; chars\/4 estimate\)$/),
+      "Later proposals: 1",
+    ]);
+  });
+
+  it("names no tool arguments, error text, paths or session IDs", async () => {
+    const host = await richHost();
+    await host.runCommand("observe-report");
+    const report = host.notices.join("\n");
+    const digest = buildDigest(host.getBranch(), { provenance: createProvenanceResolver(host.skillHome.roots) });
+    const args = (digest.toolExercises ?? []).map((exercise) => exercise.args).filter(Boolean);
+    const errors = digest.signals.flatMap((signal) => (signal.kind === "tool-error" ? [signal.error] : []));
+    expect(args).toContain("bun test");
+    expect(errors).toHaveLength(3);
+    for (const text of [...args, ...errors, host.skillHome.home, "fixture-session"]) expect(report).not.toContain(text);
+  });
+
+  it("counts the older signals the digest cap drops, as the pass's digest does", async () => {
+    const host = loadExtension();
+    const long = (index: number) => `Correction ${index}: ${"keep the seam named. ".repeat(95)}`;
+    host.setBranch(Array.from({ length: 30 }, (_, index): SessionEntry => ({
+      type: "message", id: `steer-${index}`, message: { role: "user", steering: true, content: [{ type: "text", text: long(index) }] },
+    })));
+    await host.runCommand("observe-report");
+    await host.runCommand("observe");
+    const [, dropped = ""] = /(\d+) older signals were dropped/.exec(String(host.sent[0]?.message.content)) ?? [];
+    expect(Number(dropped)).toBeGreaterThan(0);
+    expect(host.notices[0]).toContain(`Signals: steering 30, rule-violation 0, ask-custom-input 0, ask-off-recommendation 0, tool-error 0, workflow 0; ${dropped} older dropped by the digest cap`);
+  });
+
+  it("says the branch has no skill evidence, without an estimate, and follows a branch switch", async () => {
+    const host = await richHost();
+    rmSync(host.ledgerFile);
+    rmSync(host.amendmentsDir, { recursive: true });
+    await host.runCommand("observe-report");
+    host.setBranch(fx.plainUserMessage);
+    await host.emit("session_switch");
+    await host.runCommand("observe-report");
+    expect(host.notices[0]).toContain("Signals: steering 1");
+    expect(host.notices[1]).toBe("No skill evidence on this branch.");
+    expect(host.sent).toEqual([]);
+  });
+
+  it.each([
+    ["without UI", { hasUI: false }],
+    ["in a subagent session", { agentKind: "sub" }],
+  ] as const)("prints nothing %s", async (_label, options) => {
+    const host = loadExtension(options);
+    host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
+    await host.runCommand("observe-report");
+    expect(host.notices).toEqual([]);
+    expect(host.sent).toEqual([]);
+  });
+});

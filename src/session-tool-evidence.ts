@@ -162,7 +162,8 @@ function projectDigestEntries(
     const name = digestName(result.name);
     if (settled.has(result.id) || isDispatchLayer(result.id, name)) return [];
     settled.add(result.id);
-    return [{ type: "message", id: `tool-result:${result.id}`, message: {
+    const { timestamp } = branch[result.position]!;
+    return [{ type: "message", id: `tool-result:${result.id}`, ...(timestamp !== undefined && { timestamp }), message: {
       role: "toolResult", toolCallId: result.id, toolName: name, isError: result.isError, content: result.content, details: result.details,
     } }];
   };

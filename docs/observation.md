@@ -62,6 +62,19 @@ A malformed gate marker in `observer.md` stops `/observe` with an error notice; 
 
 The pass-start notice estimates the payload's size by section, as in `Observation pass started: 1 signal(s), 1 loaded skill(s), 0 stale amendment(s); payload ≈ 5848 tokens (instructions 5702, digest 110, ledger 9, rules-in-force 27; chars/4 estimate).` Each section counts ⌈characters / 4⌉, so the figure is an estimate, not the model's token count. Only the sections the message holds are listed.
 
+## Evidence report
+
+`/observe-report` prints a model-free evidence report of the current branch in one notice: what `/observe` would work from, without starting a pass. It has the same gate as `/observe` (a main session with UI; elsewhere it prints nothing), rebuilds everything from the current branch on each run, so a session switch or branch change shows in the next report, and calls no model, activates no tool and writes nothing. In order, it shows:
+
+1. **Signals** by kind, as distinct occurrences, and how many older signals the digest cap would drop from the pass;
+2. **Skills loaded**, each with its provenance kind, load route (`read`, `slash-command`) and the on-read amendments delivered for it; skills a read requested that never loaded; managed skills created;
+3. **Remedy outcomes**, one line per applied fix in force for this project, as `fingerprint: status (skill or project target path)`, delivered first, then exercised-clean, recurrence and inconclusive;
+4. **Stale amendments**, by rule name and skill;
+5. the **payload estimate** of the pass `/observe` would start now, from the same assembly and gates (without a User note);
+6. the number of **Later** proposals for this project.
+
+The report names tools, signal kinds, skills, rule names and project target paths only: no tool arguments, error text, evidence file paths or session IDs. A branch with no signals, loaded skills, stale amendments or applied fixes reports `No skill evidence on this branch.` and no estimate.
+
 ## Optional references
 
 The extension can use separately installed remote skills. The same pass reviews session-backed project-environment findings, even when a skill was loaded. When the digest has a workflow outline or a tool error, the pass carries the installed [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, inline as its retrospective reference rather than launching a separate retrospective (see [Observation payload](#observation-payload)). If that reference is unavailable then, the UI warns and ordinary observation remains usable. Quiet lifecycle events still only refresh the hint; they initiate no retrospective scan or model call.
@@ -93,7 +106,7 @@ The digest keeps signals and drops everything else: harness messages (wiki recal
 - **Workflow outlines** list one line per tool call (name, argument summary, ok/error), up to 50 calls, so one long turn can't crowd out every other signal. A subagent run shows only its `task` call (task names and agents) and the status its subagents ended with, taken from `wait` results and background-job deliveries.
 - **Identical signals** are counted as one, with a `(×N)` count, placed where they last occurred. Each keeps the occurrence IDs it stands for; a tool error's ID nests under its turn's workflow outline (`<workflow>/<event>`), so ranking counts distinct occurrences, not descriptions.
 - **Device dispatch** (`write xd://<tool>`) is recorded once, as the inner tool. A call saved both natively and by the extension's hooks also counts once, at its first request and first outcome; calls nested in `eval` appear only through their hook records, and structured parallel calls through their `tool_uses`. This view is deliberately lossy: publication receipts never rely on it.
-- **Remedy outcomes** for applied fixes report `delivered`, `exercised-clean` (the same command that failed before later succeeded after delivery, with a finished result), `recurrence` or `inconclusive`.
+- **Remedy outcomes** for applied fixes report `delivered`, `exercised-clean` (the same command that failed before later succeeded after delivery, with a finished result), `recurrence` or `inconclusive`. A project-environment fix has no amendment to deliver, so it is never `delivered`: a tool result saved after its ledger record whose call matches a quoted `Tool error in …` mechanism of its evidence counts, as `recurrence` when it fails with the quoted error and `exercised-clean` when it succeeds; a result saved earlier, or without a timestamp, counts for neither. A target file reverted after publication is not detected: the record's `afterHash` is not checked again.
 - **Managed skills** created with `manage_skill` in the session are listed, so the pass doesn't propose them again.
 
 The rendered digest is capped at about 12k tokens (estimated as 4 characters per token). Over the cap, the oldest signals are dropped first and the digest says how many. The signals left are numbered `S1`, `S2`, … from the oldest, so proposals can cite them; the ids hold only within one pass.
