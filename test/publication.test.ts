@@ -13,7 +13,7 @@ import { replaceReferenceFiles } from "../src/references.js";
 import { buildDigest } from "../src/digest.js";
 import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
 import { remedyOutcomes } from "../src/outcomes.js";
-import { toolResultGuidance } from "../src/payload.js";
+import { INSTRUCTIONS_PATH, toolResultGuidance } from "../src/payload.js";
 import { createProvenanceResolver, skillHash } from "../src/provenance.js";
 import { makeSkillHome } from "./skill-home.js";
 
@@ -477,4 +477,20 @@ it("restores previous references without writing the body when reference install
     .toThrow("injected reference install failure");
   expect(writeBody).not.toHaveBeenCalled();
   expect(readFileSync(join(f.files.referencesDir(), "tdd", "old.md"), "utf8")).toBe("Original\n");
+});
+it("keeps the result of a carried-out publication when its guidance can't be loaded", async () => {
+  const f = fixture();
+  failLedgerAppend(f.files.ledgerFile(), () => "", () => {
+    readFault.check = (file) => { if (file === INSTRUCTIONS_PATH) throw new Error("EACCES: permission denied"); };
+  });
+  const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+  const result = await f.add("first");
+  const amendment = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!;
+  expect(result.isError).toBe(true);
+  expect(result.details.publications).toEqual([{ operation: "on-read-append", skill: "tdd", rule: amendment.path, fingerprint: expect.any(String) }]);
+  expect(result.details.recording).toEqual({ rows: ["unrecorded"], error: expect.stringContaining("ENOSPC") });
+  const text = result.content.map((part) => part.text).join("\n");
+  expect(text).toMatch(/Unrecorded publication[\s\S]*applied `tdd`/);
+  expect(text.split("\n").at(-1)).toBe("The guidance for this result could not be loaded from observer.md: EACCES: permission denied");
+  expect(logged).toHaveBeenCalledWith("skill-observer: loading tool-result guidance failed:", expect.any(Error));
 });

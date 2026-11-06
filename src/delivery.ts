@@ -19,11 +19,28 @@ import { sessionToolEvidence } from "./session-tool-evidence.js";
 
 /** Delivers on-read amendments from `amendmentsDir` on both routes. */
 export function registerAmendmentDelivery(pi: ExtensionAPI, amendmentsDir: () => string): void {
+  /**
+   * The deliveries of the reminder the latest preparation returned, and the
+   * newest reminder entry on the branch then. OMP may discard or re-run a
+   * preparation, so its notices wait for a newer reminder entry on the branch.
+   */
+  let staged: { deliveries: Delivery[]; after: string | undefined } | undefined;
   // Runs in every session, UI or not: a skill needs its amendments wherever it is loaded.
   pi.on("before_agent_start", (event, ctx) => {
-    const message = amendmentReminder(event.prompt, ctx, amendmentsDir());
-    return message ? { message } : undefined;
+    const reminder = amendmentReminder(event.prompt, ctx, amendmentsDir());
+    staged = reminder && { deliveries: reminder.deliveries, after: ctx.sessionManager.getBranch().findLast(isReminder)?.id };
+    return reminder && { message: reminder.message };
   });
+  // OMP persists a message as its `message_end` fires, so a later `message_end` (the reply's at the latest) sees the entry.
+  pi.on("message_end", (_event, ctx) => {
+    if (!staged || !hasReminderAfter(ctx.sessionManager.getBranch(), staged.after)) return;
+    const { deliveries } = staged;
+    staged = undefined;
+    for (const delivery of deliveries) notifyDelivery(ctx, delivery.skill, delivery.rules);
+  });
+  for (const event of ["session_switch", "session_branch", "session_tree"] as const) {
+    pi.on(event, () => { staged = undefined; });
+  }
   pi.on("tool_result", (event, ctx) => {
     try {
       return readDelivery(pi, event, ctx, amendmentsDir(), createProvenanceResolver(defaultSkillRoots(ctx.cwd)));
@@ -41,12 +58,17 @@ export function registerAmendmentDelivery(pi: ExtensionAPI, amendmentsDir: () =>
  */
 const INVOKED_SKILL = /^\[IMPORTANT: User invoked the "([^"]+)" skill;/gm;
 
+interface Delivery {
+  skill: string;
+  rules: ObserverRule[];
+}
+
 /**
  * The hidden reminder for a submitted prompt: the on-read amendments of every
- * skill it starts, less those already delivered, with one notice per skill.
- * `undefined` when none are left.
+ * skill it starts, less those already delivered, and the delivery of each
+ * skill it holds. `undefined` when none are left.
  */
-function amendmentReminder(prompt: string, ctx: ExtensionContext, amendmentsDir: string): CustomMessage | undefined {
+function amendmentReminder(prompt: string, ctx: ExtensionContext, amendmentsDir: string): { message: CustomMessage; deliveries: Delivery[] } | undefined {
   const skills = new Set(Array.from(prompt.matchAll(INVOKED_SKILL), (match) => match[1] ?? ""));
   if (skills.size === 0) return undefined;
   const rules = undelivered(readOnReadAmendments(amendmentsDir).filter((rule) => skills.has(rule.amends)), ctx.sessionManager.getBranch());
@@ -55,14 +77,23 @@ function amendmentReminder(prompt: string, ctx: ExtensionContext, amendmentsDir:
     const skillRules = rules.filter((rule) => rule.amends === skill);
     return skillRules.length > 0 ? [{ skill, rules: skillRules }] : [];
   });
-  for (const delivery of deliveries) notifyDelivery(ctx, delivery.skill, delivery.rules);
-  return {
+  const message: CustomMessage = {
     customType: AMENDMENT_REMINDER_TYPE,
     content: deliveries.map((delivery) => renderReminder(delivery.skill, delivery.rules)).join("\n\n"),
     display: false,
     attribution: "agent",
     details: { rules: rules.map((rule) => rule.name) },
   };
+  return { message, deliveries };
+}
+
+const isReminder = (entry: SessionEntry) => entry.type === "custom_message" && entry.customType === AMENDMENT_REMINDER_TYPE;
+
+/** Whether `branch` holds a reminder entry after the one with id `after`; `false` once that entry has left the branch. */
+function hasReminderAfter(branch: readonly SessionEntry[], after: string | undefined): boolean {
+  const afterIndex = after === undefined ? -1 : branch.findIndex((entry) => entry.id === after);
+  if (after !== undefined && afterIndex < 0) return false;
+  return branch.slice(afterIndex + 1).some(isReminder);
 }
 
 /** `skill://<name>` or `skill://<name>/SKILL.md`, with an optional `read` selector such as `:10-20` or `:raw`. */
@@ -138,9 +169,7 @@ function deliveredRules(branch: readonly SessionEntry[]): Set<string> {
   const start = Math.max(compacted, reset);
   const delivered = new Set<string>();
   for (const entry of branch.slice(start)) {
-    const rules = entry.type === "custom_message" && entry.customType === AMENDMENT_REMINDER_TYPE
-      ? entry.details?.rules
-      : amendmentDelivery(entry)?.rules;
+    const rules = isReminder(entry) ? entry.details?.rules : amendmentDelivery(entry)?.rules;
     for (const rule of rules ?? []) delivered.add(rule);
   }
   return delivered;

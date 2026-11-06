@@ -160,7 +160,8 @@ export type ExtensionEvent =
   | "session_switch"
   | "session_branch"
   | "session_tree"
-  | "agent_end";
+  | "agent_end"
+  | "message_end";
 
 /**
  * Fired before a prompt, or a dequeued steering or follow-up batch with user

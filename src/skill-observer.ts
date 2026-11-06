@@ -44,7 +44,7 @@ import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
 import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
 import { evidenceReport, isEmptyEvidenceReport, renderEvidenceReport } from "./report.js";
 import { recordHookCall, recordHookResult } from "./session-tool-evidence.js";
-import { hasQualifiedApply, observationPassStart } from "./proposal-approval.js";
+import { hasQualifiedAnswer, observationPassStart } from "./proposal-approval.js";
 
 const STATUS_KEY = "skill-observer";
 /** Global, not per project: feedback about global skills gathers in one place. */
@@ -195,7 +195,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
     const isReceiptTool = ["write", "edit", "bash", "manage_skill", "ask", REVIEW_TOOL_NAME].includes(event.toolName);
     recordHookResult(pi, event, ctx.sessionManager.getBranch());
     if (event.isError || !isReceiptTool || observationPassStart(ctx.sessionManager.getBranch()) === undefined) return;
-    const guidance = event.toolName === "ask" && hasQualifiedApply(event.details as AskDetails | undefined) ? [{ type: "text", text: whatToDoNow(["apply-note"]) }] : [];
+    const guidance = event.toolName === "ask" && hasQualifiedAnswer(event.details as AskDetails | undefined) ? [{ type: "text", text: whatToDoNow(["apply-note"]) }] : [];
     // Opaque host IDs are absent from ordinary model-visible outputs; snapshot tags and commands cannot identify branch receipts.
     return {
       content: [...event.content, { type: "text", text: JSON.stringify({ observerToolCallId: event.toolCallId }) }, ...guidance],

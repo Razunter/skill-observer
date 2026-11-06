@@ -121,3 +121,9 @@ describe("rules adopted from upstream task-observer v3.9.0", () => {
     expect(instructionText(new Set())).toContain(sentence);
   });
 });
+
+describe("observer.md saved with CRLF line ends", () => {
+  it("parses into the same fragments as its LF copy", () => {
+    expect(parseFragments(observerMd.replace(/\n/g, "\r\n"))).toEqual(fragments);
+  });
+});

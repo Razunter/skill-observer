@@ -141,6 +141,12 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; j
     return added;
   };
 
+  /** Saves a message `before_agent_start` returned on the branch and fires its `message_end`, as OMP does once it commits a preparation. */
+  const commitMessage = async (message: CustomMessage) => {
+    branch = [...branch, { type: "custom_message", id: `message-${branch.length}`, customType: message.customType, content: message.content, details: message.details }];
+    await emit("message_end");
+  };
+
   /** Runs `tool_result` as OMP does: each handler sees the result as earlier ones left it, and their additional context is joined. */
   const toolResult = async (event: {
     toolName: string; toolCallId: string; content: Array<{ type: string; text?: string }>;
@@ -175,6 +181,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; j
     endTurn: () => emit("agent_end"),
     emit,
     startAgent,
+    commitMessage,
     toolResult,
     runCommand: async (name: string, args = "") => {
       const command = commands[name];
@@ -4765,15 +4772,41 @@ describe("delivery notices for on-read amendments", () => {
     return host;
   }
 
-  it("tells the user once which rules a /skill: reminder carries", async () => {
+  it("tells the user once which rules a /skill: reminder carries, after the reminder is on the branch", async () => {
     const host = withTwoDomainModelingAmendments();
 
     const [reminder] = await host.startAgent(String(fx.skillPromptUpstream[0]?.content));
-
     expect(reminder).toMatchObject({ details: { rules: expect.arrayContaining(["dm-define-terms", "dm-record-adrs"]) } });
+    expect(host.noticeEvents).toEqual([]);
+
+    await host.commitMessage(reminder!);
+    await host.emit("message_end");
+
     expect(host.noticeEvents).toEqual([{ message: expect.stringContaining("`domain-modeling`"), type: "info" }]);
     expect(host.notices[0]).toContain("dm-define-terms");
     expect(host.notices[0]).toContain("dm-record-adrs");
+  });
+
+  it("tells the user nothing for a /skill: preparation OMP discards", async () => {
+    const host = withTwoDomainModelingAmendments();
+
+    await host.startAgent(String(fx.skillPromptUpstream[0]?.content));
+    await host.emit("message_end");
+    await host.startAgent("An ordinary prompt.");
+    await host.emit("message_end");
+
+    expect(host.noticeEvents).toEqual([]);
+  });
+
+  it("tells the user once for a /skill: preparation OMP runs again before committing it", async () => {
+    const host = withTwoDomainModelingAmendments();
+
+    await host.startAgent(String(fx.skillPromptUpstream[0]?.content));
+    const [reminder] = await host.startAgent(String(fx.skillPromptUpstream[0]?.content));
+    await host.commitMessage(reminder!);
+    await host.emit("message_end");
+
+    expect(host.noticeEvents).toEqual([{ message: expect.stringContaining("`domain-modeling`"), type: "info" }]);
   });
 
   it("delivers on both routes without a notice in a session without UI", async () => {
@@ -4782,7 +4815,9 @@ describe("delivery notices for on-read amendments", () => {
     expect(readHost.notices).toEqual([]);
 
     const promptHost = withTwoDomainModelingAmendments({ hasUI: false });
-    expect(await promptHost.startAgent(String(fx.skillPromptUpstream[0]?.content))).toHaveLength(1);
+    const promptReminders = await promptHost.startAgent(String(fx.skillPromptUpstream[0]?.content));
+    expect(promptReminders).toHaveLength(1);
+    await promptHost.commitMessage(promptReminders[0]!);
     expect(promptHost.notices).toEqual([]);
   });
 
@@ -4954,10 +4989,12 @@ describe("error-path guidance in tool results", () => {
     ["a batch holding Apply with custom input and Apply with a note", { results: [
       { id: "plain", ...APPLY }, { id: "custom", selectedOptions: ["Apply"], customInput: "Only for unit tests." }, { id: "noted", selectedOptions: ["Apply"], note: "Thanks." },
     ] }, [["apply-note"]]],
+    ["custom input alone, as native single-select Ask leaves it", { selectedOptions: [], customInput: "Only for unit tests." }, [["apply-note"]]],
+    ["a batch whose only qualified answer is custom input", { results: [{ id: "plain", ...APPLY }, { id: "custom", selectedOptions: [], customInput: "Only for unit tests." }] }, [["apply-note"]]],
     ["a plain Apply", APPLY, []],
     ["a note on Later", { selectedOptions: ["Later"], note: "Next week.", noteOption: "Later" }, []],
     ["Apply with a note, outside a pass", { selectedOptions: ["Apply"], note: "Thanks.", noteOption: "Apply" }, [], false],
-  ])("gives an ask result answered with %s the apply-note guidance only during a pass and when an Apply carries a note or custom input", async (_label, details, expected, inPass = true) => {
+  ])("gives an ask result answered with %s the apply-note guidance only during a pass and when an answer carries custom input or an Apply a note", async (_label, details, expected, inPass = true) => {
     const host = loadExtension();
     if (inPass) startPass(host);
     const result = await host.toolResult({ toolName: "ask", toolCallId: "ask-answered", content: [{ type: "text", text: "User answers" }], details, isError: false });

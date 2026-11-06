@@ -86,10 +86,15 @@ const STALE_OPTIONS = { "stale-update": "Update", "stale-delete": "Delete" } as 
 /** A target that no longer holds what its approved change was prepared against: the answer needs a reconciliation or a new Ask, not a corrected call. */
 export class TargetChangedError extends Error {}
 
-/** Whether an answer of the Ask `details` holds selects Apply with a note or custom input, which approves nothing until the main agent judges it. */
-export function hasQualifiedApply(details: AskDetails | undefined): boolean {
+/**
+ * Whether an answer of the Ask `details` holds custom input, or selects Apply
+ * with a note: neither approves anything until the main agent judges it.
+ * Native single-select Ask clears `selectedOptions` for custom input, so custom
+ * input counts whatever is selected.
+ */
+export function hasQualifiedAnswer(details: AskDetails | undefined): boolean {
   const answers = details?.results ?? (details ? [details] : []);
-  return answers.some((answer) => answer.selectedOptions?.includes(APPLY) && (Boolean(answer.note) || answer.customInput !== undefined));
+  return answers.some((answer) => answer.customInput !== undefined || (answer.selectedOptions?.includes(APPLY) && Boolean(answer.note)));
 }
 
 /**

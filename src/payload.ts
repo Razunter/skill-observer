@@ -39,7 +39,7 @@ const isBlank = (line: string | undefined) => line === undefined || line.trim() 
  * throws, naming the line.
  */
 export function parseFragments(markdown: string): Fragment[] {
-  const lines = markdown.split("\n");
+  const lines = markdown.replace(/\r\n/g, "\n").split("\n");
   const fail = (index: number, reason: string): never => {
     throw new Error(`observer.md line ${index + 1}: ${reason}`);
   };
@@ -161,9 +161,18 @@ export function toolResultGuidance(condition: ToolResultCondition): string {
   return fragment.text;
 }
 
-/** The `## What to do now` section a tool result ends with: the guidance of each condition, in the order given. */
+/**
+ * The `## What to do now` section a tool result ends with: the guidance of each
+ * condition, in the order given. Never throws: the result it ends may report
+ * changes already made, so an unloadable guidance becomes a one-line note.
+ */
 export function whatToDoNow(conditions: readonly ToolResultCondition[]): string {
-  return ["## What to do now", ...conditions.map((condition) => toolResultGuidance(condition))].join("\n\n");
+  try {
+    return ["## What to do now", ...conditions.map((condition) => toolResultGuidance(condition))].join("\n\n");
+  } catch (error) {
+    console.error("skill-observer: loading tool-result guidance failed:", error);
+    return `The guidance for this result could not be loaded from observer.md: ${error instanceof Error ? error.message : String(error)}`;
+  }
 }
 
 export type PayloadSectionName = "instructions" | "note" | "digest" | "ledger" | "outcomes" | "rules-in-force" | "project" | "retro" | "stale";
