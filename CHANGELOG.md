@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `/observe` asks through the HTML-form `ask` of OMP 18.18. `observer_review` Select returns `askHtml`, the complete form with one fieldset per selected proposal (target and gist, remedy, evidence, preview, and Apply / Later / Decline, or Keep / Update / Delete for a stale amendment); the model passes it to `ask` unchanged. Nothing is preselected.
+- Proposal approval requires the saved Ask's `html` to equal the form rendered from that Select, no timeout, and exactly one answer named by the proposal's `candidateId` holding the approving label. This replaces the per-option preview comparison.
+- The form shows previews as wrapped text, because the host's form dialog cuts `<pre>` lines at its width: every word and line break, with the whitespace the form collapses marked, `·` per space of an indent, a trailing run or a repeated run and `→` per tab. The bytes written are the prepared ones.
+- A radio's value is `<candidateId>=<Label>`, so text typed into the form's Other row never equals an approving option.
+- The `tool-result` guidance for a note on Apply is now **Custom input.**, added to a pass's `ask` result when an answer starts with `Other: `.
+
+### Fixed
+
+- `observer_resolve` records approvals on OMP 18.18 and later; it refused every one because the Ask no longer held `questions[]`.
+- The digest's `ask` signals (custom input, an answer off the preselected option) fire for HTML-form results. Results saved before OMP 18.18 are still read.
+
+### Removed
+
+- `approval.nonModifyingNote`: the host no longer has notes on an option. Custom input (`Other: ...`) is the user's only free text and never approves.
+
 ## 0.2.0 - 2026-11-06
 
 ### Added

@@ -6,7 +6,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { registerResolveTool } from "../src/resolve.js";
 import { registerReviewTool } from "../src/review.js";
 import { OBSERVATION_MESSAGE_TYPE } from "../src/digest.js";
-import type { AskDetails, AskQuestion, ExtensionAPI, ExtensionContext, Schema, SessionEntry, ToolDefinition, ToolResultDetails } from "../src/omp.js";
+import type { AskDetails, ExtensionAPI, ExtensionContext, Schema, SessionEntry, ToolDefinition, ToolResultDetails } from "../src/omp.js";
 import { type Evidence, readLedger, type LedgerRecord } from "../src/ledger.js";
 import * as amendments from "../src/amendments.js";
 import { replaceReferenceFiles } from "../src/references.js";
@@ -75,22 +75,19 @@ function fixture() {
   };
   const run = (params: unknown) => call("observer_resolve", params);
   /**
-   * Prepares and selects `candidates`, then saves an Ask the user answered by
-   * selecting `select` on each question (Apply, or a stale amendment's Update
-   * or Delete), which is the only synthetic part. Returns each selected
-   * proposal's approval, in selection order.
+   * Prepares and selects `candidates`, then saves an Ask of the form Select
+   * returned, answered by choosing `select` in each fieldset (Apply, or a stale
+   * amendment's Update or Delete), which is the only synthetic part. Returns
+   * each selected proposal's approval, in selection order.
    */
   const approve = async (candidates: unknown[], select = "Apply") => {
     const prepared = await call("observer_review", { action: "prepare", candidates });
     if (prepared.isError) throw new Error(prepared.details.failures.join("; "));
     const selection = await call("observer_review", { action: "select", proposals: (prepared.details as unknown as { eligible: Selected[] }).eligible.map((entry) => entry.reference) });
-    const questions: AskQuestion[] = selection.details.selected.map(({ proposal }) => ({ id: proposal.candidateId, question: proposal.gist, options: proposal.alternatives
-      ? [{ label: "Keep" }, ...proposal.alternatives.map(({ change, preview }) => ({ label: change.operation === "stale-update" ? "Update" : "Delete", preview }))]
-      : ["Apply", "Later", "Decline"].map((label) => ({ label, ...(label === "Apply" && { preview: proposal.preview }) })) }));
-    const results = questions.map((question) => ({ id: question.id, question: question.question, options: (question.options ?? []).map((option) => String(option.label)), multi: false, selectedOptions: [select] }));
-    const answer: AskDetails = results.length === 1 ? (({ id: _, ...single }) => single)(results[0]!) : { results };
+    const { askHtml } = JSON.parse(selection.content[0]!.text) as { askHtml: string };
+    const answer: AskDetails = { answers: selection.details.selected.map(({ proposal }) => ({ name: proposal.candidateId, question: proposal.gist, answer: select })) };
     const askToolCallId = `ask-${branch.length}`;
-    branch = [...branch, toolCall(askToolCallId, "ask", { questions }),
+    branch = [...branch, toolCall(askToolCallId, "ask", { html: askHtml }),
       { type: "message", message: { role: "toolResult", toolCallId: askToolCallId, toolName: "ask", content: [], details: answer, isError: false } }];
     return selection.details.selected.map(({ reference }) => ({ proposal: reference, selectionToolCallId: selection.id, askToolCallId }));
   };

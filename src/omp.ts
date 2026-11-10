@@ -14,10 +14,12 @@ interface ContentBlock {
 }
 
 /**
- * Tool-call arguments. The digest reads `questions` for `ask`, `path` for
- * `read`, `tasks` for `task`, and any short string argument for the outline.
+ * Tool-call arguments. The digest reads `html` for `ask` (`questions` on a
+ * call saved before OMP 18.18), `path` for `read`, `tasks` for `task`, and any
+ * short string argument for the outline.
  */
 export type ToolArguments = {
+  html?: string;
   questions?: AskQuestion[];
   path?: string;
   tasks?: Array<{ name?: string; agent?: string }>;
@@ -67,10 +69,9 @@ export interface SessionEntry {
 }
 
 /**
- * A question as the model passed it to the `ask` tool. The installed host
- * requires `id`, `question` and option labels; saved arguments are read as
- * untrusted, so every field stays optional here. The rich dialog shows an
- * option's `preview` only when it has non-blank text.
+ * A question of an `ask` call saved before OMP 18.18, which took `questions`
+ * instead of one HTML form. Saved arguments are read as untrusted, so every
+ * field stays optional.
  */
 export interface AskQuestion {
   id?: string;
@@ -81,8 +82,8 @@ export interface AskQuestion {
   recommended?: number;
 }
 
-/** One answer in an `ask` result, as the installed host's `QuestionResult`. */
-interface AskAnswer {
+/** One answer in an `ask` result saved before OMP 18.18. */
+interface LegacyAskAnswer {
   /** Set on batched results only; a single answer spread into the details has none. */
   id?: string;
   question?: string;
@@ -91,20 +92,29 @@ interface AskAnswer {
   multi?: boolean;
   selectedOptions?: string[];
   customInput?: string;
-  /** A note the user attached in the rich dialog, on `noteOption` or, when that is unset, on the custom answer. */
-  note?: string;
-  noteOption?: string;
-  /** Native timeout selections are defaults, not explicit publication approval. */
-  timedOut?: boolean;
 }
 
 /**
- * `ask` result details: batched answers under `results`, a single answer
- * spread bare into the details, or `chatRedirect` with the question texts when
- * the user chose to chat instead of answering. A cancelled ask is saved as an
- * error result with `{}` details, not as an answer.
+ * One named field of an answered `ask` form, as the host's `FormAnswer`:
+ * `answer` is the chosen option's label on one line, several joined with `, `,
+ * `Other: <text>` for the free text the host adds to radio and checkbox
+ * groups, the text of a text field, or empty when nothing was chosen.
  */
-export type AskDetails = { results?: AskAnswer[]; chatRedirect?: boolean; questions?: string[] } & AskAnswer;
+export interface AskFormAnswer {
+  name?: string;
+  question?: string;
+  answer?: string;
+}
+
+/**
+ * `ask` result details: `answers` for every named field of the form, in form
+ * order, and `timedOut` when the deadline submitted the form's current values
+ * instead of the user. A result saved before OMP 18.18 holds batched answers
+ * under `results` or a single answer spread bare into the details; only the
+ * digest still reads those. A cancelled ask is saved as an error result with
+ * `{}` details, not as an answer.
+ */
+export type AskDetails = { answers?: AskFormAnswer[]; timedOut?: boolean; results?: LegacyAskAnswer[] } & LegacyAskAnswer;
 
 /** `manage_skill` result details: the action taken and the skill it named. */
 interface ManageSkillDetails {

@@ -1,1 +1,1 @@
-A stale amendment's question names the rule and the skill it amends. Its options are **Keep**, then **Update** and **Delete** for each of the proposal's `alternatives`, whose `preview` is that alternative's `preview` unchanged.
+A stale amendment's `remedy` names the rule and the skill it amends. Its options are **Keep**, then **Update** and **Delete** for each of the proposal's `alternatives`, each previewed under its own heading.

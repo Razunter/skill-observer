@@ -8,7 +8,7 @@ After each turn, the extension rebuilds the session digest from the current bran
 
 - a steering message you typed while the agent was working;
 - a rule violation: a TTSR rule firing on the agent's text or a tool call, whether it interrupts or is injected into a tool result. Every TTSR rule this extension writes is a barrier rule or pattern amendment, so each firing is a violation; on-read amendments never reach TTSR (see [Delivering on-read amendments](amendments.md#delivering-on-read-amendments));
-- an `ask` answer with custom input, or with a selection other than the recommended option (the `recommended` index, or an option labelled "(Recommended)").
+- an `ask` answer with custom input (`Other: ...`), or one that differs from the option the form preselected (`checked`). Results saved before OMP 18.18 are still read in their old shape.
 
 A workflow outline is a turn with no skill loaded and at least 3 tool calls. A cancelled `ask` and skill loads do not turn the hint on. Tool errors are not themselves correction-class signals, but a turn containing errors can still qualify as a workflow outline. Subagent sessions and sessions without UI get no hint.
 
@@ -28,9 +28,9 @@ Text after the command, as in `/observe tdd should run the one failing test firs
 
 With no note, no signals, no loaded skills and no stale amendments, `/observe` says so and starts no turn. Otherwise it sends one hidden message, the [observation payload](#observation-payload), that starts a normal turn.
 
-The model asks about at most 5 proposals, stale amendments it would update or delete, and compactions in one main `ask` batch (Apply / Later / Decline, or Keep / Update / Delete, with a preview). It ranks stale amendments first, then User note points, then correction-class signals and repeats, then compactions. Each proposal fixes one mechanism; a candidate bundling two independent fixes becomes two questions.
+The model asks about at most 5 proposals, stale amendments it would update or delete, and compactions in one main `ask`. The extension renders that Ask as one form, which `observer_review` Select returns and the model passes on unchanged: one fieldset per proposal with its target and gist, remedy, evidence and preview, and the choices Apply / Later / Decline, or Keep / Update / Delete for a stale amendment. Nothing is preselected. Stale amendments come first, then User note points, then correction-class signals and repeats, then compactions. Each proposal fixes one mechanism; a candidate bundling two independent fixes becomes two questions.
 
-Each question cites its evidence: digest signal ids with their `(×N)` counts and a short exact quote, or `User note`, a Later entry's fingerprint or a stale amendment's rule. A barrier rule is asked about only after its pattern passes the replay check (see [Replay](amendments.md#replay)). Its preview shows the rule, scope and samples.
+Each question shows its evidence: digest signal ids with their `(×N)` counts and a short exact quote, or `User note`, a Later entry's fingerprint or a stale amendment's rule. A barrier rule is asked about only after its pattern passes the replay check (see [Replay](amendments.md#replay)). Its preview shows the rule, scope and samples. The form shows a preview as wrapped text and marks indentation, repeated and trailing spaces `·` and tabs `→`; what is written is the prepared text.
 
 The model applies approved edits to local skills directly and to managed or new skills through `manage_skill`. It then records every answer with `observer_resolve`, which also writes every rule: amendment rules for upstream skills and barrier rules for local and managed ones. `observer_resolve` and `observer_check` join the model's tools at the session's first `/observe`. [`observer.md`](../observer.md) is read on every run, so it is a local proposal target too.
 
@@ -60,13 +60,13 @@ The message that starts a pass holds these sections, in this order, leaving out 
 | `withdrawal` | a fix is in force for a loaded skill, or there is a User note | withdrawal candidates and questions, and retracted fixes |
 | `ranking` | the host has an explicit, available `judge` role assignment | advisory ranking and Select's `rankings`; without it the pass calls Select without rankings |
 | `note` | there is a User note | how to weigh the User note |
-| `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, and with a note on Apply; see below |
+| `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, and with custom input; see below |
 
 Under the `project` gate, the Retrospective reference includes the installed `retro` skill's text inline, without its frontmatter. A preceding line says which parts apply: its candidate categories do; its own steps and Files section describe a standalone retrospective and do not. Without `retro`, the section says the reference is unavailable and the UI warns. Without the gate, neither the section nor the warning appears.
 
 The `tool-result` paragraphs reach the model in the tool result that reports their condition, under a closing `## What to do now` heading. An `observer_resolve` result carries one paragraph per reported condition, regardless of how many answers hit it: an answer not recorded because its rule, amendment or reference files changed since Prepare or the reconciliation, a failed ledger append, or a failed cleanup.
 
-During a pass, an `ask` result carries the note paragraph when an answer has custom input or selects **Apply** with a note. Native single-select Ask clears the selection for custom input, so custom input counts whatever is selected. A clean result and a plain Apply carry none. When `observer.md` cannot supply a paragraph, the result keeps everything it reports and ends with a one-line note naming the error instead.
+During a pass, an `ask` result carries the custom-input paragraph when an answer starts with `Other: `, the form's free-text row. Any other result carries none. When `observer.md` cannot supply a paragraph, the result keeps everything it reports and ends with a one-line note naming the error instead.
 
 A malformed gate marker in `observer.md` stops `/observe` with an error notice; no pass starts. CRLF line ends parse the same as LF.
 

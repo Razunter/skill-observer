@@ -6,11 +6,10 @@
  * rule, a stale amendment's Update or Delete, a withdrawal and a compaction.
  * The approval is the chain the pass left there: the successful
  * `observer_review` Prepare holding the proposal, a successful Select that
- * selected it, and a native `ask` whose question with the proposal's candidate
- * ID shows its preview unchanged on the Apply option (for a stale amendment,
- * each alternative's on its Update or Delete option), answered by the user
- * selecting that option alone, with no note or one the main agent classified
- * as non-modifying. Caller-supplied IDs only locate that chain. Nothing is
+ * selected it, and a native `ask` called with exactly the form rendered from
+ * that Select's proposals, answered by the user choosing the proposal's Apply
+ * option (for a stale amendment, Update or Delete) before any timeout. Custom
+ * input approves nothing. Caller-supplied IDs only locate that chain. Nothing is
  * cached: each check reads the branch as it is, so authority ends as soon as
  * the chain or the pass leaves the branch, or the user speaks after answering.
  *
@@ -32,19 +31,15 @@ import { isDeepStrictEqual } from "node:util";
 import { frontmatterField } from "./amendments.js";
 import { OBSERVATION_MESSAGE_TYPE } from "./digest.js";
 import type { AgentMessage, AskDetails, Schema, SchemaBuilder, SessionEntry } from "./omp.js";
-import { isProposalRef, type PreparedChange, type PreparedProposal, type PreparedProposalRef, preparedEntry, proposalRefSchema, REVIEW_TOOL_NAME, snapshot } from "./review.js";
+import { isProposalRef, type PreparedChange, type PreparedProposal, type PreparedProposalRef, preparedEntry, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, snapshot } from "./review.js";
 import { hasUnlistedReferenceEntries, readReferenceFiles } from "./references.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
-
-/** The main agent's classification of the note the user added on Apply: the note's exact text and why it changes nothing the proposal shows. */
-export interface NonModifyingNote { note: string; reason: string }
 
 /** Where the pass's approval of one prepared proposal is saved: its reference, the Select that selected it and the Ask the user answered. */
 export interface ProposalAnswerRef {
   proposal: PreparedProposalRef;
   selectionToolCallId: string;
   askToolCallId: string;
-  nonModifyingNote?: NonModifyingNote;
 }
 
 /** What a revised proposal states: the approval it reconciles, how the target changed, why, and why the revision keeps the approved intent and the target's unrelated content. */
@@ -77,24 +72,20 @@ type ApprovedAnswer =
 export type ApprovedChange = Exclude<PreparedChange, { operation: "direct-edit" }>;
 /** The approved changes a reconciliation may revise. */
 type ReconcilableChange = Extract<PreparedChange, { operation: "on-read-append" | "rule" }>;
-type AskAnswer = NonNullable<AskDetails["results"]>[number];
 
-const APPLY = "Apply";
-/** A stale amendment's question offers each prepared alternative under its own option. */
-const STALE_OPTIONS = { "stale-update": "Update", "stale-delete": "Delete" } as const;
+export const APPLY = "Apply";
+/** A stale amendment's fieldset offers each prepared alternative under its own option. */
+export const STALE_OPTIONS = { "stale-update": "Update", "stale-delete": "Delete" } as const;
 
 /** A target that no longer holds what its approved change was prepared against: the answer needs a reconciliation or a new Ask, not a corrected call. */
 export class TargetChangedError extends Error {}
 
-/**
- * Whether an answer of the Ask `details` holds custom input, or selects Apply
- * with a note: neither approves anything until the main agent judges it.
- * Native single-select Ask clears `selectedOptions` for custom input, so custom
- * input counts whatever is selected.
- */
-export function hasQualifiedAnswer(details: AskDetails | undefined): boolean {
-  const answers = details?.results ?? (details ? [details] : []);
-  return answers.some((answer) => answer.customInput !== undefined || (answer.selectedOptions?.includes(APPLY) && Boolean(answer.note)));
+/** The host's answer for text the user typed into a group's "Other" row starts with this. */
+const CUSTOM_INPUT = "Other: ";
+
+/** Whether an answer of the Ask `details` is custom input, which approves nothing: the pass prepares a new proposal for what it asks. */
+export function hasCustomInput(details: AskDetails | undefined): boolean {
+  return Array.isArray(details?.answers) && details.answers.some((answer) => answer?.answer?.startsWith(CUSTOM_INPUT));
 }
 
 /**
@@ -119,11 +110,7 @@ export function approvalShape(z: SchemaBuilder): Record<keyof ProposalAnswerRef,
   return {
     proposal: proposalRefSchema(z).describe("The proposal's `reference`, exactly as Prepare returned it."),
     selectionToolCallId: z.string().describe("The `observerToolCallId` of the observer_review Select that selected it."),
-    askToolCallId: z.string().describe("The `observerToolCallId` of the `ask` whose question with the proposal's `candidateId` as `id` the user answered Apply."),
-    nonModifyingNote: z.object({
-      note: z.string().describe("The user's note, exactly as the Ask result holds it."),
-      reason: z.string().describe("Why the note changes nothing the proposal shows."),
-    }).optional().describe("Only for a note the user added on Apply that you judge changes nothing the proposal shows; a modifying or ambiguous note needs a new prepared proposal and Ask."),
+    askToolCallId: z.string().describe("The `observerToolCallId` of the `ask` called with that Select's `askHtml` unchanged, in which the user chose Apply (for a stale amendment, Update or Delete)."),
   };
 }
 
@@ -232,22 +219,23 @@ function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence,
   if (!Array.isArray(chosen) || !chosen.some((entry: { reference?: unknown } | undefined) => isDeepStrictEqual(entry?.reference, ref.proposal))) {
     throw new Error(`Select \`${ref.selectionToolCallId}\` did not select this proposal`);
   }
-  const selected = checkAnswer(ask, proposal.candidateId, options, ref.nonModifyingNote);
+  const askHtml = renderAskHtml(chosen.map(({ proposal }: { proposal: PreparedProposal }) => proposal));
+  const selected = checkAnswer(ask, askHtml, proposal.candidateId, options);
   if (prepare.call.position < passStart) throw new Error("the proposal was prepared in an earlier observation pass; prepare, select and ask again");
   if (prepare.result.position > selection.call.position || selection.result.position > ask.call.position) {
     throw new Error("the Ask must follow the Select, and the Select the Prepare, in this observation pass");
   }
   const spokeAfter = branch.slice(ask.result.position + 1).some((entry) => isFromUser(entry.message));
   if (spokeAfter) throw new Error("the user sent a message after answering, which may retract or change the approval; ask again");
-  return { proposal, change: options.get(selected)!.change, selected, answeredAt: ask.result.position };
+  return { proposal, change: options.get(selected)!, selected, answeredAt: ask.result.position };
 }
 
-/** The options whose selection approves a change of `proposal`, each with that change and the preview it shows. */
-function approvingOptions(proposal: PreparedProposal): Map<string, { change: ApprovedChange; preview: string }> {
-  if ("alternatives" in proposal) return new Map(proposal.alternatives.map(({ change, preview }) => [STALE_OPTIONS[change.operation], { change, preview }]));
-  const { change, preview } = proposal;
+/** The options whose selection approves a change of `proposal`, each with that change. */
+function approvingOptions(proposal: PreparedProposal): Map<string, ApprovedChange> {
+  if ("alternatives" in proposal) return new Map(proposal.alternatives.map(({ change }) => [STALE_OPTIONS[change.operation], change]));
+  const { change } = proposal;
   if (change.operation === "direct-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself");
-  return new Map([[APPLY, { change, preview }]]);
+  return new Map([[APPLY, change]]);
 }
 
 export function isReconcilable(change: PreparedChange | undefined): change is ReconcilableChange {
@@ -299,16 +287,11 @@ const sha256 = (text: string) => createHash("sha256").update(text).digest("hex")
 
 /** `ref` in canonical form, so a saved reconciliation and an answer citing the same approval compare equal. */
 function answerRef(ref: Partial<ProposalAnswerRef> | undefined): ProposalAnswerRef {
-  const note = ref?.nonModifyingNote;
-  if (typeof ref?.selectionToolCallId !== "string" || typeof ref.askToolCallId !== "string" || !isProposalRef(ref.proposal) ||
-      (note !== undefined && (typeof note?.note !== "string" || typeof note.reason !== "string"))) {
-    throw new Error("this answer needs `approval`: the proposal's `reference` exactly as Prepare returned it, `selectionToolCallId`, `askToolCallId` and, for a note on the selected option, `nonModifyingNote` with its `note` and `reason`");
+  if (typeof ref?.selectionToolCallId !== "string" || typeof ref.askToolCallId !== "string" || !isProposalRef(ref.proposal)) {
+    throw new Error("this answer needs `approval`: the proposal's `reference` exactly as Prepare returned it, `selectionToolCallId` and `askToolCallId`");
   }
   const { reviewToolCallId, candidateId, contentHash } = ref.proposal;
-  return {
-    proposal: { reviewToolCallId, candidateId, contentHash }, selectionToolCallId: ref.selectionToolCallId, askToolCallId: ref.askToolCallId,
-    ...(note && { nonModifyingNote: { note: note.note, reason: note.reason } }),
-  };
+  return { proposal: { reviewToolCallId, candidateId, contentHash }, selectionToolCallId: ref.selectionToolCallId, askToolCallId: ref.askToolCallId };
 }
 
 /** A message the user wrote: a prompt, or steering when `steering` is set; harness- and agent-written ones are not. */
@@ -325,54 +308,28 @@ function completed(evidence: SessionToolEvidence, id: string, role: string): Com
 }
 
 /**
- * Checks that the native Ask holds one question identified by `candidateId`
- * with one option per label of `approving` previewing its change exactly, and
- * that the user answered it by selecting one of them alone, without a timeout
- * default or custom input, and with no note or the one `classified` quotes.
- * Returns the selected label.
+ * Checks that the native Ask showed exactly `askHtml`, the form its Select's
+ * proposals render to, and that the user answered the radio group named
+ * `candidateId` by choosing a label of `approving`, not by a timeout's
+ * submission of the form as it stood nor with custom input. Returns the label.
  */
-function checkAnswer({ call, result }: CompletedToolCall, candidateId: string, approving: ReadonlyMap<string, { preview: string }>, classified: NonModifyingNote | undefined): string {
+function checkAnswer({ call, result }: CompletedToolCall, askHtml: string, candidateId: string, approving: ReadonlyMap<string, unknown>): string {
   if (call.name !== "ask" || call.origin !== "native" || result.origin !== "native") {
     throw new Error(`\`${call.id}\` is not an ask the model made itself: a nested or hook-only ask is no approval`);
   }
   if (result.isError !== false) throw new Error("the Ask was cancelled or failed, so the user approved nothing");
-  const questions = Array.isArray(call.args.questions) ? call.args.questions : [];
-  const asked = questions.filter((question) => question?.id === candidateId);
-  const [question] = asked;
-  if (!question || asked.length > 1) throw new Error(`the Ask holds no single question with id \`${candidateId}\``);
-  for (const [label, { preview }] of approving) {
-    const offered = (question.options ?? []).filter((option) => option?.label === label);
-    if (offered.length !== 1 || offered[0]?.preview !== preview) throw new Error(`the question's one ${label} option does not preview the prepared proposal unchanged`);
-  }
+  if (call.args.html !== askHtml) throw new Error("the Ask's `html` is not this Select's `askHtml` unchanged: ask again with it exactly as returned");
 
   const details = result.details;
-  if (details?.chatRedirect) throw new Error("the user chose to chat instead of answering");
-  // One question's answer is spread into the details without an ID; a batch's carry their question's ID.
-  const answers: AskAnswer[] = Array.isArray(details?.results)
-    ? details.results.filter((answer) => answer?.id === candidateId)
-    : questions.length === 1 && details ? [details] : [];
+  if (details?.timedOut) throw new Error("the Ask timed out, which submits the form as it stood, not the user's approval; ask again");
+  const answers = Array.isArray(details?.answers) ? details.answers.filter((answer) => answer?.name === candidateId) : [];
   const [answer] = answers;
-  if (!answer || answers.length > 1) throw new Error(`the Ask's result holds no single answer to question \`${candidateId}\``);
-  const labels = (question.options ?? []).map((option) => option?.label);
-  if (!isDeepStrictEqual(answer.options, labels)) throw new Error("the answer was given to other options than the question shows");
-  if (answer.timedOut) throw new Error("the answer was selected by a timeout: a default, not the user's approval");
-  if (answer.customInput !== undefined) {
-    throw new Error("the answer carries custom input, which approves nothing; ask again with a proposal that shows what it asks for");
+  if (!answer || answers.length > 1) throw new Error(`the Ask's result holds no single answer named \`${candidateId}\``);
+  const selected = answer.answer;
+  if (typeof selected !== "string" || selected === "") throw new Error("the user selected no option; ask again");
+  if (selected.startsWith(CUSTOM_INPUT)) {
+    throw new Error("the answer is custom input, which approves nothing; prepare a new proposal for what it asks and ask again");
   }
-  const picked = answer.selectedOptions ?? [];
-  const [selected] = picked;
-  if (picked.length !== 1 || selected === undefined || !approving.has(selected)) {
-    throw new Error(picked.length === 0 ? "the user selected no option" : `the user selected ${picked.map((label) => `\`${label}\``).join(", ")}, not ${[...approving.keys()].join(" or ")} alone`);
-  }
-  if (!answer.note) {
-    if (classified) throw new Error("`nonModifyingNote` classifies a note, but the user's answer carries no note");
-    return selected;
-  }
-  if (answer.noteOption !== undefined && answer.noteOption !== selected) throw new Error(`the user's note is on \`${answer.noteOption}\`, not on ${selected}; ask again`);
-  if (!classified) {
-    throw new Error("the answer carries a note the main agent has not classified: when it changes nothing the proposal shows, send `nonModifyingNote` with the note's exact text and your reason; a modifying or ambiguous note needs a new prepared proposal and Ask");
-  }
-  if (classified.note !== answer.note) throw new Error("`nonModifyingNote` does not quote the user's note exactly");
-  if (!classified.reason.trim()) throw new Error("`nonModifyingNote` needs the `reason` the note changes nothing approved");
+  if (!approving.has(selected)) throw new Error(`the user selected \`${selected}\`, not ${[...approving.keys()].join(" or ")}`);
   return selected;
 }

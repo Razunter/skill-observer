@@ -1,1 +1,1 @@
-A compaction's question names the skill, the amendment's size now and after the compaction, and the on-read fixes of this pass it includes, by gist, or 'none'. Its options are **Apply**, whose `preview` is the prepared compaction's `preview` (the new body, each reference file with its path, and the reference files it deletes), **Later** and **Decline**.
+A compaction's `remedy` names the skill, the amendment's size now and after the compaction, and the on-read fixes of this pass it includes, by gist, or 'none'.

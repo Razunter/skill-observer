@@ -5,7 +5,8 @@
  * read and a preview rendered from that operation; its successful result is the
  * branch artifact. A candidate that reconciles an approved on-read append or
  * rule with its changed target is prepared the same way, carrying that reconciliation.
- * Select accepts only references to those results.
+ * Select accepts only references to those results, and renders the one Ask
+ * form that shows the proposals it selected.
  */
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
@@ -21,7 +22,7 @@ import {
 } from "./ledger.js";
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
-import { approvalShape, checkReconciliation, isReconcilable, type ProposalReconciliation } from "./proposal-approval.js";
+import { APPLY, approvalShape, checkReconciliation, isReconcilable, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import { createProvenanceResolver, defaultSkillRoots, type ProvenanceResolver } from "./provenance.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
@@ -88,10 +89,10 @@ export type PreparedChange =
   | { operation: "compaction"; rule?: RuleIdentity; target: FileSnapshot; includes: string[]; body: string; references: ReferenceChange };
 type ProtectedChange = Exclude<PreparedChange, { operation: "direct-edit" }>;
 type StaleChange = Extract<PreparedChange, { operation: "stale-update" | "stale-delete" }>;
-/** A stale question's answer that changes the rule, and the preview its option shows. */
+/** A stale amendment's answer that changes the rule, and the preview the Ask form shows under its heading. */
 interface StaleAlternative { change: StaleChange; preview: string }
 
-/** Immutable reviewed data: what a question shows and what publication may later consider. */
+/** Immutable reviewed data: what the Ask form shows and what publication may later consider. */
 export type PreparedProposal = {
   candidateId: string;
   fingerprint: string;
@@ -103,7 +104,7 @@ export type PreparedProposal = {
   reconciles?: ProposalReconciliation;
 } & (
   | { change: Exclude<PreparedChange, StaleChange>; preview: string }
-  /** A stale amendment's one Keep/Update/Delete question: each prepared answer, Update before Delete. */
+  /** A stale amendment's one Keep/Update/Delete choice: each prepared answer, Update before Delete. */
   | { alternatives: StaleAlternative[] }
 ) & (SkillScope | ProjectScope);
 
@@ -175,7 +176,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return a reference per proposal plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule for its changed target: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. This tool neither asks, approves nor publishes and never calls a model.",
+    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return a reference per proposal plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule for its changed target: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither asks, approves nor publishes and never calls a model.",
     parameters: z.object({
       action: z.enum(["prepare", "select"]),
       candidates: z.array(z.union([
@@ -245,11 +246,57 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
       }
       const output = params?.action === "prepare"
         ? { eligible: details.eligible, needsRanking: details.needsRanking, judgeStates: details.judgeStates, failures: details.failures }
-        : { selected: details.selected, deferred: details.deferred, ...(details.fallback && { fallback: details.fallback }), failures: details.failures };
+        : {
+            selected: details.selected, deferred: details.deferred,
+            ...(details.selected.length > 0 && { askHtml: renderAskHtml(details.selected.map(({ proposal }) => proposal)) }),
+            ...(details.fallback && { fallback: details.fallback }), failures: details.failures,
+          };
       return { content: [{ type: "text", text: JSON.stringify(output) }], details, isError: details.failures.length > 0 };
     },
   });
 }
+
+/**
+ * The one form an observation pass asks with: a fieldset per proposal, in
+ * order, whose radio group is named by the proposal's candidate ID. No option
+ * is preselected, so the user chooses each answer. A preview sits in a `<p>`
+ * with `<br>` line breaks because the host cuts each `<pre>` line at the dialog
+ * width; the whitespace a `<p>` collapses is shown as marks instead.
+ */
+export function renderAskHtml(proposals: readonly PreparedProposal[]): string {
+  return ["<form>", ...proposals.map(renderFieldset), "</form>"].join("\n");
+}
+
+function renderFieldset(proposal: PreparedProposal): string {
+  const target = proposal.kind === "project" ? proposal.target.path : proposal.skill;
+  const previewParagraph = (preview: string) => `<p>${preview.split("\n").map((line) => escapeHtml(markHiddenWhitespace(line))).join("<br>")}</p>`;
+  const isStale = "alternatives" in proposal;
+  const staleLabels = isStale ? proposal.alternatives.map(({ change }) => STALE_OPTIONS[change.operation]) : [];
+  const previews = isStale
+    ? proposal.alternatives.flatMap(({ preview }, i) => [`<p><b>${staleLabels[i]}</b></p>`, previewParagraph(preview)])
+    : [previewParagraph(proposal.preview)];
+  const labels = isStale ? ["Keep", ...staleLabels]
+    : proposal.change.operation === "withdrawal" ? [APPLY, "Decline"] : [APPLY, "Later", "Decline"];
+  const evidence = proposal.evidence.map(({ quote, count, source }) => `<li>${escapeHtml(`"${quote}" (×${count}${source ? `, ${source}` : ""})`)}</li>`);
+  const name = escapeHtml(proposal.candidateId).replace(/"/g, "&quot;");
+  return [
+    "<fieldset>",
+    `<legend>${escapeHtml(`\`${target}\` (${proposal.kind}): ${proposal.gist}`)}</legend>`,
+    `<p>${escapeHtml(proposal.remedy)}</p>`,
+    ...(evidence.length > 0 ? ["<ul>", ...evidence, "</ul>"] : []),
+    ...previews,
+    // The host reports the text block right before a group as the answer's question.
+    `<p><b>${isStale ? "Keep, update or delete this stale amendment?" : "Apply this change?"}</b></p>`,
+    // The host reports text typed into the group's Other row as an option's label when it equals that option's value, so no value is a bare label.
+    ...labels.map((label) => `<label><input type="radio" name="${name}" value="${name}=${label}" required>${label}</label>`),
+    "</fieldset>",
+  ].join("\n");
+}
+
+/** Marks the whitespace of a preview line that the host's form would hide: `·` per space of an indent, a trailing run or a run of two or more, `→` per tab. */
+const markHiddenWhitespace = (line: string) => line.replace(/^ +| +$| {2,}/g, (run) => "·".repeat(run.length)).replace(/\t/g, "→");
+
+const escapeHtml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 /** The parameter schema of a {@link PreparedProposalRef}, wherever a tool takes one. */
 export function proposalRefSchema(z: SchemaBuilder) {
@@ -367,7 +414,7 @@ function preparedProposal(
     if (declined.has(fingerprint)) return undefined;
     const change = prepare();
     const preview = renderPreview(skill, kind, change);
-    // Native Ask shows a preview with CRLF as LF and a bare CR as a space, so the bytes shown would not be the bytes written.
+    // The Ask form collapses whitespace, so a CRLF or a bare CR would be written without ever being shown.
     if (preview.includes("\r")) throw new Error("the change holds a carriage return, which the Ask preview would not show; send its text with `\\n` line ends only");
     const reviewed = change.operation === "stale-update" || change.operation === "stale-delete" ? { alternatives: [{ change, preview }] } : { change, preview };
     return { candidateId: `${identityClass}:${fingerprint}`, fingerprint, ...base, ...reviewed };

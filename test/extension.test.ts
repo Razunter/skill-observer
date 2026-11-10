@@ -11,7 +11,6 @@ import { createProvenanceResolver, skillHash } from "../src/provenance.js";
 import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
 import type {
   AskDetails,
-  AskQuestion,
   CommandHandler,
   CustomMessage,
   ExtensionAPI,
@@ -671,37 +670,25 @@ const lastCallId = (host: ReturnType<typeof loadExtension>) => String(host.getBr
 const startPass = (host: ReturnType<typeof loadExtension>) =>
   host.getBranch().push({ type: "custom_message", id: `observe-${host.getBranch().length}`, customType: "skill-observer", content: "Observation pass." });
 
-type AskAnswer = NonNullable<AskDetails["results"]>[number];
-const APPLY: Partial<AskAnswer> = { selectedOptions: ["Apply"] };
+/** The user's answer to one selected proposal, as the host reports it: the chosen option's label, `""` for none, or `Other: <text>` for custom input. */
+type AnswerUser = (proposal: ReviewEntry["proposal"]) => string;
 
 /**
- * Saves a native `ask` call with one question per selected proposal,
- * identified by its candidate ID: Apply/Later/Decline previewing it on Apply,
- * or for a stale amendment Keep and Update/Delete previewing each alternative.
- * Saves its successful result too. Only the user's answers are synthetic, in
- * the shapes the installed host saves: one question's answer spread into the
- * details, a batch's under `results` with their question IDs. Returns the call ID.
+ * Saves a native `ask` call with the form `selection`, a Select's result,
+ * returned as `askHtml`, and its successful result in the shape the installed
+ * host saves: one answer per radio group, named by the proposal's candidate
+ * ID. Only the user's answers are synthetic, by default an explicit Apply.
+ * Returns the call ID.
  */
-function askUser(
-  host: ReturnType<typeof loadExtension>, selected: readonly ReviewEntry[],
-  answer: (question: AskQuestion, proposal: ReviewEntry["proposal"]) => Partial<AskAnswer> = () => APPLY,
-): string {
+function askUser(host: ReturnType<typeof loadExtension>, selection: ToolResult<unknown>, answer: AnswerUser = () => "Apply"): string {
   const id = `ask-${host.getBranch().length}`;
-  const options = ({ alternatives, preview }: ReviewEntry["proposal"]) => alternatives
-    ? [{ label: "Keep" }, ...alternatives.map((alternative) => ({ label: alternative.change.operation === "stale-update" ? "Update" : "Delete", preview: alternative.preview }))]
-    : ["Apply", "Later", "Decline"].map((label) => ({ label, ...(label === "Apply" && { preview }) }));
-  const questions: AskQuestion[] = selected.map(({ proposal }) => ({
-    id: proposal.candidateId, question: `Apply \`${proposal.gist}\` to \`${proposal.skill}\`?`, options: options(proposal), recommended: 0,
-  }));
-  const results: AskAnswer[] = questions.map((question, i) => ({
-    id: question.id, question: question.question, options: (question.options ?? []).map(({ label }) => String(label)), multi: false, selectedOptions: [],
-    ...answer(question, selected[i]!.proposal),
-  }));
-  const [only] = results;
-  const details: AskDetails = questions.length === 1 && only ? (({ id: _, ...single }) => single)(only) : { results };
+  const html: string = JSON.parse(resultText(selection)).askHtml;
+  const answers = reviewEntries(selection, "selected").map(({ proposal }) => ({ name: proposal.candidateId, question: "Apply this change?", answer: answer(proposal) }));
+  const submitted = Object.fromEntries(answers.filter((given) => given.answer).map((given) => [given.name, given.answer.startsWith("Other: ") ? given.answer.slice(7) : `${given.name}=${given.answer}`]));
   host.getBranch().push(
-    { type: "message", id: `call-${id}`, message: { role: "assistant", content: [{ type: "toolCall", id, name: "ask", arguments: { questions } }] } },
-    { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: "ask", isError: false, details, content: [{ type: "text", text: "User answers" }] } },
+    { type: "message", id: `call-${id}`, message: { role: "assistant", content: [{ type: "toolCall", id, name: "ask", arguments: { html } }] } },
+    { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: "ask", isError: false, details: { answers },
+      content: [{ type: "text", text: `User answers:\n${JSON.stringify(submitted, null, 2)}` }] } },
   );
   return id;
 }
@@ -720,33 +707,32 @@ const ruleCandidate = ({ rule, ...draft }: RuleProposalDraft) => ({
   ...draft, priority: "evidence", remedy: "Add a barrier against the repeated mistake", change: { operation: "rule", ...rule },
 });
 
-type AnswerUser = (question: AskQuestion, proposal: ReviewEntry["proposal"]) => Partial<AskAnswer>;
-
 /**
  * Starts an observation pass, runs the registered Prepare and Select over
- * `candidates`, and saves the user's answer to each in one native Ask, by
- * default an explicit Apply. Returns each selected proposal and its approval
- * for observer_resolve, by gist.
+ * `candidates`, and saves the user's answer to each in the native Ask of its
+ * Select's form, by default an explicit Apply. Returns each selected proposal
+ * and its approval for observer_resolve, by gist.
  */
 async function approveCandidates(host: ReturnType<typeof loadExtension>, candidates: readonly unknown[], answer?: AnswerUser) {
   startPass(host);
   const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [...candidates] });
   expect(prepared.isError).toBeFalsy();
   const references = reviewEntries(prepared).map((entry) => entry.reference);
-  // Select fills five slots, so a pass with more proposals selects them five at a time before its one Ask.
-  const selections: Array<{ selected: ReviewEntry[]; selectionToolCallId: string }> = [];
+  // Select fills five slots, so a pass with more proposals selects and asks them five at a time.
+  const selections: Array<{ selected: ReviewEntry[]; selectionToolCallId: string; askToolCallId: string }> = [];
   for (let i = 0; i < references.length; i += 5) {
     const selection = await host.callTool("observer_review", { action: "select", proposals: references.slice(i, i + 5) });
-    selections.push({ selected: reviewEntries(selection, "selected"), selectionToolCallId: lastCallId(host) });
+    const selectionToolCallId = lastCallId(host);
+    selections.push({ selected: reviewEntries(selection, "selected"), selectionToolCallId, askToolCallId: askUser(host, selection, answer) });
   }
-  const askToolCallId = askUser(host, selections.flatMap(({ selected }) => selected), answer);
   const selectionOf = (gist: string) => {
     const found = selections.find(({ selected }) => selected.some(({ proposal }) => proposal.gist === gist));
     if (!found) throw new Error(`Select did not select "${gist}"`);
-    return { entry: found.selected.find(({ proposal }) => proposal.gist === gist)!, selectionToolCallId: found.selectionToolCallId };
+    const { selectionToolCallId, askToolCallId } = found;
+    return { entry: found.selected.find(({ proposal }) => proposal.gist === gist)!, selectionToolCallId, askToolCallId };
   };
   const entry = (gist: string) => selectionOf(gist).entry;
-  return { entry, approval: (gist: string) => ({ proposal: entry(gist).reference, selectionToolCallId: selectionOf(gist).selectionToolCallId, askToolCallId }) };
+  return { entry, approval: (gist: string) => (({ entry, ...asked }) => ({ proposal: entry.reference, ...asked }))(selectionOf(gist)) };
 }
 
 /** Has the user approve `candidates` as {@link approveCandidates} does; returns each one's applied answer for observer_resolve, in candidate order. */
@@ -784,7 +770,7 @@ const compactionCandidate = ({ includes, body, references = [], skill = "tdd", k
 });
 
 /**
- * Has the user answer, in one pass and one Ask, each stale amendment with its
+ * Has the user answer, in one pass, each stale amendment with its
  * `select`, and each withdrawal, on-read fix, rule and compaction with Apply.
  * Returns the observer_resolve `stale`, `outcomes` and `compactions` carrying them out.
  */
@@ -795,8 +781,7 @@ async function approveAll(
 ) {
   const candidates = [...stale.flatMap(staleCandidates), ...withdrawals.map(withdrawalCandidate), ...fixes.map(onReadCandidate), ...rules.map(ruleCandidate),
     ...compactions.map(compactionCandidate)];
-  const { entry, approval } = await approveCandidates(host, candidates, (_question, proposal) =>
-    ({ selectedOptions: [stale.find(({ rule }) => proposal.gist === staleGist(rule))?.select ?? "Apply"] }));
+  const { entry, approval } = await approveCandidates(host, candidates, (proposal) => stale.find(({ rule }) => proposal.gist === staleGist(rule))?.select ?? "Apply");
   return {
     stale: stale.map(({ rule, select }) => ({ rule, action: select.toLowerCase(), approval: approval(staleGist(rule)) })),
     outcomes: [
@@ -814,9 +799,9 @@ async function approveAll(
 const resolveApproved = async (host: ReturnType<typeof loadExtension>, drafts: Parameters<typeof approveAll>[1]) =>
   host.callTool("observer_resolve", await approveAll(host, drafts));
 
-const approveOnRead = (host: ReturnType<typeof loadExtension>, drafts: readonly OnReadDraft[], answer?: (question: AskQuestion) => Partial<AskAnswer>) =>
+const approveOnRead = (host: ReturnType<typeof loadExtension>, drafts: readonly OnReadDraft[], answer?: AnswerUser) =>
   approve(host, drafts.map(onReadCandidate), answer);
-const approveRules = (host: ReturnType<typeof loadExtension>, drafts: readonly RuleProposalDraft[], answer?: (question: AskQuestion) => Partial<AskAnswer>) =>
+const approveRules = (host: ReturnType<typeof loadExtension>, drafts: readonly RuleProposalDraft[], answer?: AnswerUser) =>
   approve(host, drafts.map(ruleCandidate), answer);
 /** Runs the registered Prepare over pattern amendment and barrier rule drafts. */
 const prepareRules = (host: ReturnType<typeof loadExtension>, drafts: readonly RuleProposalDraft[]) =>
@@ -1159,6 +1144,28 @@ describe("observer_review prepared proposals", () => {
     expect(ownedFiles(host)).toEqual(before);
   });
 
+  it("returns one Ask form showing each selected proposal's preview whole, escaped and with hidden whitespace marked, with no option preselected", async () => {
+    const host = loadExtension();
+    const long = `A long line ${"that keeps going ".repeat(20)}to its end.`;
+    const selection = await prepareAndSelect(host, [{ kind: "local", skill: "ce-commit-jj", gist: "Use <jj> & not git", priority: "evidence", remedy: "Edit the skill",
+      change: { operation: "direct-edit", preview: `- if (a < b && c > d)\n    x  y\t\na\tb c \n\n${long}` }, evidence: [{ quote: "git commit <again>", count: 2, source: "user" }] }]);
+    const { candidateId } = reviewEntries(selection, "selected")[0]!.proposal;
+    const { askHtml } = JSON.parse(resultText(selection));
+    expect(askHtml).toBe([
+      "<form>", "<fieldset>",
+      "<legend>`ce-commit-jj` (local): Use &lt;jj&gt; &amp; not git</legend>",
+      "<p>Edit the skill</p>",
+      "<ul>", '<li>"git commit &lt;again&gt;" (×2, user)</li>', "</ul>",
+      `<p>- if (a &lt; b &amp;&amp; c &gt; d)<br>····x··y→<br>a→b c·<br><br>${long}</p>`,
+      "<p><b>Apply this change?</b></p>",
+      ...["Apply", "Later", "Decline"].map((label) => `<label><input type="radio" name="${candidateId}" value="${candidateId}=${label}" required>${label}</label>`),
+      "</fieldset>", "</form>",
+    ].join("\n"));
+    expect(askHtml).not.toMatch(/<pre|checked/);
+    const none = await host.callTool("observer_review", { action: "select", proposals: [] });
+    expect(JSON.parse(resultText(none))).not.toHaveProperty("askHtml");
+  });
+
   it("asks a stale amendment's Update and Delete as one question that takes one of the five slots", async () => {
     const host = loadExtension();
     splitAmendment(host, "tdd", "tdd-stale");
@@ -1174,6 +1181,9 @@ describe("observer_review prepared proposals", () => {
     const [question, ...rest] = reviewEntries(selected, "selected");
     expect(question?.proposal.alternatives?.map(({ change, preview }) => [change.operation, preview.split(" ")[0]])).toEqual([["stale-update", "Update"], ["stale-delete", "Delete"]]);
     expect(question?.proposal.alternatives?.[0]?.change).toMatchObject({ body: "Rewritten." });
+    const id = question?.proposal.candidateId;
+    const offered = [...String(JSON.parse(resultText(selected)).askHtml).matchAll(new RegExp(`name="${id}" value="${id}=(\\w+)"`, "g"))].map(([, label]) => label);
+    expect(offered).toEqual(["Keep", "Update", "Delete"]);
     expect(rest.map((entry) => entry.proposal.gist)).toEqual(["Fix 0", "Fix 1", "Fix 2", "Fix 3"]);
     expect(reviewEntries(selected, "deferred").map((entry) => entry.proposal.gist)).toEqual(["Fix 4"]);
   });
@@ -1281,7 +1291,7 @@ describe("observer_review prepared proposals", () => {
 
 describe("proposal approval of on-read appends", () => {
   const amendment = (host: ReturnType<typeof loadExtension>) => join(host.amendmentsDir, "tdd-amendment.md");
-  const approved = async (answer?: (question: AskQuestion) => Partial<AskAnswer>) => {
+  const approved = async (answer?: AnswerUser) => {
     const host = loadExtension();
     const [applied] = await approveOnRead(host, [{ gist: "Name the seam", section: "  ## Seams\n\nName the seam first.\n\n", evidence: [{ quote: "which seam?", count: 1 }] }], answer);
     if (!applied) throw new Error("no applied answer");
@@ -1303,17 +1313,17 @@ describe("proposal approval of on-read appends", () => {
     const call = host.getBranch().find((entry) => Array.isArray(entry.message?.content) && entry.message.content.some((block) => block.id === id));
     const result = host.getBranch().find((entry) => entry.message?.toolCallId === id);
     if (!call?.message || !result?.message) throw new Error("no saved Ask");
-    const [question] = (call.message.content as Array<{ arguments?: ToolArguments }>)[0]?.arguments?.questions ?? [];
-    if (!question) throw new Error("no saved question");
-    return { call, result, question, details: result.message.details as AskDetails };
+    const args = (call.message.content as Array<{ arguments?: ToolArguments }>)[0]?.arguments;
+    if (!args) throw new Error("no saved Ask arguments");
+    return { call, result, args, details: result.message.details as AskDetails };
   };
 
-  it("appends exactly the prepared section shown on the Apply option the user selected", async () => {
+  it("appends exactly the prepared section the form showed above the Apply the user chose", async () => {
     const { host, applied } = await approved();
     const result = await resolve(host, [applied]);
     expect(result.isError).toBeFalsy();
-    expect(savedAsk({ host, applied }).question.options?.[0]?.preview)
-      .toBe(`Create the on-read amendment \`${amendment(host)}\` of \`tdd\` (upstream) with this section:\n\n## Seams\n\nName the seam first.`);
+    expect(savedAsk({ host, applied }).args.html)
+      .toContain(`<p>Create the on-read amendment \`${amendment(host)}\` of \`tdd\` (upstream) with this section:<br><br>## Seams<br><br>Name the seam first.</p>`);
     expect(readRule(amendment(host)).body).toBe("## Seams\n\nName the seam first.");
     expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({
       skill: "tdd", kind: "upstream", gist: "Name the seam", outcome: "applied", fingerprint: proposalFingerprint("tdd", "Name the seam"),
@@ -1345,14 +1355,12 @@ describe("proposal approval of on-read appends", () => {
     await expectNoWrite(fixture.host, [answer(fixture)], reason);
   });
 
-  it.each<[string, string, Partial<AskAnswer>]>([
-    ["Decline", "selected `Decline`", { selectedOptions: ["Decline"] }],
-    ["Later", "selected `Later`", { selectedOptions: ["Later"] }],
-    ["no option", "selected no option", { selectedOptions: [] }],
-    ["Apply among other selections", "not Apply alone", { multi: true, selectedOptions: ["Apply", "Later"] }],
-    ["a timeout default", "timeout", { selectedOptions: ["Apply"], timedOut: true }],
-    ["a custom answer alone", "custom input", { selectedOptions: [], customInput: "Yes, apply it" }],
-    ["Apply with a note the main agent left unclassified", "has not classified", { selectedOptions: ["Apply"], note: "but only for unit tests", noteOption: "Apply" }],
+  it.each<[string, string, string]>([
+    ["Decline", "selected `Decline`", "Decline"],
+    ["Later", "selected `Later`", "Later"],
+    ["no option", "selected no option", ""],
+    ["Apply joined with another label", "selected `Apply, Later`", "Apply, Later"],
+    ["custom input", "custom input", "Other: yes apply it"],
   ])("writes nothing when the user's answer is %s", async (_label, reason, answer) => {
     const { host, applied } = await approved(() => answer);
     await expectNoWrite(host, [applied], reason);
@@ -1366,24 +1374,28 @@ describe("proposal approval of on-read appends", () => {
     }],
     ["text claiming consent over an empty answer", "selected no option", (fixture) => {
       const { result, details } = savedAsk(fixture);
-      details.selectedOptions = [];
+      details.answers![0]!.answer = "";
       result.message!.content = [{ type: "text", text: "User selected: Apply" }];
     }],
-    ["a chat redirect", "chat", (fixture) => { savedAsk(fixture).result.message!.details = { chatRedirect: true, questions: ["Apply?"] }; }],
-    ["a question under another ID", "no single question", (fixture) => { savedAsk(fixture).question.id = "proposal:000000000000"; }],
-    ["an Apply option previewing other content", "preview", (fixture) => {
-      const [apply] = savedAsk(fixture).question.options ?? [];
-      apply!.preview = "## Seams\n\nSubstituted.";
+    ["Apply submitted by a timeout", "timed out", (fixture) => { savedAsk(fixture).details.timedOut = true; }],
+    ["a form differing from the Select's by one character", "not this Select's `askHtml` unchanged", (fixture) => {
+      const { args } = savedAsk(fixture);
+      args.html = `${args.html} `;
     }],
-    ["an answer to other options", "other options", (fixture) => { savedAsk(fixture).details.options = ["Apply", "Decline"]; }],
+    ["an answer under another name", "no single answer", (fixture) => { savedAsk(fixture).details.answers![0]!.name = "proposal:000000000000"; }],
+    ["a result without answers", "no single answer", (fixture) => { savedAsk(fixture).details.answers = []; }],
+    ["two answers for the proposal", "no single answer", (fixture) => {
+      const { answers } = savedAsk(fixture).details;
+      answers!.push({ ...answers![0]! });
+    }],
     ["duplicate Ask results", "no single completed Ask call", (fixture) => { fixture.host.getBranch().push(structuredClone(savedAsk(fixture).result)); }],
     ["a hook-only Ask", "not an ask the model made itself", (fixture) => {
-      const { call, result, question, details } = savedAsk(fixture);
+      const { call, result, args, details } = savedAsk(fixture);
       const id = fixture.applied.approval.askToolCallId;
       fixture.host.setBranch(fixture.host.getBranch().flatMap((entry): SessionEntry[] => {
-        if (entry === call) return [{ type: "custom", id: "hook-call", customType: "skill-observer-tool-call", data: { toolCallId: id, toolName: "ask", input: { questions: [question] } } }];
+        if (entry === call) return [{ type: "custom", id: "hook-call", customType: "skill-observer-tool-call", data: { toolCallId: id, toolName: "ask", input: args } }];
         if (entry === result) return [{ type: "custom", id: "hook-result", customType: "skill-observer-tool-result",
-          data: { toolCallId: id, toolName: "ask", input: { questions: [question] }, isError: false, details, content: [] } }];
+          data: { toolCallId: id, toolName: "ask", input: args, isError: false, details, content: [] } }];
         return [entry];
       }));
     }],
@@ -1399,15 +1411,28 @@ describe("proposal approval of on-read appends", () => {
     await expectNoWrite(fixture.host, [fixture.applied], reason);
   });
 
-  it("binds each answer of a batched Ask to its own question and proposal", async () => {
+  it("binds each answer of one form to its own proposal", async () => {
     const host = loadExtension();
     const seams = `proposal:${proposalFingerprint("tdd", "Name the seam")}`;
     const [seamsAnswer, redAnswer] = await approveOnRead(host, [{ gist: "Name the seam", section: SEAMS }, { gist: "Red is a diff", section: RED }],
-      (question) => question.id === seams ? { multi: true, selectedOptions: ["Apply"] } : { selectedOptions: ["Decline"] });
+      (proposal) => proposal.candidateId === seams ? "Apply" : "Decline");
     const result = await resolve(host, [seamsAnswer, redAnswer]);
     expect(failures(result)).toEqual([expect.stringContaining("selected `Decline`")]);
     expect(readRule(amendment(host)).body).toBe(SEAMS);
     expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ gist: "Name the seam", outcome: "applied" })]);
+  });
+
+  it("writes nothing when the Ask showed the form of another Select than the approval cites", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare",
+      candidates: [{ gist: "Name the seam", section: SEAMS }, { gist: "Red is a diff", section: RED }].map(onReadCandidate) });
+    const references = reviewEntries(prepared).map((entry) => entry.reference);
+    await host.callTool("observer_review", { action: "select", proposals: references });
+    const selectionToolCallId = lastCallId(host);
+    const askToolCallId = askUser(host, await host.callTool("observer_review", { action: "select", proposals: references.slice(0, 1) }));
+    const answer = { skill: "tdd", kind: "upstream", gist: "Name the seam", outcome: "applied", approval: { proposal: references[0], selectionToolCallId, askToolCallId } };
+    await expectNoWrite(host, [answer], "not this Select's `askHtml` unchanged");
   });
 
   it.each<[string, string, (fixture: Approved) => void]>([
@@ -1466,42 +1491,6 @@ describe("proposal approval of on-read appends", () => {
     const result = await pending;
     expect(failures(result)).toEqual([expect.stringContaining("may retract")]);
     expect(observerBytes(host)).toEqual(before);
-  });
-
-  it("writes Apply with a note the main agent classified as non-modifying, and reports the classification bound to the user's note", async () => {
-    const { host, applied } = await approved(() => ({ selectedOptions: ["Apply"], note: "Thanks, this keeps biting me.", noteOption: "Apply" }));
-    const nonModifyingNote = { note: "Thanks, this keeps biting me.", reason: "Thanks and context; it asks for no change to the section." };
-    const result = await resolve(host, [{ ...applied, approval: { ...applied.approval, nonModifyingNote } }]);
-    expect(result.isError).toBeFalsy();
-    expect(readRule(amendment(host)).body).toBe("## Seams\n\nName the seam first.");
-    expect((result.details as { approvals: unknown[] }).approvals).toEqual([{
-      fingerprint: proposalFingerprint("tdd", "Name the seam"), approval: { ...applied.approval, nonModifyingNote }, selected: "Apply",
-    }]);
-    expect(resultText(result)).toContain(`the user's note "Thanks, this keeps biting me." is classified non-modifying by the main agent: Thanks and context; it asks for no change to the section.`);
-  });
-
-  it.each<[string, string, Partial<AskAnswer>, Record<string, unknown> | undefined]>([
-    ["a classification quoting other text than the note", "does not quote", { selectedOptions: ["Apply"], note: "Only for unit tests.", noteOption: "Apply" },
-      { note: "Thanks.", reason: "Praise only." }],
-    ["a classification without a reason", "reason", { selectedOptions: ["Apply"], note: "Thanks.", noteOption: "Apply" }, { note: "Thanks.", reason: " " }],
-    ["a classification of an answer without a note", "no note", { selectedOptions: ["Apply"] }, { note: "Thanks.", reason: "Praise only." }],
-    ["a classified note on another option", "on `Later`", { selectedOptions: ["Apply"], note: "Thanks.", noteOption: "Later" }, { note: "Thanks.", reason: "Praise only." }],
-    ["a classified custom answer alone", "custom input", { selectedOptions: [], customInput: "Yes, apply it" }, { note: "Yes, apply it", reason: "Agreement." }],
-    ["a classified note beside Decline", "selected `Decline`", { selectedOptions: ["Decline"], note: "Thanks.", noteOption: "Decline" }, { note: "Thanks.", reason: "Praise only." }],
-  ])("writes nothing for %s", async (_label, reason, answer, nonModifyingNote) => {
-    const { host, applied } = await approved(() => answer);
-    await expectNoWrite(host, [{ ...applied, approval: { ...applied.approval, nonModifyingNote } }], reason);
-  });
-
-  it("binds a note's classification to its own question of a batched Ask", async () => {
-    const host = loadExtension();
-    const notes: Record<string, string> = { "Name the seam": "Thanks.", "Red is a diff": "Only for unit tests." };
-    const answers = await approveOnRead(host, [{ gist: "Name the seam", section: SEAMS }, { gist: "Red is a diff", section: RED }],
-      (question) => ({ selectedOptions: ["Apply"], note: notes[String(question.question).includes("seam") ? "Name the seam" : "Red is a diff"], noteOption: "Apply" }));
-    const [seams, red] = answers.map((answer) => ({ ...answer, approval: { ...answer.approval, nonModifyingNote: { note: "Thanks.", reason: "Praise only." } } }));
-    const result = await resolve(host, [seams, red]);
-    expect(failures(result)).toEqual([expect.stringContaining("does not quote")]);
-    expect(readRule(amendment(host)).body).toBe(SEAMS);
   });
 });
 
@@ -2931,7 +2920,7 @@ describe("compacting on-read amendments", () => {
     const { entry, approval } = await approveCandidates(host, [
       onReadCandidate({ gist: "A red is an assertion diff.", section: RED }), onReadCandidate({ gist: declined, section: ONE_BEHAVIOUR }),
       compactionCandidate({ includes: ["A red is an assertion diff.", declined], body: `## Short\n\n${pointer(host, "tdd", "seams.md")}`, references: [{ name: "seams.md", body: "Seams." }] }),
-    ], (_question, proposal) => ({ selectedOptions: [proposal.gist === declined ? "Decline" : "Apply"] }));
+    ], (proposal) => proposal.gist === declined ? "Decline" : "Apply");
     const result = await host.callTool("observer_resolve", {
       outcomes: [
         { ...outcome("tdd", "upstream", "A red is an assertion diff.", "applied"), approval: approval("A red is an assertion diff.") },
@@ -3034,7 +3023,7 @@ describe("compacting on-read amendments", () => {
     });
 
     it("writes nothing for a compaction the user declined", async () => {
-      const { host, fix, compaction } = await approvedCompaction((_question, proposal) => ({ selectedOptions: [proposal.priority === "compaction" ? "Decline" : "Apply"] }));
+      const { host, fix, compaction } = await approvedCompaction((proposal) => proposal.priority === "compaction" ? "Decline" : "Apply");
       const before = ownedFiles(host);
 
       const result = await host.callTool("observer_resolve", { outcomes: [], compactions: [compaction] });
@@ -3363,7 +3352,7 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
     "a pattern amendment": { skill: "tdd", kind: "upstream", gist: "Run the whole file.", rule: focusedTestsRule },
   } satisfies Record<string, RuleProposalDraft>;
   type Approved = { host: ReturnType<typeof loadExtension>; applied: Awaited<ReturnType<typeof barrierFix>> };
-  const approved = async (draft: RuleProposalDraft, answer?: (question: AskQuestion) => Partial<AskAnswer>): Promise<Approved> => {
+  const approved = async (draft: RuleProposalDraft, answer?: AnswerUser): Promise<Approved> => {
     const host = loadExtension();
     const [applied] = await approveRules(host, [draft], answer);
     if (!applied) throw new Error("no applied answer");
@@ -3412,10 +3401,9 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
     await expectNoWrite(host, [answer], "needs `approval`");
   });
 
-  it.each<[string, string, Partial<AskAnswer>]>([
-    ["Decline", "selected `Decline`", { selectedOptions: ["Decline"] }],
-    ["a timeout default", "timeout", { selectedOptions: ["Apply"], timedOut: true }],
-    ["Apply with a note the main agent left unclassified", "has not classified", { selectedOptions: ["Apply"], note: "Only in this repo.", noteOption: "Apply" }],
+  it.each<[string, string, string]>([
+    ["Decline", "selected `Decline`", "Decline"],
+    ["custom input", "custom input", "Other: only in this repo"],
   ])("writes nothing when the user's answer is %s", async (_label, reason, answer) => {
     const { host, applied } = await approved(drafts["a barrier rule"], () => answer);
     await expectNoWrite(host, [applied], reason);
@@ -3438,16 +3426,6 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
     expect(failures(result)).toEqual([expect.stringContaining("may retract")]);
     expect(result.details).toMatchObject({ records: [], deferred: [] });
     expect(observerBytes(host)).toEqual(before);
-  });
-
-  it("accepts a barrier rule's Apply with a classified non-modifying note, then holds the rule for its replay", async () => {
-    const note = "Thanks, this keeps biting me.";
-    const { host, applied } = await approved(drafts["a barrier rule"], () => ({ selectedOptions: ["Apply"], note, noteOption: "Apply" }));
-    vi.stubEnv("PATH", "");
-    const nonModifyingNote = { note, reason: "Thanks and context; it asks for no change to the rule." };
-    const result = await host.callTool("observer_resolve", { outcomes: [{ ...applied, approval: { ...applied.approval, nonModifyingNote } }] });
-    expect(result.details).toMatchObject({ failures: [], deferred: [expect.stringContaining("omp")] });
-    expect(existsSync(jjFile(host))).toBe(false);
   });
 
   describe("reconciling a rule that changed after Prepare", () => {
@@ -4022,15 +4000,15 @@ describe("proposal approval of stale answers and withdrawals", () => {
       const [applied] = await approveOnRead(host, [{ gist: String(red.gist), section: RED, fingerprint: red.fingerprint }]);
       return { outcomes: [{ ...applied, outcome: "withdrawn" }] };
     }],
-    ["a stale amendment answered Keep", "not Update or Delete alone", async (host) => {
-      const { approval } = await approveCandidates(host, staleCandidates({ rule: "tdd-amendment", select: "Update", body: SEAMS }), () => ({ selectedOptions: ["Keep"] }));
+    ["a stale amendment answered Keep", "not Update or Delete", async (host) => {
+      const { approval } = await approveCandidates(host, staleCandidates({ rule: "tdd-amendment", select: "Update", body: SEAMS }), () => "Keep");
       return { stale: [{ rule: "tdd-amendment", action: "update", approval: approval(staleGist("tdd-amendment")) }] };
     }],
-    ["a stale question whose Delete option previews something else", "one Delete option does not preview", async (host) => {
+    ["a stale form whose Delete preview was replaced before asking", "not this Select's `askHtml` unchanged", async (host) => {
       const { stale } = await approveAll(host, { stale: [{ rule: "tdd-amendment", select: "Update", body: SEAMS }] });
       const ask = host.getBranch().findLast((entry) => entry.message?.role === "assistant");
-      const [question] = (ask?.message?.content as Array<{ arguments: { questions: AskQuestion[] } }>)[0]!.arguments.questions;
-      question!.options!.find((option) => option.label === "Delete")!.preview = "Keep everything.";
+      const args = (ask?.message?.content as Array<{ arguments: ToolArguments }>)[0]!.arguments;
+      args.html = args.html?.replace("go out of force", "stay in force");
       return { stale };
     }],
   ])("writes and records nothing for %s", async (_label, reason, params) => {
@@ -4085,7 +4063,8 @@ describe("proposal approval of stale answers and withdrawals", () => {
     const file = join(host.amendmentsDir, "tdd-afk-seams.md");
     startPass(host);
     host.getBranch().push({ type: "message", id: "prose", message: { role: "user", steering: true, content: "Please take back the afk seams fix." } });
-    const selected = reviewEntries(await prepareAndSelect(host, [withdrawalCandidate({ fingerprint: applied?.fingerprint, gist: String(applied?.gist) })]), "selected");
+    const selection = await prepareAndSelect(host, [withdrawalCandidate({ fingerprint: applied?.fingerprint, gist: String(applied?.gist) })]);
+    const selected = reviewEntries(selection, "selected");
     const selectionToolCallId = lastCallId(host);
     const answer = withdrawn(applied!);
 
@@ -4093,7 +4072,7 @@ describe("proposal approval of stale answers and withdrawals", () => {
     await expectNoWrite(host, { outcomes: [{ ...answer, approval: { proposal: selected[0]!.reference, selectionToolCallId, askToolCallId: selectionToolCallId } }] }, "is not an ask");
     expect(existsSync(file)).toBe(true);
 
-    const askToolCallId = askUser(host, selected);
+    const askToolCallId = askUser(host, selection);
     const result = await host.callTool("observer_resolve", { outcomes: [{ ...answer, approval: { proposal: selected[0]!.reference, selectionToolCallId, askToolCallId } }] });
 
     expect(result.isError).toBeFalsy();
@@ -4948,7 +4927,7 @@ describe("evidence-gated instructions", () => {
 });
 
 describe("error-path guidance in tool results", () => {
-  const CONDITIONS: readonly ToolResultCondition[] = ["changed-target", "ledger-append-failed", "cleanup-failed", "apply-note"];
+  const CONDITIONS: readonly ToolResultCondition[] = ["changed-target", "ledger-append-failed", "cleanup-failed", "custom-input"];
   /** Each `## What to do now` section of `text`, as the conditions whose guidance paragraphs it holds, in order; any other paragraph stays text. */
   const whatToDoNow = (text: string) => text.split("\n## What to do now\n\n").slice(1)
     .map((section) => section.split("\n\n").map((paragraph) => CONDITIONS.find((condition) => toolResultGuidance(condition) === paragraph) ?? paragraph));
@@ -4977,26 +4956,22 @@ describe("error-path guidance in tool results", () => {
   it("adds no guidance to a clean resolve, nor to a refusal whose target did not change", async () => {
     const host = loadExtension();
     const clean = await addOnReadFix(host, "tdd", "Name the seam before the first test.", SEAMS);
-    const unclassified = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }],
-      () => ({ selectedOptions: ["Apply"], note: "Only in unit tests.", noteOption: "Apply" }));
-    const refused = await resolve(host, unclassified);
-    expect(failures(refused)).toEqual([expect.stringContaining("has not classified")]);
+    const declined = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }], () => "Decline");
+    const refused = await resolve(host, declined);
+    expect(failures(refused)).toEqual([expect.stringContaining("selected `Decline`")]);
     expect([whatToDoNow(resultText(clean)), whatToDoNow(resultText(refused))]).toEqual([[], []]);
   });
 
-  it.each<[string, AskDetails, ToolResultCondition[][], boolean?]>([
-    ["Apply with a note", { selectedOptions: ["Apply"], note: "Thanks, this keeps biting me.", noteOption: "Apply" }, [["apply-note"]]],
-    ["a batch holding Apply with custom input and Apply with a note", { results: [
-      { id: "plain", ...APPLY }, { id: "custom", selectedOptions: ["Apply"], customInput: "Only for unit tests." }, { id: "noted", selectedOptions: ["Apply"], note: "Thanks." },
-    ] }, [["apply-note"]]],
-    ["custom input alone, as native single-select Ask leaves it", { selectedOptions: [], customInput: "Only for unit tests." }, [["apply-note"]]],
-    ["a batch whose only qualified answer is custom input", { results: [{ id: "plain", ...APPLY }, { id: "custom", selectedOptions: [], customInput: "Only for unit tests." }] }, [["apply-note"]]],
-    ["a plain Apply", APPLY, []],
-    ["a note on Later", { selectedOptions: ["Later"], note: "Next week.", noteOption: "Later" }, []],
-    ["Apply with a note, outside a pass", { selectedOptions: ["Apply"], note: "Thanks.", noteOption: "Apply" }, [], false],
-  ])("gives an ask result answered with %s the apply-note guidance only during a pass and when an answer carries custom input or an Apply a note", async (_label, details, expected, inPass = true) => {
+  it.each<[string, string[], ToolResultCondition[][], boolean?]>([
+    ["custom input", ["Other: only for unit tests"], [["custom-input"]]],
+    ["custom input beside a plain Apply", ["Apply", "Other: only for unit tests"], [["custom-input"]]],
+    ["a plain Apply", ["Apply"], []],
+    ["Later and no option", ["Later", ""], []],
+    ["custom input, outside a pass", ["Other: only for unit tests"], [], false],
+  ])("gives an ask result answered with %s the custom-input guidance only during a pass and when an answer is custom input", async (_label, answers, expected, inPass = true) => {
     const host = loadExtension();
     if (inPass) startPass(host);
+    const details: AskDetails = { answers: answers.map((answer, i) => ({ name: `proposal:${i}`, question: "Apply this change?", answer })) };
     const result = await host.toolResult({ toolName: "ask", toolCallId: "ask-answered", content: [{ type: "text", text: "User answers" }], details, isError: false });
     expect(result.content[0]).toEqual({ type: "text", text: "User answers" });
     expect(whatToDoNow(result.content.map((block) => block.text).join("\n"))).toEqual(expected);

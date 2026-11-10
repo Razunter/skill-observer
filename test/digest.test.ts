@@ -117,6 +117,84 @@ describe("correction-class skill signals", () => {
   });
 });
 
+describe("skill signals from an HTML-form ask", () => {
+  const STORE_FORM =
+    '<form><label><input type="radio" name="store" value="sqlite" checked> SQLite</label>' +
+    '<label><input type="radio" name="store" value="redis"> Redis</label></form>';
+
+  /** An `ask` call with its saved result, as OMP 18.18 writes them. */
+  function asked(
+    html: string,
+    answers: Array<{ name: string; question: string; answer: string }>,
+    submitted: Record<string, unknown>,
+    extra: { timedOut?: boolean } = {},
+  ): SessionEntry[] {
+    const lead = extra.timedOut ? "No answer before the timeout; submitted the form's current values:" : "User answers:";
+    return [
+      { type: "message", id: "ask-call", message: { role: "assistant", content: [{ type: "toolCall", id: "ask-1", name: "ask", arguments: { html } }] } },
+      { type: "message", id: "ask-result", message: { role: "toolResult", toolName: "ask", toolCallId: "ask-1",
+        content: [{ type: "text", text: `${lead}\n${JSON.stringify(submitted, null, 2)}` }], details: { answers, ...extra } } },
+    ];
+  }
+
+  it("flags the free text typed into a group's Other row as custom input", () => {
+    const entries = asked(STORE_FORM, [{ name: "store", question: "Session store", answer: "Other: I've started it" }], { store: "I've started it" });
+    expect(buildDigest(entries, env).signals).toEqual([
+      expect.objectContaining({ kind: "ask-custom-input", correction: true, questionId: "store", question: "Session store", customInput: "I've started it" }),
+    ]);
+  });
+
+  it("flags a submitted option other than the preselected one", () => {
+    const entries = asked(STORE_FORM, [{ name: "store", question: "Session store", answer: "Redis" }], { store: "redis" });
+    const signals = buildDigest(entries, env).signals;
+    expect(signals).toEqual([
+      expect.objectContaining({ kind: "ask-off-recommendation", questionId: "store", question: "Session store", recommended: "sqlite", selected: ["redis"] }),
+    ]);
+  });
+
+  it("reads preselected values from single-quoted, unquoted and entity-escaped attributes", () => {
+    const html =
+      "<form><input type='checkbox' name='tags' value='a &amp; b' checked><input type=checkbox name=tags value=c CHECKED>" +
+      '<input type="checkbox" name="tags" value="d"><input type="radio" name="other" value="x" checked></form>';
+    const unchanged = asked(html, [{ name: "tags", question: "Tags", answer: "A & B, C" }], { tags: ["c", "a & b"] });
+    expect(buildDigest(unchanged, env).signals).toEqual([]);
+    const changed = asked(html, [{ name: "tags", question: "Tags", answer: "A & B, D" }], { tags: ["a & b", "d"] });
+    expect(buildDigest(changed, env).signals).toEqual([
+      expect.objectContaining({ kind: "ask-off-recommendation", recommended: "a & b, c", selected: ["a & b", "d"] }),
+    ]);
+  });
+
+  it("decodes numeric character references in a preselected option's name and value", () => {
+    const html =
+      '<form><input type="radio" name="my&#32;store" value="a&#x20;b&#39;&apos;&#x1F600;" checked>' +
+      '<input type="radio" name="my&#32;store" value="c"></form>';
+    const unchanged = asked(html, [{ name: "my store", question: "Store", answer: "A" }], { "my store": "a b''😀" });
+    expect(buildDigest(unchanged, env).signals).toEqual([]);
+    const changed = asked(html, [{ name: "my store", question: "Store", answer: "C" }], { "my store": "c" });
+    expect(buildDigest(changed, env).signals).toEqual([
+      expect.objectContaining({ kind: "ask-off-recommendation", questionId: "my store", recommended: "a b''😀", selected: ["c"] }),
+    ]);
+  });
+
+  it.each([
+    ["the preselected option was submitted", asked(STORE_FORM, [{ name: "store", question: "Session store", answer: "SQLite" }], { store: "sqlite" })],
+    ["the form timed out", asked(STORE_FORM, [{ name: "store", question: "Session store", answer: "Other: later" }], { store: "later" }, { timedOut: true })],
+    ["nothing was preselected", asked(STORE_FORM.replace(" checked", ""), [{ name: "store", question: "Session store", answer: "Redis" }], { store: "redis" })],
+    ["nothing was chosen", asked(STORE_FORM, [{ name: "store", question: "Session store", answer: "" }], {})],
+    ["a text field holds free text", asked('<form><input type="text" name="why" value="because"></form>', [{ name: "why", question: "Why", answer: "Use the other store" }], { why: "Use the other store" })],
+  ])("finds no signal when %s", (_label, entries) => {
+    expect(buildDigest(entries, env).signals).toEqual([]);
+  });
+
+  it("keeps only custom input from an observation pass's ask", () => {
+    const pass: SessionEntry = { type: "custom_message", customType: "skill-observer" };
+    const choice = asked(STORE_FORM, [{ name: "store", question: "Session store", answer: "Redis" }], { store: "redis" });
+    expect(buildDigest([pass, ...choice], env).signals).toEqual([]);
+    const custom = asked(STORE_FORM, [{ name: "store", question: "Session store", answer: "Other: neither" }], { store: "neither" });
+    expect(buildDigest([pass, ...custom], env).signals.map((signal) => signal.kind)).toEqual(["ask-custom-input"]);
+  });
+});
+
 describe("skills loaded in the session", () => {
   const digestOf = (...groups: Array<keyof typeof fx>) => {
     const { roots, relocate } = makeSkillHome();

@@ -110,9 +110,12 @@ function recommendedLabel(question: AskQuestion): string | undefined {
 
 function askSignals(
   entryId: string | undefined,
-  questions: readonly AskQuestion[],
+  call: ToolArguments,
   details: AskDetails,
+  resultText: string,
 ): RawSignal[] {
+  if (Array.isArray(details.answers)) return formAskSignals(entryId, call.html ?? "", details, resultText);
+  const questions = call.questions ?? [];
   const answers = details.results ?? (details.selectedOptions || details.customInput ? [details] : []);
   const signals: RawSignal[] = [];
   for (const answer of answers) {
@@ -144,6 +147,86 @@ function askSignals(
     }
   }
   return signals;
+}
+
+const CUSTOM_INPUT_PREFIX = "Other: ";
+
+/** Signals of an answered HTML form, the shape `ask` has had since OMP 18.18. */
+function formAskSignals(
+  entryId: string | undefined,
+  html: string,
+  details: AskDetails,
+  resultText: string,
+): RawSignal[] {
+  // The deadline submitted the form's defaults; the user answered nothing.
+  if (details.timedOut) return [];
+  const signals: RawSignal[] = [];
+  for (const answer of details.answers ?? []) {
+    const base = { correction: true, entryId, questionId: answer.name, question: answer.question ?? "" };
+
+    if (answer.answer?.startsWith(CUSTOM_INPUT_PREFIX)) {
+      const customInput = clip(answer.answer.slice(CUSTOM_INPUT_PREFIX.length), CORRECTION_TEXT_CHARS);
+      if (customInput) signals.push({ ...base, kind: "ask-custom-input", customInput });
+      continue;
+    }
+
+    if (answer.name === undefined) continue;
+    const preselected = preselectedValues(html, answer.name);
+    const selected = submittedValues(resultText, answer.name);
+    if (preselected.length === 0 || selected.length === 0) continue;
+    const tookPreselection =
+      selected.length === preselected.length && selected.every((value) => preselected.includes(value));
+    if (!tookPreselection) {
+      signals.push({ ...base, kind: "ask-off-recommendation", recommended: preselected.join(", "), selected });
+    }
+  }
+  return signals;
+}
+
+const INPUT_TAG = /<input\b((?:[^>"']|"[^"]*"|'[^']*')*)>/gi;
+const ATTRIBUTE = /([^\s"'=<>/]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>]+)))?/g;
+const CHARACTER_REFERENCE = /&(?:#(\d+)|#[xX]([0-9a-fA-F]+)|(amp|lt|gt|quot|apos));/g;
+const ENTITIES: Record<string, string> = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" };
+
+/** The values of the radios and checkboxes named `name` that the form shows already chosen. */
+function preselectedValues(html: string, name: string): string[] {
+  // shortcut: a <select>'s `selected` option is not scanned, scan it when the digest must see select defaults.
+  const values: string[] = [];
+  for (const [, tagBody = ""] of html.matchAll(INPUT_TAG)) {
+    const attributes = new Map<string, string>();
+    for (const [, key = "", double, single, bare] of tagBody.matchAll(ATTRIBUTE)) {
+      const raw = double ?? single ?? bare ?? "";
+      const decoded = raw.replace(CHARACTER_REFERENCE, (reference, decimal?: string, hex?: string, entity?: string) => {
+        if (entity) return ENTITIES[entity]!;
+        const codePoint = decimal ? Number(decimal) : Number.parseInt(hex!, 16);
+        // A reference past the last code point stays as written: String.fromCodePoint throws on it.
+        return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : reference;
+      });
+      attributes.set(key.toLowerCase(), decoded);
+    }
+    const type = attributes.get("type")?.toLowerCase();
+    const isChoice = type === "radio" || type === "checkbox";
+    const value = attributes.get("value");
+    if (isChoice && attributes.has("checked") && attributes.get("name") === name && value) values.push(value);
+  }
+  return values;
+}
+
+/** What the form submitted for `name`, from the JSON object the result text carries after its first line. */
+function submittedValues(resultText: string, name: string): string[] {
+  let data: unknown;
+  try {
+    data = JSON.parse(resultText.slice(resultText.indexOf("\n") + 1));
+  } catch {
+    // A result text without the JSON cannot show what was submitted, so it supports no signal.
+    return [];
+  }
+  if (typeof data !== "object" || data === null) return [];
+  const value = (data as Record<string, unknown>)[name];
+  return (Array.isArray(value) ? value : [value])
+    .filter((item) => typeof item === "string" || typeof item === "number")
+    .map(String)
+    .filter(Boolean);
 }
 
 function textOf(content: AgentMessage["content"]): string {
@@ -345,7 +428,7 @@ export function buildDigest(
     if (entry.type === "ttsr_injection") recordedInterrupts.add(entry.parentId);
   }
 
-  const askQuestions = new Map<string, AskQuestion[]>();
+  const askCalls = new Map<string, ToolArguments>();
   const calls = new Map<string, ToolCallRecord>();
   // Subagent job id → the `task` call that spawned it.
   const jobs = new Map<string, ToolCallRecord>();
@@ -432,7 +515,7 @@ export function buildDigest(
         turn.calls.push(call);
         if (block.id) calls.set(block.id, call);
         if (block.name === "ask" && block.id) {
-          askQuestions.set(block.id, block.arguments?.questions ?? []);
+          askCalls.set(block.id, block.arguments ?? {});
         } else if (block.name === "read" && typeof block.arguments?.path === "string") {
           call.skill = skillReadBy(block.arguments.path, env.provenance);
           if (call.skill) attemptedSkills.set(call.skill.kind === "unknown" ? call.skill.name : call.skill.path, call.skill);
@@ -465,8 +548,11 @@ export function buildDigest(
           skills: [...turn.skills],
         }, turn.calls[0]?.id && `${turn.calls[0].id}:workflow:`);
       } else if (message.toolName === "ask" && message.details) {
-        const questions = askQuestions.get(message.toolCallId ?? "") ?? [];
-        for (const signal of askSignals(entry.id, questions, message.details)) {
+        const askCall = askCalls.get(message.toolCallId ?? "") ?? {};
+        const firstText = typeof message.content === "string"
+          ? message.content
+          : message.content?.find((block) => block.type === "text")?.text ?? "";
+        for (const signal of askSignals(entry.id, askCall, message.details, firstText)) {
           if (!turn.observing || signal.kind === "ask-custom-input") correct(signal);
         }
       } else if (
