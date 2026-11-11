@@ -42,8 +42,21 @@ export function remedyOutcomes(records: readonly LedgerRecord[], digest: Session
   return outcomes;
 }
 
-export function renderRemedyOutcomes(outcomes: readonly RemedyOutcome[]): string {
+/**
+ * Lists the outcomes this session could have exercised: project fixes and fixes
+ * for a skill the digest loaded. The rest are only counted, since their skill's
+ * instructions never reached the session.
+ */
+export function renderRemedyOutcomes(outcomes: readonly RemedyOutcome[], records: readonly LedgerRecord[], digest: SessionDigest): string {
   if (!outcomes.length) return "";
-  return ["### Remedy outcomes", "", ...outcomes.map((outcome) =>
-    `- ${outcome.fingerprint}: ${outcome.status}${outcome.evidence.length ? ` (evidence: ${outcome.evidence.join(", ")})` : "; missing relevant delivery/exercise evidence"}.`)].join("\n");
+  const latest = new Map(records.map((record) => [record.fingerprint, record]));
+  const loaded = new Set(digest.skills.map((skill) => skill.name));
+  const listed = outcomes.filter(({ fingerprint }) => {
+    const record = latest.get(fingerprint)!;
+    return record.kind === "project" || loaded.has(record.skill);
+  });
+  const unlisted = outcomes.length - listed.length;
+  return ["### Remedy outcomes", "", ...listed.map((outcome) =>
+    `- ${outcome.fingerprint}: ${outcome.status}${outcome.evidence.length ? ` (evidence: ${outcome.evidence.join(", ")})` : "; missing relevant delivery/exercise evidence"}.`),
+  ...(unlisted ? [`- ${unlisted} more ${unlisted === 1 ? "fix" : "fixes"} not listed: ${unlisted === 1 ? "its skill was" : "their skills were"} not loaded in this session.`] : [])].join("\n");
 }

@@ -4,7 +4,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirS
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { appendLedger, type LedgerRecord, proposalFingerprint, readLedger } from "../src/ledger.js";
+import { appendLedger, canonicalProjectTarget, type LedgerRecord, projectFingerprint, proposalFingerprint, readLedger } from "../src/ledger.js";
 import skillObserver from "../src/skill-observer.js";
 import { buildDigest } from "../src/digest.js";
 import { createProvenanceResolver, skillHash } from "../src/provenance.js";
@@ -5061,6 +5061,60 @@ describe("re-offer conditions on Later entries", () => {
     expect(result.isError).toBe(true);
     expect(failures(result)).toEqual([expect.stringContaining("`reoffer` is blank"), expect.stringContaining("`reoffer` is blank")]);
     expect(result.details).toMatchObject({ records: [] });
+  });
+});
+
+describe("remedy outcomes in the observation payload", () => {
+  /** A host where `tdd` is read and the ledger holds an applied fix for each of `skills` (with its on-read amendment) and, with `project`, an applied project-environment fix; returns the fixes' fingerprints. */
+  async function hostWithFixes(skills: readonly string[], project: boolean) {
+    const host = loadExtension();
+    for (const skill of skills) splitAmendment(host, skill, `${skill}-fix`);
+    const fingerprints = skills.map((skill) => proposalFingerprint(skill, `Gist of ${skill}-fix.`));
+    if (project) {
+      const target = canonicalProjectTarget(host.skillHome.roots.cwd, { scope: "project", root: host.skillHome.roots.cwd, path: "package.json", mechanism: "Wire the typecheck." });
+      const fingerprint = projectFingerprint(target);
+      appendFileSync(host.ledgerFile, `${JSON.stringify({ fingerprint, kind: "project", target, gist: "Wire the typecheck.", outcome: "applied", timestamp: new Date().toISOString(), sessionId: "fixture-session" })}\n`);
+      fingerprints.push(fingerprint);
+    }
+    host.setBranch(fx.plainUserMessage);
+    await readSkill(host, "skill://tdd");
+    return { host, fingerprints };
+  }
+
+  /** The list under the payload's Remedy outcomes heading, one line per item; `undefined` without the heading. */
+  async function payloadOutcomes(host: ReturnType<typeof loadExtension>) {
+    await host.runCommand("observe");
+    const blocks = String(host.sent[0]?.message.content).split("\n\n");
+    const heading = blocks.indexOf("### Remedy outcomes");
+    return heading < 0 ? undefined : blocks[heading + 1]!.split("\n");
+  }
+
+  it("lists the fixes for loaded skills and the project, and counts the rest as not loaded in this session", async () => {
+    const { host, fingerprints: [loaded, unloaded, project] } = await hostWithFixes(["tdd", "domain-modeling"], true);
+
+    const lines = await payloadOutcomes(host);
+
+    expect(lines).toEqual([
+      expect.stringMatching(new RegExp(`^- ${loaded}: delivered\\b`)),
+      expect.stringMatching(new RegExp(`^- ${project}: inconclusive\\b`)),
+      expect.stringMatching(/\b1\b.*not loaded in this session/),
+    ]);
+    expect(lines!.join("\n")).not.toContain(unloaded!);
+  });
+
+  it("keeps the heading with only the count when no fix's skill was loaded", async () => {
+    const { host } = await hostWithFixes(["domain-modeling", "grill-with-docs"], false);
+    expect(await payloadOutcomes(host)).toEqual([expect.stringMatching(/\b2\b.*not loaded in this session/)]);
+  });
+
+  it.each([
+    ["loaded, unloaded and project fixes", ["tdd", "domain-modeling"], true],
+    ["only unloaded-skill fixes", ["domain-modeling", "grill-with-docs"], false],
+  ] as const)("leaves /observe-report listing every outcome for %s", async (_label, skills, project) => {
+    const { host, fingerprints } = await hostWithFixes(skills, project);
+    await host.runCommand("observe-report");
+    const listed = host.notices.at(-1)!.split("\n").filter((line) => /^- [0-9a-f]+: /.test(line));
+    expect(listed.map((line) => line.split(":")[0]!.slice(2)).sort()).toEqual([...fingerprints].sort());
   });
 });
 

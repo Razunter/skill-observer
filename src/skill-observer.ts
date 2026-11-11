@@ -136,7 +136,7 @@ async function observationPayload(
     { name: "note", text: note && `## User note\n\n${note}` },
     { name: "digest", text: `## Session digest\n\n${renderDigest(digest)}` },
     { name: "ledger", text: renderLedger(ledger) },
-    { name: "outcomes", text: renderRemedyOutcomes(remedyOutcomes(ledger, digest)) },
+    { name: "outcomes", text: renderRemedyOutcomes(remedyOutcomes(ledger, digest), ledger, digest) },
     { name: "rules-in-force", text: renderRulesInForce(inForce, readHandWrittenRules(userRulesDir())) },
     { name: "project", text: gates.has("project") ? projectSections(ctx.cwd, provenance) : "" },
     { name: "retro", text: retro?.text ?? "" },
