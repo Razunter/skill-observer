@@ -201,11 +201,7 @@ export function checkReconciliation(
  * holds no such approval in the current pass.
  */
 function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): { proposal: PreparedProposal; change: ApprovedChange; selected: string; answeredAt: number } {
-  const passStart = observationPassStart(branch);
-  if (passStart === undefined) {
-    throw new Error("no observation pass is current on this branch: a later prompt, `/skill:` start or `/clear` ended it, so its answers approve nothing");
-  }
-  const { proposal } = preparedEntry(evidence, ref.proposal);
+  const proposal = preparedInPass(ref.proposal, evidence, branch);
   const options = approvingOptions(proposal);
 
   const prepare = evidence.completedCall(ref.proposal.reviewToolCallId);
@@ -221,13 +217,27 @@ function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence,
   }
   const askHtml = renderAskHtml(chosen.map(({ proposal }: { proposal: PreparedProposal }) => proposal));
   const selected = checkAnswer(ask, askHtml, proposal.candidateId, options);
-  if (prepare.call.position < passStart) throw new Error("the proposal was prepared in an earlier observation pass; prepare, select and ask again");
   if (prepare.result.position > selection.call.position || selection.result.position > ask.call.position) {
     throw new Error("the Ask must follow the Select, and the Select the Prepare, in this observation pass");
   }
   const spokeAfter = branch.slice(ask.result.position + 1).some((entry) => isFromUser(entry.message));
   if (spokeAfter) throw new Error("the user sent a message after answering, which may retract or change the approval; ask again");
   return { proposal, change: options.get(selected)!, selected, answeredAt: ask.result.position };
+}
+
+/**
+ * The proposal `ref` locates, prepared in the current observation pass: an
+ * answer of this pass, approved or not, cites only a proposal of this pass.
+ * Throws with the precise reason otherwise.
+ */
+export function preparedInPass(ref: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): PreparedProposal {
+  const passStart = observationPassStart(branch);
+  if (passStart === undefined) {
+    throw new Error("no observation pass is current on this branch: a later prompt, `/skill:` start or `/clear` ended it, so its answers approve nothing");
+  }
+  const { proposal } = preparedEntry(evidence, ref);
+  if (evidence.completedCall(ref.reviewToolCallId).call.position < passStart) throw new Error("the proposal was prepared in an earlier observation pass; prepare, select and ask again");
+  return proposal;
 }
 
 /** The options whose selection approves a change of `proposal`, each with that change. */

@@ -4187,6 +4187,132 @@ describe("proposal approval of stale answers and withdrawals", () => {
   });
 });
 
+describe("answers citing their prepared proposal", () => {
+  const recorded = (fields: Record<string, unknown>) => ({ ...fields, timestamp: expect.any(String), sessionId: "fixture-session" });
+  const sourced = (quote: string) => [{ quote, count: 2, source: `signal for ${quote}` }];
+  /** Prepares one on-read fix of `tdd` per gist, each citing its own sourced evidence, and selects them: the sixth is deferred. */
+  async function preparedFixes(host: ReturnType<typeof loadExtension>, gists: string[]) {
+    startPass(host);
+    const candidates = gists.map((gist) => ({ ...onReadCandidate({ gist, section: `## ${gist}\n\nText for ${gist}.` }), evidence: sourced(gist) }));
+    const selection = await prepareAndSelect(host, candidates);
+    const reference = (gist: string) =>
+      [...reviewEntries(selection, "selected"), ...reviewEntries(selection, "deferred")].find(({ proposal }) => proposal.gist === gist)!.reference;
+    return { selection, reference };
+  }
+
+  it("carries out an applied on-read fix, a rule and a withdrawal from their outcome and approval alone, recorded as prepared", async () => {
+    const host = loadExtension();
+    splitAmendment(host, "domain-modeling", "dm-define-terms");
+    const [fix] = ledgerRecords(host.ledgerFile);
+    if (!fix) throw new Error("no applied fix");
+    // The rule's replay can't run without `omp`, so it is recorded as Later under its prepared identity.
+    vi.stubEnv("PATH", "");
+    const { outcomes } = await approveAll(host, {
+      withdrawals: [{ skill: "domain-modeling", fingerprint: fix.fingerprint, gist: String(fix.gist) }],
+      fixes: [{ gist: "Name the seam", section: SEAMS, evidence: [{ quote: "which seam?", count: 2 }] }],
+      rules: [{ skill: "ce-commit-jj", kind: "local", gist: "Commit with jj, not git.", rule: JJ_NOT_GIT }],
+    });
+
+    const result = await resolve(host, outcomes.map(({ outcome, approval }) => ({ outcome, approval })));
+
+    expect(failures(result)).toEqual([]);
+    expect(existsSync(join(host.amendmentsDir, "dm-define-terms.md"))).toBe(false);
+    expect(readRule(join(host.amendmentsDir, "tdd-amendment.md")).body).toBe(SEAMS);
+    expect(ledgerRecords(host.ledgerFile).slice(1)).toEqual([
+      recorded({ fingerprint: fix.fingerprint, skill: "domain-modeling", kind: "upstream", gist: fix.gist, outcome: "withdrawn", rule: fix.rule }),
+      recorded({ fingerprint: proposalFingerprint("tdd", "Name the seam"), skill: "tdd", kind: "upstream", gist: "Name the seam", outcome: "applied",
+        rule: join(host.amendmentsDir, "tdd-amendment.md"), evidence: [{ quote: "which seam?", count: 2 }] }),
+      recorded({ fingerprint: proposalFingerprint("ce-commit-jj", "Commit with jj, not git."), skill: "ce-commit-jj", kind: "local", gist: "Commit with jj, not git.", outcome: "later" }),
+    ]);
+  });
+
+  it("records a Later, a Decline and a Select-deferred proposal from their proposal reference alone, under its identity and evidence without its source", async () => {
+    const host = loadExtension();
+    const gists = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth"];
+    const { selection, reference } = await preparedFixes(host, gists);
+    expect(reviewEntries(selection, "deferred").map(({ proposal }) => proposal.gist)).toEqual(["Sixth"]);
+    askUser(host, selection, ({ gist }) => (gist === "First" ? "Later" : gist === "Second" ? "Decline" : ""));
+
+    const result = await resolve(host, [
+      { outcome: "later", proposal: reference("First"), reoffer: "Once the seam is named twice more." },
+      { outcome: "declined", proposal: reference("Second") },
+      { outcome: "later", proposal: reference("Sixth"), reoffer: "Selected past the cap; offer it next pass." },
+    ]);
+
+    expect(failures(result)).toEqual([]);
+    const answered = (gist: string, outcome: string, reoffer?: string) => recorded({
+      fingerprint: proposalFingerprint("tdd", gist), skill: "tdd", kind: "upstream", gist, outcome,
+      evidence: [{ quote: gist, count: 2 }], ...(reoffer && { reoffer }),
+    });
+    expect(ledgerRecords(host.ledgerFile)).toEqual([
+      answered("First", "later", "Once the seam is named twice more."),
+      answered("Second", "declined"),
+      answered("Sixth", "later", "Selected past the cap; offer it next pass."),
+    ]);
+  });
+
+  it("records a cited proposal's evidence over a re-offered entry's earlier evidence, and carries the earlier evidence when the proposal cites none", async () => {
+    const host = loadExtension();
+    const earlier = [{ quote: "run only the failing test", count: 3 }];
+    await resolve(host, [
+      { ...outcome("tdd", "upstream", "Run the failing test first.", "later"), evidence: earlier, reoffer: "When it recurs." },
+      { ...outcome("tdd", "upstream", "Name the seam.", "later"), evidence: earlier, reoffer: "When it recurs." },
+    ]);
+    const [cited, uncited] = ledgerRecords(host.ledgerFile);
+    startPass(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
+      { ...onReadCandidate({ gist: "Run the failing test first.", section: RED, fingerprint: cited?.fingerprint }), evidence: sourced("the whole suite again") },
+      onReadCandidate({ gist: "Name the seam.", section: SEAMS, fingerprint: uncited?.fingerprint }),
+    ] });
+    const [withEvidence, without] = reviewEntries(prepared).map(({ reference }) => reference);
+
+    await resolve(host, [{ outcome: "declined", proposal: withEvidence }, { outcome: "declined", proposal: without }]);
+
+    expect(ledgerRecords(host.ledgerFile).slice(2)).toEqual([
+      expect.objectContaining({ fingerprint: cited?.fingerprint, outcome: "declined", evidence: [{ quote: "the whole suite again", count: 2 }] }),
+      expect.objectContaining({ fingerprint: uncited?.fingerprint, outcome: "declined", evidence: earlier }),
+    ]);
+  });
+
+  it.each<[string, string, (host: ReturnType<typeof loadExtension>, reference: (gist: string) => unknown) => Promise<unknown>]>([
+    ["a Later whose supplied gist differs from its proposal's", "not this answer", async (_host, reference) =>
+      ({ outcome: "later", proposal: reference("First"), gist: "Second", reoffer: "Later." })],
+    ["a Decline whose supplied skill differs from its proposal's", "not this answer", async (_host, reference) =>
+      ({ outcome: "declined", proposal: reference("First"), skill: "grill-with-docs" })],
+    ["a Decline whose supplied kind differs from its proposal's", "not this answer", async (_host, reference) =>
+      ({ outcome: "declined", proposal: reference("First"), kind: "local" })],
+    ["an approved fix whose supplied gist differs from its proposal's", "not this answer", async (host) => {
+      const [applied] = await approveOnRead(host, [{ gist: "Name the seam", section: SEAMS }]);
+      return { outcome: "applied", approval: applied!.approval, gist: "Name every seam" };
+    }],
+    ["an answer citing its proposal through both `approval` and `proposal`", "cites its proposal once", async (host, reference) => {
+      const [applied] = await approveOnRead(host, [{ gist: "Name the seam", section: SEAMS }]);
+      return { outcome: "applied", approval: applied!.approval, proposal: reference("First") };
+    }],
+    ["an answer citing nothing without its gist", "needs its `skill`, `kind` and `gist`", async () => ({ outcome: "declined", skill: "tdd", kind: "upstream" })],
+    ["a Decline citing a proposal of an earlier observation pass", "earlier observation pass", async (host, reference) => {
+      startPass(host);
+      return { outcome: "declined", proposal: reference("First") };
+    }],
+    ["a Decline citing a withdrawal", "which `proposal` does not answer", async (host) => {
+      splitAmendment(host, "tdd", "tdd-afk-seams");
+      const fix = ledgerRecords(host.ledgerFile).at(-1)!;
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [withdrawalCandidate({ fingerprint: fix.fingerprint, gist: String(fix.gist) })] });
+      return { outcome: "declined", proposal: reviewEntries(prepared)[0]!.reference };
+    }],
+  ])("records and writes nothing for %s", async (_label, reason, answer) => {
+    const host = loadExtension();
+    const { reference } = await preparedFixes(host, ["First"]);
+    const params = await answer(host, reference);
+    const before = observerBytes(host);
+
+    const result = await resolve(host, [params]);
+
+    expect(failures(result)).toEqual([expect.stringContaining(reason)]);
+    expect(observerBytes(host)).toEqual(before);
+  });
+});
+
 describe("observer_resolve takes no raw protected change", () => {
   const references = [{ name: "seams.md", body: "Seam recipes." }];
   const withdrawn = { ...outcome("tdd", "upstream", "A red is an assertion diff.", "withdrawn"), fingerprint: proposalFingerprint("tdd", "A red is an assertion diff.") };
