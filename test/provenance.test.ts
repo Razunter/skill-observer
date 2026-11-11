@@ -2,7 +2,7 @@ import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createProvenanceResolver } from "../src/provenance.js";
-import { CE_PLUGIN, installPlugin, makeSkillHome, writeSkill } from "./skill-home.js";
+import { CE_PLUGIN, copySkillEntry, installPlugin, makeSkillHome, writeSkill } from "./skill-home.js";
 
 describe("skill provenance", () => {
   it("labels a skill in the lock as upstream, with its folder hash and installed folder", () => {
@@ -118,5 +118,29 @@ describe("skill provenance", () => {
     expect(
       createProvenanceResolver(roots).byPath(".agents/skills/admin-browser-testing/SKILL.md"),
     ).toEqual({ kind: "unknown", name: "admin-browser-testing" });
+  });
+
+  it.each([
+    ["a plugin", "ce-code-review", "plugin"],
+    ["a local", "ce-commit-jj", "local"],
+  ])("resolves a byte-identical copy of %s skill outside the skill roots to the installed skill", (_label, name, kind) => {
+    const { roots } = makeSkillHome();
+    const resolver = createProvenanceResolver(roots);
+    const installed = resolver.byName(name);
+    if (installed.kind === "unknown") throw new Error(`${name} is not installed`);
+    const copy = copySkillEntry(installed.path, join(roots.cwd, ".agents/skills", name));
+
+    expect(resolver.byPath(copy)).toEqual(installed);
+    expect(installed.kind).toBe(kind);
+  });
+
+  it("labels a copy of an installed skill that differs by one byte as unknown", () => {
+    const { roots } = makeSkillHome();
+    const resolver = createProvenanceResolver(roots);
+    const installed = resolver.byName("ce-code-review");
+    if (installed.kind === "unknown") throw new Error("ce-code-review is not installed");
+    const copy = copySkillEntry(installed.path, join(roots.cwd, ".agents/skills/ce-code-review"), " ");
+
+    expect(resolver.byPath(copy)).toEqual({ kind: "unknown", name: "ce-code-review" });
   });
 });

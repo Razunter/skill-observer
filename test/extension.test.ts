@@ -27,7 +27,7 @@ import type { PatternDraft } from "../src/replay.js";
 import * as amendments from "../src/amendments.js";
 import { type Gate, INSTRUCTIONS_PATH, parseFragments, type ToolResultCondition, toolResultGuidance } from "../src/payload.js";
 import { entries as fx } from "./fixtures.js";
-import { CE_PLUGIN, installPlugin, makeSkillHome, uninstallPlugin, writeSkill } from "./skill-home.js";
+import { CE_PLUGIN, copySkillEntry, installPlugin, makeSkillHome, uninstallPlugin, writeSkill } from "./skill-home.js";
 
 /** The environment `omp` runs under, taken before tests point HOME at a temp skill home; `test/setup.ts` already pointed the agent dir at a temp one. */
 const ompEnv = { ...process.env };
@@ -4686,6 +4686,35 @@ describe("amendments for skills read with the read tool", () => {
       const host = await withRenamedSkill();
       const result = await readSkill(host, "skill://writing-for-agents", { isError: true });
       expect(result.additionalContext).toBeUndefined();
+      expect(deliveries(host)).toEqual([]);
+    });
+  });
+
+  describe("a copy of an installed skill outside the skill roots", () => {
+    /** A host where `name` has an on-read amendment and a copy of its entry file under the project, `extra` longer; returns the copy's path. */
+    function withCopy(name: string, extra = "") {
+      const host = loadExtension();
+      splitAmendment(host, name, `${name}-amendment`, { body: "## Mode\n\nName the mode first." });
+      host.setBranch(fx.plainUserMessage);
+      const installed = createProvenanceResolver(host.skillHome.roots).byName(name);
+      if (installed.kind === "unknown") throw new Error(`${name} is not installed`);
+      return { host, copy: copySkillEntry(installed.path, join(host.skillHome.roots.cwd, ".agents/skills", name), extra) };
+    }
+
+    it.each([
+      ["a plugin", "ce-code-review"],
+      ["a local", "ce-commit-jj"],
+    ])("delivers the installed skill's on-read amendment when the copy of %s skill holds the same bytes", async (_label, name) => {
+      const { host, copy } = withCopy(name);
+      expect((await readSkill(host, copy)).additionalContext).toContain("Name the mode first.");
+      expect(deliveries(host)).toEqual([{ skill: name, rules: [`${name}-amendment`] }]);
+    });
+
+    it("delivers nothing when the copy differs from the installed skill by one byte", async () => {
+      const { host, copy } = withCopy("ce-code-review", " ");
+      const result = await readSkill(host, copy);
+      expect(result.additionalContext).toBeUndefined();
+      expect(result.content).toEqual(ORIGINAL);
       expect(deliveries(host)).toEqual([]);
     });
   });

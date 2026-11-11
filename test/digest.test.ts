@@ -6,7 +6,7 @@ import type { SessionEntry } from "../src/omp.js";
 import { createProvenanceResolver } from "../src/provenance.js";
 import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
 import { entries as fx } from "./fixtures.js";
-import { makeSkillHome } from "./skill-home.js";
+import { copySkillEntry, makeSkillHome } from "./skill-home.js";
 
 const env = { provenance: createProvenanceResolver(makeSkillHome().roots) };
 
@@ -273,6 +273,38 @@ describe("skills loaded in the session", () => {
       expect(renderDigest(digest)).toMatch(/^- `ce-code-review`: plugin\b/m);
     }
   });
+
+  /** The digest of a read of each path in a temp skill home where `ce-code-review` and `ce-commit-jj` have copies under the project, the second `extra` longer. */
+  const digestOfCopyReads = (extra: string, read: (copies: string[]) => string[]) => {
+    const { roots } = makeSkillHome();
+    const provenance = createProvenanceResolver(roots);
+    const copies = ["ce-code-review", "ce-commit-jj"].map((name, at) => {
+      const installed = provenance.byName(name);
+      if (installed.kind === "unknown") throw new Error(`${name} is not installed`);
+      return copySkillEntry(installed.path, join(roots.cwd, ".agents/skills", name), at === 1 ? extra : "");
+    });
+    const entries = read(copies).flatMap((path, at): SessionEntry[] => [
+      { type: "message", id: `call-${at}`, message: { role: "assistant", content: [{ type: "toolCall", id: `read-${at}`, name: "read", arguments: { path } }] } },
+      { type: "message", id: `result-${at}`, message: { role: "toolResult", toolCallId: `read-${at}`, toolName: "read", isError: false, content: "Skill instructions." } },
+    ]);
+    return buildDigest(entries, { provenance });
+  };
+
+  it("lists a read of a byte-identical copy of a plugin or local skill as the installed skill, once with its other reads", () => {
+    const digest = digestOfCopyReads("", (copies) => [...copies, "skill://ce-code-review"]);
+    expect(digest.skills).toEqual([
+      expect.objectContaining({ name: "ce-code-review", kind: "plugin", via: ["read"] }),
+      expect.objectContaining({ name: "ce-commit-jj", kind: "local", via: ["read"] }),
+    ]);
+    expect(renderDigest(digest)).toMatch(/^- `ce-commit-jj`: local\b/m);
+  });
+
+  it("lists a read of a copy that differs from the installed skill by one byte as provenance unknown", () => {
+    expect(digestOfCopyReads(" ", (copies) => copies).skills).toEqual([
+      expect.objectContaining({ name: "ce-code-review", kind: "plugin" }),
+      { kind: "unknown", name: "ce-commit-jj", via: ["read"] },
+    ]);
+  });
 });
 
 describe("on-read amendments", () => {
@@ -301,8 +333,9 @@ describe("tool errors and workflow outlines", () => {
   const withoutPrompt = (entries: readonly SessionEntry[]) =>
     entries.filter((entry) => entry.message?.role !== "user");
 
-  it("keeps a tool error, cut to about 300 characters and attributed to the skill loaded in its turn", () => {
-    const [error, ...rest] = digestFrom(fx.skillTurnToolError).signals;
+  it("keeps a long tool error quoted from its end, in its signal and its tool exercise, attributed to the skill loaded in its turn", () => {
+    const digest = digestFrom(fx.skillTurnToolError);
+    const [error, ...rest] = digest.signals;
     expect(rest).toEqual([]);
     expect(error).toMatchObject({
       kind: "tool-error",
@@ -311,9 +344,10 @@ describe("tool errors and workflow outlines", () => {
       skills: ["impeccable"],
     });
     const text = (error as { error: string }).error;
-    expect(text).toMatch(/^impeccable: engine 0\.1\.5 is not installed; cannot create cache directory/);
-    expect(text).not.toContain("IMPECCABLE_HOME");
+    expect(text).toMatch(/^….*Command exited with code 127$/);
+    expect(text).not.toContain("impeccable: engine 0.1.5 is not installed");
     expect(text.length).toBeLessThanOrEqual(301);
+    expect(digest.toolExercises?.find((exercise) => exercise.failed)?.error).toBe(text);
   });
 
   it("outlines a turn with no skill loaded, one line per tool call, and keeps its tool error unattributed", () => {

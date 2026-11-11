@@ -15,6 +15,14 @@ export function writeSkill(dir: string, name: string): void {
   writeFileSync(join(dir, "SKILL.md"), `---\nname: ${name}\ndescription: Fixture skill.\n---\n\nBody.\n`);
 }
 
+/** Copies the entry file `skillFile` into `dir` with `extra` appended, as a project can keep a copy of an installed skill; returns the copy's path. */
+export function copySkillEntry(skillFile: string, dir: string, extra = ""): string {
+  mkdirSync(dir, { recursive: true });
+  const copy = join(dir, "SKILL.md");
+  writeFileSync(copy, readFileSync(skillFile, "utf8") + extra);
+  return copy;
+}
+
 type Registry = { version: number; plugins: Record<string, Array<Record<string, unknown>>> };
 
 const readRegistry = (roots: SkillRoots): Registry => JSON.parse(readFileSync(roots.pluginsRegistry, "utf8"));

@@ -209,7 +209,11 @@ export function createProvenanceResolver(roots: SkillRoots): ProvenanceResolver 
       if ((root === roots.skillsDir || root === roots.managedDir) && existsSync(skillFile)) {
         return installed(skillFile);
       }
-      return { kind: "unknown", name: basename(dirname(skillFile)) };
+      const unknown = { kind: "unknown" as const, name: basename(dirname(skillFile)) };
+      if (!existsSync(skillFile)) return unknown;
+      // A byte-identical copy of an installed skill's entry file loads the same instructions.
+      const named = index().get(skillName(skillFile));
+      return named && named.kind !== "unknown" && readFileSync(named.path).equals(readFileSync(skillFile)) ? named : unknown;
     },
   };
 }

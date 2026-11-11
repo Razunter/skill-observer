@@ -43,7 +43,7 @@ export type SkillSignal =
       tool: string;
       /** Short summary of the call's arguments. */
       args: string;
-      /** The error text, cut to about 300 characters. */
+      /** The error text; a long one keeps its last 300 or so characters, where a failure's reason sits. */
       error: string;
       /** Skills loaded earlier in the same turn. */
       skills: string[];
@@ -529,7 +529,7 @@ export function buildDigest(
       const unfinished = message.details?.async !== undefined || message.details?.service !== undefined;
       if (call && !turn.observing && entry.id && !unfinished) {
         toolExercises.push({ entryId: entry.id, tool: call.name, args: call.exerciseArgs ?? "", failed: Boolean(message.isError),
-          ...(message.isError ? { error: clip(textOf(message.content), ERROR_CHARS) } : {}),
+          ...(message.isError ? { error: tail(textOf(message.content), ERROR_CHARS) } : {}),
           deliveredRules: [...skills.values()].flatMap((skill) => skill.amendmentsDelivered ?? []),
           ...(entry.timestamp !== undefined && { at: entry.timestamp }) });
       }
@@ -544,7 +544,7 @@ export function buildDigest(
           entryId: entry.id,
           tool: message.toolName ?? call?.name ?? "unknown",
           args: call?.args ?? "",
-          error: clip(textOf(message.content), ERROR_CHARS),
+          error: tail(textOf(message.content), ERROR_CHARS),
           skills: [...turn.skills],
         }, turn.calls[0]?.id && `${turn.calls[0].id}:workflow:`);
       } else if (message.toolName === "ask" && message.details) {
