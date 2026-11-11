@@ -126,11 +126,17 @@ export function approvalShape(z: SchemaBuilder): Record<keyof ProposalAnswerRef,
 export function approvedChange(answer: ApprovedAnswer, branch: readonly SessionEntry[]): { change: ApprovedChange; evidence: ApprovalEvidence } {
   const approval = answerRef(answer.approval);
   const evidence = sessionToolEvidence(branch);
-  const { proposal, change, selected, answeredAt } = approvedProposal(approval, evidence, branch);
+  const { proposal, change, selected, note, answeredAt } = approvedProposal(approval, evidence, branch);
   checkCarriedOut(answer, proposal, change, selected);
   const { fingerprint } = proposal;
+  if (note !== undefined && !isReconcilable(change)) {
+    throw new Error(`the user chose ${selected} with the note ${JSON.stringify(note)}, and a ${change.operation} takes no note: prepare the changed proposal through \`observer_review\` and ask again`);
+  }
   const revision = answer.approval?.revision;
   if (revision === undefined) {
+    if (note !== undefined) {
+      throw new Error(`the user chose ${selected} with the note ${JSON.stringify(note)}: prepare the revision by that note through \`observer_review\`, citing this approval, and cite it as \`approval.revision\``);
+    }
     checkTarget(change, isReconcilable(change)
       ? "Prepare read it; prepare a reconciliation that cites this approval through `observer_review`, or ask again"
       : "Prepare read it; prepare it again and ask again");
@@ -196,11 +202,12 @@ export function checkReconciliation(
 
 /**
  * The approved proposal `ref` locates: its prepared proposal, the change of
- * the option the user selected, that option and the branch position where the
- * user's answer was saved. Throws with the precise reason when the branch
- * holds no such approval in the current pass.
+ * the option the user selected, that option, the user's approval note on it,
+ * if any, and the branch position where the user's answer was saved. Throws
+ * with the precise reason when the branch holds no such approval in the current pass.
  */
-function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): { proposal: PreparedProposal; change: ApprovedChange; selected: string; answeredAt: number } {
+function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]):
+  { proposal: PreparedProposal; change: ApprovedChange; selected: string; note?: string; answeredAt: number } {
   const proposal = preparedInPass(ref.proposal, evidence, branch);
   const options = approvingOptions(proposal);
 
@@ -216,13 +223,13 @@ function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence,
     throw new Error(`Select \`${ref.selectionToolCallId}\` did not select this proposal`);
   }
   const askHtml = renderAskHtml(chosen.map(({ proposal }: { proposal: PreparedProposal }) => proposal));
-  const selected = checkAnswer(ask, askHtml, proposal.candidateId, options);
+  const { selected, note } = checkAnswer(ask, askHtml, proposal.candidateId, options);
   if (prepare.result.position > selection.call.position || selection.result.position > ask.call.position) {
     throw new Error("the Ask must follow the Select, and the Select the Prepare, in this observation pass");
   }
   const spokeAfter = branch.slice(ask.result.position + 1).some((entry) => isFromUser(entry.message));
   if (spokeAfter) throw new Error("the user sent a message after answering, which may retract or change the approval; ask again");
-  return { proposal, change: options.get(selected)!, selected, answeredAt: ask.result.position };
+  return { proposal, change: options.get(selected)!, selected, ...(note !== undefined && { note }), answeredAt: ask.result.position };
 }
 
 /**
@@ -321,9 +328,10 @@ function completed(evidence: SessionToolEvidence, id: string, role: string): Com
  * Checks that the native Ask showed exactly `askHtml`, the form its Select's
  * proposals render to, and that the user answered the radio group named
  * `candidateId` by choosing a label of `approving`, not by a timeout's
- * submission of the form as it stood nor with custom input. Returns the label.
+ * submission of the form as it stood nor with custom input. Returns the label
+ * and the approval note the user attached to it, trimmed; a blank note is none.
  */
-function checkAnswer({ call, result }: CompletedToolCall, askHtml: string, candidateId: string, approving: ReadonlyMap<string, unknown>): string {
+function checkAnswer({ call, result }: CompletedToolCall, askHtml: string, candidateId: string, approving: ReadonlyMap<string, unknown>): { selected: string; note?: string } {
   if (call.name !== "ask" || call.origin !== "native" || result.origin !== "native") {
     throw new Error(`\`${call.id}\` is not an ask the model made itself: a nested or hook-only ask is no approval`);
   }
@@ -341,5 +349,7 @@ function checkAnswer({ call, result }: CompletedToolCall, askHtml: string, candi
     throw new Error("the answer is custom input, which approves nothing; prepare a new proposal for what it asks and ask again");
   }
   if (!approving.has(selected)) throw new Error(`the user selected \`${selected}\`, not ${[...approving.keys()].join(" or ")}`);
-  return selected;
+  const text = details?.notes?.find((given) => given?.name === candidateId && given.option === selected)?.text;
+  const note = typeof text === "string" ? text.trim() : "";
+  return { selected, ...(note && { note }) };
 }

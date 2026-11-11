@@ -106,15 +106,25 @@ export interface AskFormAnswer {
   answer?: string;
 }
 
+/** A note the user attached to one chosen option of an answered `ask` form, as the host's `OptionNote`: `option` is that option's label. */
+export interface AskOptionNote {
+  name?: string;
+  question?: string;
+  option?: string;
+  value?: string;
+  text?: string;
+}
+
 /**
  * `ask` result details: `answers` for every named field of the form, in form
- * order, and `timedOut` when the deadline submitted the form's current values
+ * order, `notes` for each chosen option the user attached a note to, and
+ * `timedOut` when the deadline submitted the form's current values
  * instead of the user. A result saved before OMP 18.18 holds batched answers
  * under `results` or a single answer spread bare into the details; only the
  * digest still reads those. A cancelled ask is saved as an error result with
  * `{}` details, not as an answer.
  */
-export type AskDetails = { answers?: AskFormAnswer[]; timedOut?: boolean; results?: LegacyAskAnswer[] } & LegacyAskAnswer;
+export type AskDetails = { answers?: AskFormAnswer[]; notes?: AskOptionNote[]; timedOut?: boolean; results?: LegacyAskAnswer[] } & LegacyAskAnswer;
 
 /** `manage_skill` result details: the action taken and the skill it named. */
 interface ManageSkillDetails {

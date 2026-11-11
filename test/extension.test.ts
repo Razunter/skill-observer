@@ -670,24 +670,34 @@ const lastCallId = (host: ReturnType<typeof loadExtension>) => String(host.getBr
 const startPass = (host: ReturnType<typeof loadExtension>) =>
   host.getBranch().push({ type: "custom_message", id: `observe-${host.getBranch().length}`, customType: "skill-observer", content: "Observation pass." });
 
-/** The user's answer to one selected proposal, as the host reports it: the chosen option's label, `""` for none, or `Other: <text>` for custom input. */
-type AnswerUser = (proposal: ReviewEntry["proposal"]) => string;
+/**
+ * The user's answer to one selected proposal, as the host reports it: the chosen option's label, `""` for none, or `Other: <text>` for custom input;
+ * `{ option, note }` for an option chosen with the note the user attached to it.
+ */
+type AnswerUser = (proposal: ReviewEntry["proposal"]) => string | { option: string; note: string };
 
 /**
  * Saves a native `ask` call with the form `selection`, a Select's result,
  * returned as `askHtml`, and its successful result in the shape the installed
  * host saves: one answer per radio group, named by the proposal's candidate
- * ID. Only the user's answers are synthetic, by default an explicit Apply.
+ * ID, and an option note per noted chosen option, apart from the answers.
+ * Only the user's answers are synthetic, by default an explicit Apply.
  * Returns the call ID.
  */
 function askUser(host: ReturnType<typeof loadExtension>, selection: ToolResult<unknown>, answer: AnswerUser = () => "Apply"): string {
   const id = `ask-${host.getBranch().length}`;
   const html: string = JSON.parse(resultText(selection)).askHtml;
-  const answers = reviewEntries(selection, "selected").map(({ proposal }) => ({ name: proposal.candidateId, question: "Apply this change?", answer: answer(proposal) }));
-  const submitted = Object.fromEntries(answers.filter((given) => given.answer).map((given) => [given.name, given.answer.startsWith("Other: ") ? given.answer.slice(7) : `${given.name}=${given.answer}`]));
+  const given = reviewEntries(selection, "selected").map(({ proposal }) => {
+    const chosen = answer(proposal);
+    const [option, note] = typeof chosen === "string" ? [chosen, undefined] : [chosen.option, chosen.note];
+    return { name: proposal.candidateId, question: "Apply this change?", answer: option, note };
+  });
+  const answers = given.map(({ note: _, ...entry }) => entry);
+  const notes = given.flatMap(({ name, question, answer: option, note }) => note === undefined ? [] : [{ name, question, option, value: `${name}=${option}`, text: note }]);
+  const submitted = Object.fromEntries(answers.filter((entry) => entry.answer).map((entry) => [entry.name, entry.answer.startsWith("Other: ") ? entry.answer.slice(7) : `${entry.name}=${entry.answer}`]));
   host.getBranch().push(
     { type: "message", id: `call-${id}`, message: { role: "assistant", content: [{ type: "toolCall", id, name: "ask", arguments: { html } }] } },
-    { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: "ask", isError: false, details: { answers },
+    { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: "ask", isError: false, details: { answers, ...(notes.length > 0 && { notes }) },
       content: [{ type: "text", text: `User answers:\n${JSON.stringify(submitted, null, 2)}` }] } },
   );
   return id;
@@ -771,17 +781,21 @@ const compactionCandidate = ({ includes, body, references = [], skill = "tdd", k
 
 /**
  * Has the user answer, in one pass, each stale amendment with its
- * `select`, and each withdrawal, on-read fix, rule and compaction with Apply.
+ * `select`, and each withdrawal, on-read fix, rule and compaction with Apply,
+ * each with `note` attached when given.
  * Returns the observer_resolve `stale`, `outcomes` and `compactions` carrying them out.
  */
 async function approveAll(
   host: ReturnType<typeof loadExtension>,
-  { stale = [], withdrawals = [], fixes = [], rules = [], compactions = [] }:
-    { stale?: StaleDraft[]; withdrawals?: WithdrawalDraft[]; fixes?: OnReadDraft[]; rules?: RuleProposalDraft[]; compactions?: CompactionDraft[] },
+  { stale = [], withdrawals = [], fixes = [], rules = [], compactions = [], note }:
+    { stale?: StaleDraft[]; withdrawals?: WithdrawalDraft[]; fixes?: OnReadDraft[]; rules?: RuleProposalDraft[]; compactions?: CompactionDraft[]; note?: string },
 ) {
   const candidates = [...stale.flatMap(staleCandidates), ...withdrawals.map(withdrawalCandidate), ...fixes.map(onReadCandidate), ...rules.map(ruleCandidate),
     ...compactions.map(compactionCandidate)];
-  const { entry, approval } = await approveCandidates(host, candidates, (proposal) => stale.find(({ rule }) => proposal.gist === staleGist(rule))?.select ?? "Apply");
+  const { entry, approval } = await approveCandidates(host, candidates, (proposal) => {
+    const option = stale.find(({ rule }) => proposal.gist === staleGist(rule))?.select ?? "Apply";
+    return note === undefined ? option : { option, note };
+  });
   return {
     stale: stale.map(({ rule, select }) => ({ rule, action: select.toLowerCase(), approval: approval(staleGist(rule)) })),
     outcomes: [
@@ -1364,6 +1378,36 @@ describe("proposal approval of on-read appends", () => {
   ])("writes nothing when the user's answer is %s", async (_label, reason, answer) => {
     const { host, applied } = await approved(() => answer);
     await expectNoWrite(host, [applied], reason);
+  });
+
+  it("writes nothing for an Apply with an approval note and no revision, quoting the note and asking for the revision", async () => {
+    const { host, applied } = await approved(() => ({ option: "Apply", note: "  Say it in one line.  " }));
+    const before = observerBytes(host);
+    const result = await resolve(host, [applied]);
+    expect(failures(result)).toEqual([expect.stringMatching(/"Say it in one line\.".*observer_review/)]);
+    expect((result.details as { records: unknown[] }).records).toEqual([]);
+    expect(observerBytes(host)).toEqual(before);
+  });
+
+  it("treats a whitespace-only note on Apply as no note", async () => {
+    const { host, applied } = await approved(() => ({ option: "Apply", note: " \n " }));
+    expect((await resolve(host, [applied])).isError).toBeFalsy();
+    expect(readRule(amendment(host)).body).toBe("## Seams\n\nName the seam first.");
+  });
+
+  it("writes nothing for a Later with a note that cites the approval: a note never stands in for Apply", async () => {
+    const { host, applied } = await approved(() => ({ option: "Later", note: "Apply it next week." }));
+    await expectNoWrite(host, [applied], "selected `Later`");
+  });
+
+  it.each(["Later", "Decline"])("records a %s with a note exactly as one without", async (option) => {
+    const recorded = async (answer: AnswerUser) => {
+      const { host, applied } = await approved(answer);
+      const result = await resolve(host, [{ proposal: applied.approval.proposal, outcome: option === "Later" ? "later" : "declined" }]);
+      expect(failures(result)).toEqual([]);
+      return { files: ownedFiles(host), records: ledgerRecords(host.ledgerFile).map(({ timestamp: _, sessionId: __, ...record }) => record) };
+    };
+    expect(await recorded(() => ({ option, note: "Only for unit tests." }))).toEqual(await recorded(() => option));
   });
 
   it.each<[string, string, (fixture: Approved) => void]>([
@@ -3032,6 +3076,17 @@ describe("compacting on-read amendments", () => {
       expect(ownedFiles(host)).toEqual(before);
       expect(fix.approval.askToolCallId).toBe(compaction.approval.askToolCallId);
     });
+
+    it("writes and records nothing for a compaction applied with a note", async () => {
+      const { host, compaction } = await approvedCompaction((proposal) => proposal.priority === "compaction" ? { option: "Apply", note: "Keep Red first." } : "Apply");
+      const before = { files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "utf8") };
+
+      const result = await host.callTool("observer_resolve", { outcomes: [], compactions: [compaction] });
+
+      expect(failures(result)).toEqual([expect.stringContaining("with the note \"Keep Red first.\"")]);
+      expect((result.details as { records: unknown[] }).records).toEqual([]);
+      expect({ files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "utf8") }).toEqual(before);
+    });
   });
 
   it.each([
@@ -3399,6 +3454,11 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
   it("writes nothing for an applied pattern amendment without approval", async () => {
     const { host, applied: { approval: _, ...answer } } = await approved(drafts["a pattern amendment"]);
     await expectNoWrite(host, [answer], "needs `approval`");
+  });
+
+  it.each(Object.entries(drafts))("writes nothing for %s applied with a note and no revision, quoting the note", async (_label, draft) => {
+    const { host, applied } = await approved(draft, () => ({ option: "Apply", note: "Only on main." }));
+    await expectNoWrite(host, [applied], "\"Only on main.\"");
   });
 
   it.each<[string, string, string]>([
@@ -3980,6 +4040,12 @@ describe("proposal approval of stale answers and withdrawals", () => {
     ["a stale Delete", "needs `approval`", async () => ({ stale: [{ rule: "tdd-amendment", action: "delete" }] })],
     ["a withdrawal with a raw body", "not a `rule`", async (_host, { red }) => ({ outcomes: [{ ...withdrawn(red), rule: { body: SEAMS } }] })],
     ["a withdrawal", "needs `approval`", async (_host, { red }) => ({ outcomes: [withdrawn(red)] })],
+    ["a stale Update with a note", "with the note \"Keep Seams.\"", async (host) =>
+      ({ stale: (await approveAll(host, { stale: [{ rule: "tdd-amendment", select: "Update", body: SEAMS }], note: "Keep Seams." })).stale })],
+    ["a stale Delete with a note", "with the note \"Keep Seams.\"", async (host) =>
+      ({ stale: (await approveAll(host, { stale: [{ rule: "tdd-amendment", select: "Delete", body: SEAMS }], note: "Keep Seams." })).stale })],
+    ["a withdrawal with a note", "with the note \"Keep Seams.\"", async (host, { red }) =>
+      ({ outcomes: (await approveAll(host, { withdrawals: [{ fingerprint: red.fingerprint, gist: String(red.gist), body: SEAMS }], note: "Keep Seams." })).outcomes })],
     ["an approved stale Update carrying a substituted body", "no `body`", async (host) => {
       const { stale: [update] } = await approveAll(host, { stale: [{ rule: "tdd-amendment", select: "Update", body: SEAMS }] });
       return { stale: [{ ...update, body: "## Substituted\n\nNot what the user saw." }] };
@@ -5117,16 +5183,19 @@ describe("error-path guidance in tool results", () => {
     expect([whatToDoNow(resultText(clean)), whatToDoNow(resultText(refused))]).toEqual([[], []]);
   });
 
-  it.each<[string, string[], ToolResultCondition[][], boolean?]>([
+  it.each<[string, string[], ToolResultCondition[][], boolean?, string?]>([
     ["custom input", ["Other: only for unit tests"], [["custom-input"]]],
     ["custom input beside a plain Apply", ["Apply", "Other: only for unit tests"], [["custom-input"]]],
+    ["custom input beside an Apply with a note", ["Apply", "Other: only for unit tests"], [["custom-input"]], true, "Shorter."],
     ["a plain Apply", ["Apply"], []],
+    ["an Apply with a note", ["Apply"], [], true, "Shorter."],
     ["Later and no option", ["Later", ""], []],
     ["custom input, outside a pass", ["Other: only for unit tests"], [], false],
-  ])("gives an ask result answered with %s the custom-input guidance only during a pass and when an answer is custom input", async (_label, answers, expected, inPass = true) => {
+  ])("gives an ask result answered with %s the custom-input guidance only during a pass and when an answer is custom input", async (_label, answers, expected, inPass = true, note) => {
     const host = loadExtension();
     if (inPass) startPass(host);
-    const details: AskDetails = { answers: answers.map((answer, i) => ({ name: `proposal:${i}`, question: "Apply this change?", answer })) };
+    const details: AskDetails = { answers: answers.map((answer, i) => ({ name: `proposal:${i}`, question: "Apply this change?", answer })),
+      ...(note && { notes: [{ name: "proposal:0", question: "Apply this change?", option: answers[0], value: `proposal:0=${answers[0]}`, text: note }] }) };
     const result = await host.toolResult({ toolName: "ask", toolCallId: "ask-answered", content: [{ type: "text", text: "User answers" }], details, isError: false });
     expect(result.content[0]).toEqual({ type: "text", text: "User answers" });
     expect(whatToDoNow(result.content.map((block) => block.text).join("\n"))).toEqual(expected);
