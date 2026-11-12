@@ -31,7 +31,7 @@ import { CE_PLUGIN, copySkillEntry, installPlugin, makeSkillHome, uninstallPlugi
 
 /** The environment `omp` runs under, taken before tests point HOME at a temp skill home; `test/setup.ts` already pointed the agent dir at a temp one. */
 const ompEnv = { ...process.env };
-const ompAvailable = process.env.SKILL_OBSERVER_NATIVE_TESTS !== "0" && spawnSync("omp", ["--version"], { env: ompEnv }).status === 0;
+const ompAvailable = process.env.SKILL_OBSERVER_NATIVE_TESTS === "1" && spawnSync("omp", ["--version"], { env: ompEnv }).status === 0;
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 

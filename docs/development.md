@@ -157,11 +157,11 @@ Run these commands from a source checkout's extension root, the directory contai
 
 ```sh
 bun install
-SKILL_OBSERVER_NATIVE_TESTS=0 bun run test
+bun run test
 bun run typecheck
 ```
 
-This runs ordinary tests without launching the native OMP checks. See [Testing](#testing) for explicit native checks.
+This runs ordinary tests without launching the native OMP checks. See [Testing](#testing) for explicit native checks. To print what `/observe-report` shows for a saved session without OMP, for example to compare the observation payload estimate before and after a change, run `bun --no-env-file scripts/observe-report.ts <session.jsonl>`; it works on a temp copy of the agent dir's observer state.
 
 ### Instruction fragments
 
@@ -230,16 +230,16 @@ Unit tests create their own temporary skills, lockfile, managed directory and pl
 
 ### Explicit native checks
 
-Native checks require Bun and an installed `omp` that responds successfully to `omp --version`. With `SKILL_OBSERVER_NATIVE_TESTS` unset or set to a value other than `0`, the suite enables its OMP-backed tests when that binary is available. To request those checks explicitly, run this from the extension root:
+Native checks require Bun and an installed `omp` that responds successfully to `omp --version`. The suite enables its OMP-backed tests only when `SKILL_OBSERVER_NATIVE_TESTS=1` and that binary is available. Run this from the extension root:
 
 ```sh
 SKILL_OBSERVER_NATIVE_TESTS=1 bun run test
 ```
 
-The installed OMP host loads `test/native-schema.ts` without a model prompt to verify actual tool-schema registration. It uses a temp agent dir so the extension's startup migration never touches your rules. The amendment/replay suites use `omp ttsr test` for native trigger checks. These OMP-backed checks are skipped when OMP is unavailable or `SKILL_OBSERVER_NATIVE_TESTS=0`; requesting them with `1` does not turn a missing prerequisite into a passing check.
+The installed OMP host loads `test/native-schema.ts` without a model prompt to verify actual tool-schema registration. It uses a temp agent dir so the extension's startup migration never touches your rules. The amendment/replay suites use `omp ttsr test` for native trigger checks. These OMP-backed checks are skipped when OMP is unavailable or `SKILL_OBSERVER_NATIVE_TESTS` is not `1`; requesting them with `1` does not turn a missing prerequisite into a passing check.
 
 The `/skill:` reminder finds the skill by the first line of OMP's user-invocation template. One test renders `src/prompts/skills/user-invocation.md` from the package of the first `omp` on `PATH` (an npm or Bun global install), so a reworded template in the installed OMP fails the suite. It is skipped, independently of the native-test flag, when `omp` is missing or is a compiled binary that ships no template. Native checks still require their OMP or Bun prerequisites.
 
 ### Pre-commit hook
 
-Enable the bundled hook in each clone with `git config core.hooksPath hooks`. It rejects unstaged or untracked files so verification matches the index. It sets `SKILL_OBSERVER_NATIVE_TESTS=0` so native OMP checks stay explicit-only, and runs `bun run check` (typecheck, then tests). Missing Bun/dependencies or a failing check blocks the commit.
+Enable the bundled hook in each clone with `git config core.hooksPath hooks`. It rejects unstaged or untracked files so verification matches the index. It sets `SKILL_OBSERVER_NATIVE_TESTS=0` so a `1` inherited from the shell cannot enable native OMP checks, and runs `bun run check` (typecheck, then tests). Missing Bun/dependencies or a failing check blocks the commit.
