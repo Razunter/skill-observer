@@ -210,10 +210,14 @@ export function createProvenanceResolver(roots: SkillRoots): ProvenanceResolver 
         return installed(skillFile);
       }
       const unknown = { kind: "unknown" as const, name: basename(dirname(skillFile)) };
-      if (!existsSync(skillFile)) return unknown;
-      // A byte-identical copy of an installed skill's entry file loads the same instructions.
-      const named = index().get(skillName(skillFile));
-      return named && named.kind !== "unknown" && readFileSync(named.path).equals(readFileSync(skillFile)) ? named : unknown;
+      // A byte-identical copy of an installed skill's entry file loads the same instructions; a path that cannot be read is no copy.
+      try {
+        const copy = readFileSync(skillFile);
+        const named = index().get(FRONTMATTER_NAME.exec(copy.toString("utf8", 0, 4096))?.[1] ?? unknown.name);
+        return named && named.kind !== "unknown" && readFileSync(named.path).equals(copy) ? named : unknown;
+      } catch {
+        return unknown;
+      }
     },
   };
 }

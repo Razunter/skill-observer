@@ -1,4 +1,4 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createProvenanceResolver } from "../src/provenance.js";
@@ -142,5 +142,13 @@ describe("skill provenance", () => {
     const copy = copySkillEntry(installed.path, join(roots.cwd, ".agents/skills/ce-code-review"), " ");
 
     expect(resolver.byPath(copy)).toEqual({ kind: "unknown", name: "ce-code-review" });
+  });
+
+  it("labels a directory named SKILL.md under an installed skill's name as unknown", () => {
+    const { roots } = makeSkillHome();
+    const unreadable = join(roots.cwd, "tdd/SKILL.md");
+    mkdirSync(unreadable, { recursive: true });
+
+    expect(createProvenanceResolver(roots).byPath(unreadable)).toEqual({ kind: "unknown", name: "tdd" });
   });
 });

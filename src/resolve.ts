@@ -400,13 +400,10 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
 const CITABLE = ["on-read-append", "rule", "direct-edit"];
 
 /**
- * `answer` filled from the prepared proposal it cites, through `approval` or
- * `proposal`: the skill, kind, gist and fingerprint it leaves out, and the
- * proposal's evidence without its source label, which takes precedence over
- * evidence the answer carries. Supplied values must equal the proposal's: the
- * approval check compares an approved answer's, this one any other's. An
- * answer citing nothing carries its skill, kind and gist itself. Throws with
- * the reason otherwise.
+ * `answer` filled from the prepared proposal it cites. The proposal's evidence
+ * takes precedence over evidence the answer carries. Supplied values must
+ * equal the proposal's: the approval check compares an approved answer's,
+ * this one any other's.
  */
 function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): ProposalAnswer {
   const { proposal: reference, skill, kind, gist, ...rest } = answer;
