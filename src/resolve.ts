@@ -403,7 +403,7 @@ const CITABLE = ["on-read-append", "rule", "direct-edit"];
  * `answer` filled from the prepared proposal it cites. The proposal's evidence
  * takes precedence over evidence the answer carries. Supplied values must
  * equal the proposal's: the approval check compares an approved answer's,
- * this one any other's.
+ * this function every other answer's.
  */
 function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): ProposalAnswer {
   const { proposal: reference, skill, kind, gist, ...rest } = answer;

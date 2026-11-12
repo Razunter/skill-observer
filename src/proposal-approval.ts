@@ -16,7 +16,7 @@
  * A proposal reconciliation adapts an approved on-read append or rule to the
  * user's approval note on its Apply, to a target that changed after its
  * Prepare, or to both: a revised proposal, prepared later in the pass, that
- * cites the approval. An Apply with a note writes nothing without one. A stale
+ * cites the approval. An Apply with a note writes nothing until a revision cites it. A stale
  * answer, withdrawal or compaction takes no note, and against a changed target
  * needs a new Prepare and Ask instead: each deletes or rewrites the target
  * without keeping its new content, and a re-pin alone is no change to the
@@ -62,7 +62,7 @@ export interface ApprovalEvidence {
   approval: ProposalAnswerRef;
   /** The option the user selected: Apply, or a stale amendment's Update or Delete. */
   selected: string;
-  /** The approval note the user attached to that option, which the reconciliation revised the proposal by. */
+  /** The approval note the user attached to that option; the reconciliation revised the proposal by it. */
   note?: string;
   /** The main agent's reconciliation the written content comes from, with the preview of that content; the user approved the original, not this revision. */
   reconciliation?: Omit<ProposalReconciliation, "approval"> & { revision: PreparedProposalRef; preview: string };

@@ -213,7 +213,7 @@ export function createProvenanceResolver(roots: SkillRoots): ProvenanceResolver 
       // A byte-identical copy of an installed skill's entry file loads the same instructions; a path that cannot be read is no copy.
       try {
         const copy = readFileSync(skillFile);
-        const named = index().get(FRONTMATTER_NAME.exec(copy.toString("utf8", 0, 4096))?.[1] ?? unknown.name);
+        const named = index().get(FRONTMATTER_NAME.exec(copy.toString("utf8").slice(0, 4096))?.[1] ?? unknown.name);
         return named && named.kind !== "unknown" && readFileSync(named.path).equals(copy) ? named : unknown;
       } catch {
         return unknown;

@@ -680,7 +680,7 @@ type AnswerUser = (proposal: ReviewEntry["proposal"]) => string | { option: stri
  * Saves a native `ask` call with the form `selection`, a Select's result,
  * returned as `askHtml`, and its successful result in the shape the installed
  * host saves: one answer per radio group, named by the proposal's candidate
- * ID, and an option note per noted chosen option, apart from the answers.
+ * ID, and in a separate `notes` list an option note per noted chosen option.
  * Only the user's answers are synthetic, by default an explicit Apply.
  * Returns the call ID.
  */
@@ -1201,7 +1201,7 @@ describe("observer_review prepared proposals", () => {
     const [entry] = reviewEntries(prepared);
     const json = JSON.stringify(entry?.proposal);
     expect(entry?.reference.contentHash).toBe(createHash("sha256").update(json).digest("hex"));
-    // The hash this proposal had before Prepare reported amendment sections, with the temp home masked.
+    // Pins the hash, with the temp home masked: Prepare keeps amendment sections out of the proposal.
     expect(createHash("sha256").update(json.replaceAll(host.skillHome.home, "<home>")).digest("hex"))
       .toBe("2a28432a71f68a87a569dfa199446d9be99a8c14222f88f02976b4f5bd111706");
   });
