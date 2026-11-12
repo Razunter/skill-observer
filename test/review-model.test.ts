@@ -45,14 +45,14 @@ function host(options: { assignment?: string; settings?: boolean; models?: boole
     sessionManager: { getBranch: () => branch, getSessionId: () => "review-model" },
     ...(options.models !== false && { modelRegistry: { getAvailable: () => options.available === false ? [] : [{ ...model, kind: options.kind }] } }),
   } as unknown as ExtensionContext;
-  let references: unknown[] = [];
+  let eligible: Array<{ reference: { candidateId: string }; gist: string }> = [];
   return {
     disable() { assignment = undefined; },
-    /** Runs Prepare with the fixture candidates, or Select with the references the last Prepare returned, and saves the completed call on the branch. */
+    /** Runs Prepare with the fixture candidates, or Select with the references the last Prepare returned, naming Select's references by the gists Prepare gave them, and saves the completed call on the branch. */
     async run(action: "prepare" | "select") {
       if (!tool) throw new Error("review tool not registered");
       const id = `review-${branch.length}`;
-      const params = action === "prepare" ? { action, candidates } : { action, proposals: references, rankings };
+      const params = action === "prepare" ? { action, candidates } : { action, proposals: eligible.map(({ reference }) => reference), rankings };
       const result = await tool.execute(id, params, undefined, undefined, ctx);
       branch.push(
         { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name: "observer_review", arguments: params as ToolArguments }] } },
@@ -60,8 +60,12 @@ function host(options: { assignment?: string; settings?: boolean; models?: boole
       );
       expect(result.isError).toBeFalsy();
       const output = JSON.parse(result.content[0]!.text);
-      if (action === "prepare") references = output.eligible.map((entry: { reference: unknown }) => entry.reference);
-      return output;
+      if (action === "prepare") {
+        eligible = output.eligible;
+        return output;
+      }
+      const gists = (references: Array<{ candidateId: string }>) => references.map(({ candidateId }) => eligible.find(({ reference }) => reference.candidateId === candidateId)?.gist);
+      return { ...output, selected: gists(output.selected), deferred: gists(output.deferred) };
     },
   };
 }
@@ -80,8 +84,8 @@ describe("observer_review explicit judge availability", () => {
     const h = host(options);
     expect(await h.run("prepare")).toMatchObject({ needsRanking: false, judgeStates: {} });
     expect(await h.run("select")).toMatchObject({
-      selected: [{ proposal: { gist: "Strong" } }, { proposal: { gist: "Weak" } }, ...Array.from({ length: 3 }, (_, i) => ({ proposal: { gist: `Other ${i}` } }))],
-      deferred: [{ proposal: { gist: "Other 3" } }], fallback: expect.stringContaining("Advisory ranking unavailable"), failures: [],
+      selected: ["Strong", "Weak", "Other 0", "Other 1", "Other 2"],
+      deferred: ["Other 3"], fallback: expect.stringContaining("Advisory ranking unavailable"), failures: [],
     });
   });
 
@@ -92,7 +96,7 @@ describe("observer_review explicit judge availability", () => {
     expect(Object.keys(prepared.judgeStates)).toEqual(rankings.map(entry => entry.id));
     expect(JSON.stringify(prepared.judgeStates)).not.toContain("Exact");
     const selected = await h.run("select");
-    expect(selected.selected.map((entry: { proposal: { gist: string } }) => entry.proposal.gist)).toEqual(["Weak", "Strong", "Other 0", "Other 1", "Other 2"]);
+    expect(selected.selected).toEqual(["Weak", "Strong", "Other 0", "Other 1", "Other 2"]);
     expect(selected).not.toHaveProperty("fallback");
   });
 
@@ -100,6 +104,6 @@ describe("observer_review explicit judge availability", () => {
     const h = host({ assignment: "fixture/explicit-judge" });
     expect((await h.run("prepare")).needsRanking).toBe(true);
     h.disable();
-    expect((await h.run("select")).selected[0].proposal.gist).toBe("Strong");
+    expect((await h.run("select")).selected[0]).toBe("Strong");
   });
 });

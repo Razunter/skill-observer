@@ -13,8 +13,8 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import {
-  compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, readObserverRule, readOnReadAmendments,
-  type RuleDirs, rulePath, skillAmendment, skillAmendmentName,
+  compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, parseFrontmatter, readObserverRule, readOnReadAmendments,
+  type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
   canonicalProjectTarget, type Evidence, ledgerForProject, type LedgerRecord,
@@ -146,6 +146,8 @@ interface PrepareContext {
   provenance: ProvenanceResolver;
   /** The session branch, where a reconciliation's approval is saved. */
   branch: readonly SessionEntry[];
+  /** Filled by Prepare: the `## ` headings of each on-read append's target amendment at the bytes it read, by candidate ID, kept out of the proposal so its content hash ignores them. */
+  amendmentSections: Map<string, string[]>;
 }
 
 /** The model uses installed host judge helpers between Prepare and Select; this tool never calls a provider. */
@@ -177,7 +179,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return a reference per proposal plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass, the revision makes the same operation on the same target under the same identity, and, under a note, differs from the approved change. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither asks, approves nor publishes and never calls a model.",
+    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass, the revision makes the same operation on the same target under the same identity, and, under a note, differs from the approved change. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither asks, approves nor publishes and never calls a model.",
     parameters: z.object({
       action: z.enum(["prepare", "select"]),
       candidates: z.array(z.union([
@@ -193,6 +195,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
     }),
     async execute(toolCallId, params, signal, _update, ctx) {
       const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
+      const amendmentSections = new Map<string, string[]>();
       try {
         signal?.throwIfAborted();
         const ledger = readLedger(files.ledgerFile());
@@ -200,7 +203,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
           if (!Array.isArray(params.candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
           const context: PrepareContext = {
             cwd: ctx.cwd, dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
-            ledger, provenance: createProvenanceResolver(defaultSkillRoots(ctx.cwd)), branch: ctx.sessionManager.getBranch(),
+            ledger, provenance: createProvenanceResolver(defaultSkillRoots(ctx.cwd)), branch: ctx.sessionManager.getBranch(), amendmentSections,
           };
           details.eligible = prepareProposals(params.candidates, context).map((proposal) => ({
             reference: { reviewToolCallId: toolCallId, candidateId: proposal.candidateId, contentHash: contentHash(proposal) },
@@ -246,15 +249,30 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
         details.failures.push(error instanceof Error ? error.message : String(error));
       }
       const output = params?.action === "prepare"
-        ? { eligible: details.eligible, needsRanking: details.needsRanking, judgeStates: details.judgeStates, failures: details.failures }
+        ? {
+            eligible: details.eligible.map((entry) => preparedSummary(entry, amendmentSections)),
+            needsRanking: details.needsRanking, judgeStates: details.judgeStates, failures: details.failures,
+          }
         : {
-            selected: details.selected, deferred: details.deferred,
+            selected: details.selected.map(({ reference }) => reference), deferred: details.deferred.map(({ reference }) => reference),
             ...(details.selected.length > 0 && { askHtml: renderAskHtml(details.selected.map(({ proposal }) => proposal)) }),
             ...(details.fallback && { fallback: details.fallback }), failures: details.failures,
           };
       return { content: [{ type: "text", text: JSON.stringify(output) }], details, isError: details.failures.length > 0 };
     },
   });
+}
+
+/** What the model needs of a prepared proposal to rank, ask and answer it; its change and evidence stay in the saved details. */
+function preparedSummary({ reference, proposal }: PreparedEntry, amendmentSections: ReadonlyMap<string, string[]>) {
+  const sections = "change" in proposal && proposal.change.operation === "on-read-append" ? amendmentSections.get(proposal.candidateId) : undefined;
+  return {
+    reference, fingerprint: proposal.fingerprint, kind: proposal.kind,
+    ...(proposal.kind === "project" ? { target: proposal.target } : { skill: proposal.skill }),
+    gist: proposal.gist,
+    ...("alternatives" in proposal ? { previews: proposal.alternatives.map(({ preview }) => preview) } : { preview: proposal.preview }),
+    ...optional("amendmentSections", sections),
+  };
 }
 
 /**
@@ -433,8 +451,10 @@ function preparedProposal(
         const rule = skillAmendment(dirs.amendmentsDir, skill) ?? created;
         const section = created.body.trim();
         const bytes = existsSync(rule.path) ? readFileSync(rule.path) : null;
+        const text = bytes?.toString("utf8");
+        context.amendmentSections.set(`proposal:${fingerprint}`, sectionHeadings(parseFrontmatter(text ?? "")?.body ?? ""));
         // Publication appends nothing when the amendment already holds the section verbatim.
-        const effect = bytes === null ? "create" : bytes.toString("utf8").includes(section) ? "record" : "append";
+        const effect = text === undefined ? "create" : text.includes(section) ? "record" : "append";
         return { operation: "on-read-append", effect, rule: ruleIdentity(rule), target: snapshot(rule.path, bytes), section };
       }));
     }

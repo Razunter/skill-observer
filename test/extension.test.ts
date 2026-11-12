@@ -888,6 +888,7 @@ describe("observer_review selection", () => {
       { ...candidate("Compact guidance"), skill: "domain-modeling", priority: "compaction", change: { operation: "compaction", includes: [], body: "## Compact\n\nShorter.", references: [] } },
       candidate("Overflow evidence", "evidence", 1),
     ];
+    startPass(host);
     const result = await prepareAndSelect(host, candidates, { rankings: [
       ranked("Low evidence", 2), ranked("High evidence", 1), ranked("Other evidence", 3), ranked("Overflow evidence", 0),
     ] });
@@ -898,11 +899,9 @@ describe("observer_review selection", () => {
       ],
       deferred: [{ proposal: { gist: "Overflow evidence" } }, { proposal: { priority: "compaction" } }],
     });
-    const [overflow] = reviewEntries(result, "deferred");
-    if (!overflow) throw new Error("missing deferred proposal");
-    const { skill, kind, gist, fingerprint, evidence } = overflow.proposal;
-    await host.callTool("observer_resolve", { outcomes: [{ skill, kind, gist, fingerprint, evidence, outcome: "later" }] });
-    expect(ledgerRecords(host.ledgerFile).at(-1)).toMatchObject({ gist: "Overflow evidence", outcome: "later" });
+    const { deferred: [overflow] } = JSON.parse(resultText(result));
+    expect(failures(await host.callTool("observer_resolve", { outcomes: [{ proposal: overflow, outcome: "later" }] }))).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile).at(-1)).toMatchObject({ gist: "Overflow evidence", outcome: "later", evidence: [{ quote: "Evidence for Overflow evidence", count: 1 }] });
   });
 
   it.each(["missing", "failed", "partial", "low confidence", "inconsistent", "unknown ID", "duplicate ID"] as const)(
@@ -1144,7 +1143,7 @@ describe("observer_review prepared proposals", () => {
     expect(ownedFiles(host)).toEqual(before);
   });
 
-  it("selects exactly the proposals its references name, as their successful Prepare saved them", async () => {
+  it("selects exactly the proposals its references name, as their successful Prepare saved them, and returns their references, not their bodies", async () => {
     const host = loadExtension();
     const candidates = ["Evidence fix", "Note fix"].map((gist, index) => ({ kind: "upstream", skill: "tdd", gist, priority: index ? "note" : "evidence", remedy,
       change: { operation: "on-read-append", section: `## ${gist}\n\nDo it.` }, evidence: [{ quote: gist, count: 1 }] }));
@@ -1154,8 +1153,57 @@ describe("observer_review prepared proposals", () => {
     const selected = await host.callTool("observer_review", { action: "select", proposals: eligible.map((entry) => entry.reference) });
     expect(selected.isError).toBeFalsy();
     expect(reviewEntries(selected, "selected")).toEqual([eligible[1], eligible[0]]);
-    expect(JSON.parse(resultText(selected)).selected).toEqual([eligible[1], eligible[0]]);
+    expect(JSON.parse(resultText(selected))).toEqual({
+      selected: [eligible[1]?.reference, eligible[0]?.reference], deferred: [],
+      askHtml: expect.stringMatching(/^<form>/), failures: [],
+    });
     expect(ownedFiles(host)).toEqual(before);
+  });
+
+  it("returns in Prepare's text each proposal's reference, fingerprint, target, kind, gist and preview, and the sections of its target amendment, not its change or evidence", async () => {
+    const host = loadExtension();
+    await addOnReadFix(host, "tdd", "Name the seam first.", SEAMS);
+    await addOnReadFix(host, "tdd", "A red is an assertion diff.", RED);
+    splitAmendment(host, "grill-with-docs", "grill-stale");
+    const root = host.skillHome.roots.cwd;
+    const target = { scope: "project", root, path: "package.json", mechanism: "Wire the typecheck." } as const;
+    const evidence = [{ quote: "the quoted signal", count: 2, source: "signal source" }];
+    const stale = { kind: "upstream", skill: "grill-with-docs", gist: "Gist of grill-stale.", priority: "stale", remedy, evidence };
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
+      { ...onReadCandidate({ gist: "Test one behaviour per test.", section: ONE_BEHAVIOUR }), evidence },
+      { ...onReadCandidate({ skill: "domain-modeling", gist: "Define terms first.", section: "## Terms\n\nDefine terms first." }), evidence },
+      { kind: "project", target, gist: "Wire the typecheck.", priority: "evidence", remedy, change: { operation: "direct-edit", preview: "Exact project diff" }, evidence },
+      { ...stale, change: { operation: "stale-update", rule: "grill-stale", body: "Rewritten." } },
+      { ...stale, change: { operation: "stale-delete", rule: "grill-stale" } },
+    ] });
+    expect(prepared.isError).toBeFalsy();
+    const [scope, terms, project, question] = reviewEntries(prepared);
+    const shown = (entry: ReviewEntry | undefined) => ({ reference: entry?.reference, fingerprint: entry?.proposal.fingerprint, gist: entry?.proposal.gist });
+    expect(JSON.parse(resultText(prepared))).toEqual({
+      eligible: [
+        { ...shown(scope), kind: "upstream", skill: "tdd", preview: scope?.proposal.preview, amendmentSections: ["Seams", "Red"] },
+        { ...shown(terms), kind: "upstream", skill: "domain-modeling", preview: terms?.proposal.preview, amendmentSections: [] },
+        { ...shown(project), kind: "project", target: canonicalProjectTarget(root, target), preview: "Exact project diff" },
+        { ...shown(question), kind: "upstream", skill: "grill-with-docs", previews: question?.proposal.alternatives?.map(({ preview }) => preview) },
+      ],
+      needsRanking: false, judgeStates: {}, failures: [],
+    });
+    expect(resultText(prepared)).not.toContain("the quoted signal");
+  });
+
+  it("keeps a prepared proposal's content hash the hash of its saved proposal, which the amendment's sections stay out of", async () => {
+    const host = loadExtension();
+    await addOnReadFix(host, "tdd", "Name the seam first.", SEAMS);
+    startPass(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
+      { ...onReadCandidate({ gist: "First", section: "## First\n\nText for First." }), evidence: [{ quote: "First", count: 2, source: "signal for First" }] },
+    ] });
+    const [entry] = reviewEntries(prepared);
+    const json = JSON.stringify(entry?.proposal);
+    expect(entry?.reference.contentHash).toBe(createHash("sha256").update(json).digest("hex"));
+    // The hash this proposal had before Prepare reported amendment sections, with the temp home masked.
+    expect(createHash("sha256").update(json.replaceAll(host.skillHome.home, "<home>")).digest("hex"))
+      .toBe("2a28432a71f68a87a569dfa199446d9be99a8c14222f88f02976b4f5bd111706");
   });
 
   it("returns one Ask form showing each selected proposal's preview whole, escaped and with hidden whitespace marked, with no option preselected", async () => {
@@ -4424,6 +4472,40 @@ describe("answers citing their prepared proposal", () => {
       answered("Second", "declined"),
       answered("Sixth", "later", "Selected past the cap; offer it next pass."),
     ]);
+  });
+
+  it("carries out a pass from the references its text results give alone: a noted Apply revised, an Apply, a Later and a deferred proposal", async () => {
+    const host = loadExtension();
+    await addOnReadFix(host, "tdd", "Name the seam first.", SEAMS);
+    startPass(host);
+    const text = (result: ToolResult<unknown>) => JSON.parse(resultText(result));
+    const gists = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth"];
+    const prepared = text(await host.callTool("observer_review", { action: "prepare",
+      candidates: gists.map((gist) => ({ ...onReadCandidate({ gist, section: `## ${gist}\n\nText for ${gist}.` }), evidence: sourced(gist) })) }));
+    expect(prepared.eligible[0].amendmentSections).toEqual(["Seams"]);
+    const reference = (gist: string) => prepared.eligible.find((entry: { gist: string }) => entry.gist === gist).reference;
+    const selection = await host.callTool("observer_review", { action: "select", proposals: prepared.eligible.map((entry: { reference: unknown }) => entry.reference) });
+    const selectionToolCallId = lastCallId(host);
+    const { selected, deferred } = text(selection);
+    expect(deferred).toEqual([reference("Sixth")]);
+    const askToolCallId = askUser(host, selection, ({ gist }) => (gist === "First" ? { option: "Apply", note: "Say it shorter." } : gist === "Second" ? "Apply" : "Later"));
+    const approval = (gist: string) => ({ proposal: selected.find((ref: { candidateId: string }) => ref.candidateId === reference(gist).candidateId), selectionToolCallId, askToolCallId });
+    const revision = text(await host.callTool("observer_review", { action: "prepare", candidates: [{
+      ...onReadCandidate({ gist: "First", section: "## First\n\nShorter." }),
+      reconciles: { approval: approval("First"), reason: "The user asked for it shorter.", preserved: "Same First guidance; nothing else changes." },
+    }] })).eligible[0].reference;
+
+    const result = await resolve(host, [
+      { outcome: "applied", approval: { ...approval("First"), revision } },
+      { outcome: "applied", approval: approval("Second") },
+      { outcome: "later", proposal: reference("Third"), reoffer: "When it recurs." },
+      { outcome: "later", proposal: deferred[0], reoffer: "Selected past the cap; offer it next pass." },
+    ]);
+
+    expect(failures(result)).toEqual([]);
+    expect(readRule(join(host.amendmentsDir, "tdd-amendment.md")).body).toBe(`${SEAMS}\n\n## First\n\nShorter.\n\n## Second\n\nText for Second.`);
+    expect(ledgerRecords(host.ledgerFile).slice(1).map(({ gist, outcome }) => [gist, outcome]))
+      .toEqual([["First", "applied"], ["Second", "applied"], ["Third", "later"], ["Sixth", "later"]]);
   });
 
   it("records a cited proposal's evidence over a re-offered entry's earlier evidence, and carries the earlier evidence when the proposal cites none", async () => {
