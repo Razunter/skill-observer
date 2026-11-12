@@ -8,16 +8,23 @@
 - Proposal approval requires the saved Ask's `html` to equal the form rendered from that Select, no timeout, and exactly one answer named by the proposal's `candidateId` holding the approving label. This replaces the per-option preview comparison.
 - The form shows previews as wrapped text, because the host's form dialog cuts `<pre>` lines at its width: every word and line break, with the whitespace the form collapses marked, `·` per space of an indent, a trailing run or a repeated run and `→` per tab. The bytes written are the prepared ones.
 - A radio's value is `<candidateId>=<Label>`, so text typed into the form's Other row never equals an approving option.
-- The `tool-result` guidance for a note on Apply is now **Custom input.**, added to a pass's `ask` result when an answer starts with `Other: `.
+- A pass's `ask` result gets the `tool-result` guidance **Custom input.** when an answer starts with `Other: `, and **An approval note.** when a chosen option carries a note.
+- A note on Apply, added with `n` on the option row, is an approval note. The main agent revises the proposal by it as a proposal reconciliation, and `observer_resolve` writes the revision without a second Ask. Its result shows the note, the reason and the text written. A noted Apply without a revision, and a revision identical to the approved change, are refused. A note on a stale Update or Delete, a withdrawal or a compaction makes the answer refused. A note on Later becomes the deferral's `reoffer`; a note on Decline is ignored. A reconciliation's `changedTarget` is required only when the target changed.
+- The observation payload lists remedy outcomes only for project-environment fixes and fixes for a skill the session loaded, and counts the rest in one line. `/observe-report` still lists every one.
+- Prepare names the `## ` headings of each on-read fix's target amendment as `amendmentSections`.
+- Prepare and Select return less text. Prepare returns per proposal its reference, fingerprint, kind, skill or project target, gist and preview (`previews` for a stale proposal); Select returns the references of its selected and deferred proposals beside `askHtml`. The canonical changes and evidence stay in the saved details.
+- `observer_resolve` answers cite their prepared proposal, through `approval` or the new `proposal`, instead of carrying skill, kind, gist, fingerprint and evidence. The proposal's evidence is recorded.
 
 ### Fixed
 
 - `observer_resolve` records approvals on OMP 18.18 and later; it refused every one because the Ask no longer held `questions[]`.
 - The digest's `ask` signals (custom input, an answer off the preselected option) fire for HTML-form results. Results saved before OMP 18.18 are still read.
+- A `SKILL.md` that is a byte-identical copy of an installed skill's entry file counts as that skill: the digest shows its provenance and the skill's on-read amendment is delivered on the read. A copy that differs stays provenance unknown.
+- A long tool error is quoted from its end, where a failed command states why, instead of its start.
 
 ### Removed
 
-- `approval.nonModifyingNote`: the host no longer has notes on an option. Custom input (`Other: ...`) is the user's only free text and never approves.
+- `approval.nonModifyingNote`. A note on Apply is now an approval note, read from the Ask's `details.notes`. Custom input (`Other: ...`) still never approves.
 
 ## 0.2.0 - 2026-11-06
 

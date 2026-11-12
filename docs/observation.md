@@ -22,6 +22,8 @@ A workflow outline is a turn with no skill loaded and at least 3 tool calls. A c
 - **plugin**: installed by an OMP marketplace plugin, such as the `ce-*` and `impeccable` skills. Its `SKILL.md` lies under an enabled plugin's install path in OMP's user-scope registry, `~/.omp/plugins/installed_plugins.json`. Its provenance metadata carries that plugin's id and version. The rendered digest line shows the provenance kind, load route, delivered amendments and file path, not the plugin id or version. A name provided by both a plugin and `~/.agents/skills/` resolves to the plugin skill, which OMP loads. A read by path resolves to the file read;
 - **unknown**: anywhere else (project skills, project-scoped plugins).
 
+A `SKILL.md` read from anywhere else counts as an installed skill when it holds the same bytes as that skill's entry file. The installed skill is the one named by the copy's frontmatter `name`, or by its folder when it has none. The digest lists the copy under that skill and its provenance, and the skill's on-read amendment is delivered on the read. Only the entry file is compared. A copy that differs from the installed skill stays unknown.
+
 A skill's line also names its on-read amendments delivered in this session, as in `` `tdd`: upstream; read by the model; amendments delivered: `tdd-amendment` ``. These come from the session's `skill-observer-amendment-delivery` entries after skill reads and from `/skill:` reminders. Both name their rules, so an amendment deleted later in the session still shows as delivered. Deliveries add no signal: a skill read alone never turns the hint on. They let the pass see that a correction on the same point happened despite the amendment.
 
 Text after the command, as in `/observe tdd should run the one failing test first`, goes into the pass as a **User note** ahead of the digest: feedback the digest can't show, or a steer such as a skill to focus on. The model weighs each change it names like a correction-class signal. A note starts a pass even in a session without signals.
@@ -29,6 +31,8 @@ Text after the command, as in `/observe tdd should run the one failing test firs
 With no note, no signals, no loaded skills and no stale amendments, `/observe` says so and starts no turn. Otherwise it sends one hidden message, the [observation payload](#observation-payload), that starts a normal turn.
 
 The model asks about at most 5 proposals, stale amendments it would update or delete, and compactions in one main `ask`. The extension renders that Ask as one form, which `observer_review` Select returns and the model passes on unchanged: one fieldset per proposal with its target and gist, remedy, evidence and preview, and the choices Apply / Later / Decline, or Keep / Update / Delete for a stale amendment. Nothing is preselected. Stale amendments come first, then User note points, then correction-class signals and repeats, then compactions. Each proposal fixes one mechanism; a candidate bundling two independent fixes becomes two questions.
+
+An option can carry a note, which you add with `n` on its row. A note on **Apply** is an approval note: it approves the proposal as the model revises it by that note. The revision is written without a second question, and `observer_resolve`'s result shows the note, the model's reason for the revision and the text written. A note on **Later** becomes that deferral's re-offer condition, in your words. A note on **Decline** is ignored. A note on a stale amendment's **Update** or **Delete**, a withdrawal or a compaction approves nothing: the pass prepares the changed proposal and asks again. A note that asks for something unrelated to its proposal defers that proposal as Later and becomes a question of its own. Custom input (`Other: ...`) still approves nothing. See [Proposal approval](development.md#proposal-approval).
 
 Each question shows its evidence: digest signal ids with their `(×N)` counts and a short exact quote, or `User note`, a Later entry's fingerprint or a stale amendment's rule. A barrier rule is asked about only after its pattern passes the replay check (see [Replay](amendments.md#replay)). Its preview shows the rule, scope and samples. The form shows a preview as wrapped text and marks indentation, repeated and trailing spaces `·` and tabs `→`; what is written is the prepared text.
 
@@ -44,7 +48,7 @@ The message that starts a pass holds these sections, in this order, leaving out 
 - **note**: the User note;
 - **digest**: the [session digest](#digest);
 - **ledger**: the proposal ledger's Later entries, each with its re-offer condition (`Re-offer when: …`) when its record has one;
-- **outcomes**: the remedy outcomes of applied fixes;
+- **outcomes**: the remedy outcomes of applied fixes. Only project-environment fixes and fixes for a skill the digest loaded are listed. One closing line counts the rest, whose skills were not loaded in this session;
 - **rules-in-force**: the [rules in force](#rules-in-force);
 - **project**: Project scope and the Recurring mistake workflow, under the `project` gate;
 - **retro**: the Retrospective reference, under the `project` gate;
@@ -60,13 +64,13 @@ The message that starts a pass holds these sections, in this order, leaving out 
 | `withdrawal` | a fix is in force for a loaded skill, or there is a User note | withdrawal candidates and questions, and retracted fixes |
 | `ranking` | the host has an explicit, available `judge` role assignment | advisory ranking and Select's `rankings`; without it the pass calls Select without rankings |
 | `note` | there is a User note | how to weigh the User note |
-| `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, and with custom input; see below |
+| `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, with custom input and with an approval note; see below |
 
 Under the `project` gate, the Retrospective reference includes the installed `retro` skill's text inline, without its frontmatter. A preceding line says which parts apply: its candidate categories do; its own steps and Files section describe a standalone retrospective and do not. Without `retro`, the section says the reference is unavailable and the UI warns. Without the gate, neither the section nor the warning appears.
 
 The `tool-result` paragraphs reach the model in the tool result that reports their condition, under a closing `## What to do now` heading. An `observer_resolve` result carries one paragraph per reported condition, regardless of how many answers hit it: an answer not recorded because its rule, amendment or reference files changed since Prepare or the reconciliation, a failed ledger append, or a failed cleanup.
 
-During a pass, an `ask` result carries the custom-input paragraph when an answer starts with `Other: `, the form's free-text row. Any other result carries none. When `observer.md` cannot supply a paragraph, the result keeps everything it reports and ends with a one-line note naming the error instead.
+During a pass, an `ask` result carries the custom-input paragraph when an answer starts with `Other: `, the form's free-text row, and the approval-note paragraph when a chosen option has a note that is not blank. Any other result carries none. When `observer.md` cannot supply a paragraph, the result keeps everything it reports and ends with a one-line note naming the error instead.
 
 A malformed gate marker in `observer.md` stops `/observe` with an error notice; no pass starts. CRLF line ends parse the same as LF.
 
@@ -78,7 +82,7 @@ The pass-start notice estimates the payload's size by section, as in `Observatio
 
 1. **Signals** by kind, as distinct occurrences, and how many older signals the digest cap would drop from the pass;
 2. **Skills loaded**, each with its provenance kind, load route (`read`, `slash-command`) and the on-read amendments delivered for it; skills a read requested that never loaded; managed skills created;
-3. **Remedy outcomes**, one line per applied fix in force for this project, as `fingerprint: status (skill or project target path)`, delivered first, then exercised-clean, recurrence and inconclusive;
+3. **Remedy outcomes**, one line per applied fix in force for this project, as `fingerprint: status (skill or project target path)`, delivered first, then exercised-clean, recurrence and inconclusive. The report lists every one, including those the payload only counts;
 4. **Stale amendments**, by rule name and skill;
 5. the **payload estimate** of the pass `/observe` would start now, from the same assembly and gates (without a User note);
 6. the number of **Later** proposals for this project.
@@ -119,7 +123,7 @@ The pass dismisses a candidate that a listed rule already covers. A signal repea
 The digest keeps signals and drops everything else: harness messages (wiki recall, status notices, advisor, reminders and nudges, background-job and IRC deliveries, file mentions, `developer` messages), bookkeeping entries and thinking blocks.
 
 - **Corrections** carry the ~200 characters of assistant text just before them. Their own text is cut at 2,000 characters, so a pasted log can't fill the digest.
-- **Tool errors** show the tool, a short argument summary and the error cut to about 300 characters, and name the skills loaded earlier in the same turn. Errors inside an observation pass are left out, and its calls get no outline.
+- **Tool errors** show the tool, a short argument summary and the end of the error, about its last 300 characters, where a failed command states why it failed. They name the skills loaded earlier in the same turn. Errors inside an observation pass are left out, and its calls get no outline.
 - **Workflow outlines** list one line per tool call (name, argument summary, ok/error), up to 50 calls, so one long turn can't crowd out every other signal. A subagent run shows only its `task` call (task names and agents) and the status its subagents ended with, taken from `wait` results and background-job deliveries.
 - **Identical signals** are counted as one, with a `(×N)` count, placed where they last occurred. Each keeps the occurrence IDs it stands for; a tool error's ID nests under its turn's workflow outline (`<workflow>/<event>`), so ranking counts distinct occurrences, not descriptions.
 - **Device dispatch** (`write xd://<tool>`) is recorded once, as the inner tool. A call saved both natively and by the extension's hooks also counts once, at its first request and first outcome; calls nested in `eval` appear only through their hook records, and structured parallel calls through their `tool_uses`. This view is deliberately lossy: publication receipts never rely on it.

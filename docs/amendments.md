@@ -17,7 +17,9 @@ A barrier rule's `scope` sets where its pattern watches for the mistake: `text`,
 
 ## The skill's on-read amendment
 
-Each upstream or plugin skill has at most one on-read amendment, `<skill>-amendment.md`. An applied on-read fix carries the user's `approval` of its prepared proposal. The section written is the one that proposal holds, a `## ` heading line and its text. See [Proposal approval](development.md#proposal-approval).
+Each upstream or plugin skill has at most one on-read amendment, `<skill>-amendment.md`. An applied on-read fix carries the user's `approval` of its prepared proposal. The section written is the one that proposal holds, a `## ` heading line and its text, or its revision by the user's approval note. See [Proposal approval](development.md#proposal-approval).
+
+For each on-read fix, Prepare names the `## ` headings the skill's amendment holds at the bytes it read, as `amendmentSections`, empty when the skill has no amendment yet. The pass then drops or reworks a fix whose section the amendment already covers, even when the amendment was not delivered in this session. The headings are not part of the proposal, so they do not change its content hash.
 
 `observer_resolve` appends the section after a blank line to the skill's amendment, or creates the amendment with the section as its body when the skill has none. On append, it removes trailing whitespace from the existing file with `trimEnd()`, adds two newlines, appends the trimmed section, and ends the file with a newline. Content before that trailing whitespace stays unchanged. If the body already holds the section verbatim when the pass answers the same applied fix again, it is not appended twice. The answer still records.
 
@@ -63,7 +65,7 @@ If a file is already there, the old file is deleted only if the existing one is 
 The extension delivers a skill's on-read amendments through either route into the context. It renders a hidden `<system-reminder reason="skill_amendment" skill="<skill>">` holding one `<amendment rule="<name>">` per amendment:
 
 - **`/skill:<name>`** puts the skill in the conversation without a `read`. When a submitted prompt starts an amended skill, the extension appends a hidden `skill-observer-amendments` message after it, on the same turn.
-- **A `read` of the skill's entry file** can use `skill://<name>`, `skill://<name>/SKILL.md`, or the skill's `…/SKILL.md` path, any with a read selector such as `:1-40` or `:raw`. Reference files, longer skill names, other URLs, and failed reads get nothing.
+- **A `read` of the skill's entry file** can use `skill://<name>`, `skill://<name>/SKILL.md`, or the skill's `…/SKILL.md` path, any with a read selector such as `:1-40` or `:raw`. A `SKILL.md` elsewhere that holds the same bytes as the installed skill's entry file counts as that skill (see [`/observe`](observation.md#observe)). Reference files, longer skill names, other URLs, a copy that differs, and failed reads get nothing.
 
   When the model called `read` itself, as the saved transcript shows by the time the result arrives, the amendments go out as the call's additional context. OMP adds this after the tool results. A read nested in `eval` or a device dispatch has nowhere to put additional context, so the amendments are appended to its result text instead. The extension's hook copy of such a read, or a native outer `write xd://read` under the same call ID, does not make it native.
 
