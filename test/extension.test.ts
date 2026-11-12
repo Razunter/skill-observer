@@ -1586,7 +1586,7 @@ describe("proposal reconciliation of on-read appends", () => {
     expect(readRule(amendment(fixture.host)).body).toBe(`${SEAMS}\n\n${MINE}\n\n${RED}`);
     const { revision, ...approval } = answer.approval;
     expect((result.details as { approvals: unknown[] }).approvals).toEqual([{
-      fingerprint: fixture.applied.fingerprint, approval, selected: "Apply", reconciliation: { revision, ...claim },
+      fingerprint: fixture.applied.fingerprint, approval, selected: "Apply", reconciliation: { revision, ...claim, preview: expect.stringContaining(RED) },
     }]);
     expect(resultText(result)).toContain(`reconciled by the main agent in revision \`${revision.candidateId}\` of review \`${revision.reviewToolCallId}\`, not approved by the user`);
   });
@@ -1650,6 +1650,81 @@ describe("proposal reconciliation of on-read appends", () => {
     appendFileSync(amendment(host), `\n${MINE}\n`);
     const answer = await reconciled({ host, applied: red! });
     await expectNoWrite(host, [{ ...oneBehaviour, approval: { ...oneBehaviour!.approval, revision: answer.approval.revision } }], "lineage");
+  });
+
+  describe("under an approval note", () => {
+    const NOTE = "Say it in one line.";
+    const REVISED = "## Red\n\nA red is an assertion diff.";
+    const judgment = { reason: "The user asked for one line.", preserved: "Same Red guidance, shorter; nothing else in the amendment changes." };
+    /** `tdd`'s amendment holding Seams, and the user's Apply to a Red append with NOTE attached. */
+    const noted = async (): Promise<Changed> => {
+      const host = loadExtension();
+      await addOnReadFix(host, "tdd", "Name the seam before the first test.", SEAMS);
+      const [applied] = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }], () => ({ option: "Apply", note: NOTE }));
+      if (!applied) throw new Error("no applied answer");
+      return { host, applied };
+    };
+    const revise = (fixture: Changed, overrides: Record<string, unknown> = {}) => prepareRevision(fixture.host, reviseCandidate(fixture,
+      { change: { operation: "on-read-append", section: REVISED }, reconciles: { approval: fixture.applied.approval, ...judgment }, ...overrides }));
+    /** Prepares the revision as `revise` does and returns the answer citing it. */
+    const citing = async (fixture: Changed, overrides?: Record<string, unknown>) => {
+      const prepared = await revise(fixture, overrides);
+      expect(failures(prepared)).toEqual([]);
+      const [revision] = reviewEntries(prepared);
+      if (!revision) throw new Error("no revision");
+      return { ...fixture.applied, approval: { ...fixture.applied.approval, revision: revision.reference } };
+    };
+
+    it("writes the section as the note revised it, without a second Ask, and reports the note, the reason and the text written", async () => {
+      const fixture = await noted();
+      const answer = await citing(fixture);
+      const result = await resolve(fixture.host, [answer]);
+      expect(result.isError).toBeFalsy();
+      expect(readRule(amendment(fixture.host)).body).toBe(`${SEAMS}\n\n${REVISED}`);
+      expect(fixture.host.getBranch().findLast((entry) => entry.message?.toolName === "ask")?.message?.toolCallId).toBe(answer.approval.askToolCallId);
+      const { revision, ...approval } = answer.approval;
+      expect((result.details as { approvals: unknown[] }).approvals).toEqual([{
+        fingerprint: fixture.applied.fingerprint, approval, selected: "Apply", note: NOTE, reconciliation: { revision, ...judgment, preview: expect.stringContaining(REVISED) },
+      }]);
+      expect(resultText(result)).toContain(NOTE);
+      expect(resultText(result)).toContain(judgment.reason);
+      expect(resultText(result)).toContain("A red is an assertion diff.");
+      const record = ledgerRecords(fixture.host.ledgerFile).at(-1)!;
+      expect(Object.keys(record).sort()).toEqual(Object.keys(ledgerRecords(fixture.host.ledgerFile)[0]!).sort());
+      expect(record).toMatchObject({ gist: "A red is an assertion diff.", outcome: "applied", rule: amendment(fixture.host) });
+    });
+
+    it("covers the note and a target changed after Prepare with one revision, which states how the target changed", async () => {
+      const fixture = await noted();
+      appendFileSync(amendment(fixture.host), `\n${MINE}\n`);
+      expect(failures(await revise(fixture))).toEqual([expect.stringContaining("changedTarget")]);
+      const answer = await citing(fixture, { reconciles: { approval: fixture.applied.approval, ...judgment, changedTarget: claim.changedTarget } });
+      const result = await resolve(fixture.host, [answer]);
+      expect(result.isError).toBeFalsy();
+      expect(readRule(amendment(fixture.host)).body).toBe(`${SEAMS}\n\n${MINE}\n\n${REVISED}`);
+      expect((result.details as { approvals: Array<{ note?: string; reconciliation?: Record<string, unknown> }> }).approvals)
+        .toEqual([expect.objectContaining({ note: NOTE, reconciliation: expect.objectContaining({ changedTarget: claim.changedTarget }) })]);
+    });
+
+    it.each<[string, string, Record<string, unknown>]>([
+      ["identical to the approved section: the note was not applied", "the note", { change: { operation: "on-read-append", section: RED } }],
+      ["for another skill", "approved proposal's own", { skill: "domain-modeling" }],
+      ["under another ledger identity", "approved proposal's own", { gist: "Reds are diffs of assertions." }],
+    ])("refuses to prepare a revision %s", async (_label, reason, overrides) => {
+      const result = await revise(await noted(), overrides);
+      expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
+    });
+
+    it("writes nothing for a revision saved before the user answered", async () => {
+      const fixture = await noted();
+      const answer = await citing(fixture);
+      const branch = fixture.host.getBranch();
+      const revisionEntries = branch.filter((entry) => JSON.stringify(entry).includes(`"${answer.approval.revision.reviewToolCallId}"`));
+      const rest = branch.filter((entry) => !revisionEntries.includes(entry));
+      const askCall = rest.findIndex((entry) => JSON.stringify(entry).includes(`"${answer.approval.askToolCallId}"`));
+      fixture.host.setBranch([...rest.slice(0, askCall), ...revisionEntries, ...rest.slice(askCall)]);
+      await expectNoWrite(fixture.host, [answer], "prepared before the user answered");
+    });
   });
 });
 
@@ -3528,7 +3603,8 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
       expect(result.isError).toBeFalsy();
       expect(readRule(jjFile(fixture.host)).body).toBe(`${JJ_NOT_GIT.body}\n\n${USER_LINE}`);
       const { revision, ...approval } = answer.approval;
-      expect((result.details as { approvals: unknown[] }).approvals).toEqual([{ fingerprint: fixture.applied.fingerprint, approval, selected: "Apply", reconciliation: { revision, ...claim } }]);
+      expect((result.details as { approvals: unknown[] }).approvals).toEqual([{ fingerprint: fixture.applied.fingerprint, approval, selected: "Apply",
+        reconciliation: { revision, ...claim, preview: expect.stringContaining(USER_LINE) } }]);
       expect(resultText(result)).toContain("not approved by the user");
     }, 30_000);
 
@@ -3553,6 +3629,39 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
       const fixture = await changedAfterApproval();
       const result = await prepareRevision(fixture, { ...JJ_NOT_GIT, name: "jj-not-git-either" });
       expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining("approved proposal's own rule")] });
+    });
+  });
+
+  describe("revising a rule by an approval note", () => {
+    const NOTE = "Mention jj describe too.";
+    const REVISED_BODY = "Use `jj commit` or `jj describe`; this repo has no git index.";
+    const judgment = { reason: "The user asked to mention jj describe.", preserved: "Same barrier against git commit; only the body names jj describe." };
+    const noted = () => approved(drafts["a barrier rule"], () => ({ option: "Apply", note: NOTE }));
+    /** Prepares a revision of the noted barrier rule as `rule`, citing its approval. */
+    const prepareRevision = ({ host, applied }: Approved, rule: PatternRule) =>
+      host.callTool("observer_review", { action: "prepare", candidates: [
+        { ...ruleCandidate({ ...drafts["a barrier rule"], rule }), reconciles: { approval: applied.approval, ...judgment } },
+      ] });
+
+    it.skipIf(!ompAvailable)("replays and writes the rule as the note revised it, without a second Ask, and reports the note, the reason and the rule written", async () => {
+      const fixture = await noted();
+      const prepared = await prepareRevision(fixture, { ...JJ_NOT_GIT, body: REVISED_BODY });
+      const [revision] = reviewEntries(prepared);
+      if (!revision) throw new Error("no revision");
+      const result = await fixture.host.callTool("observer_resolve", { outcomes: [{ ...fixture.applied, approval: { ...fixture.applied.approval, revision: revision.reference } }] });
+      expect(result.isError).toBeFalsy();
+      expect(readRule(jjFile(fixture.host))).toMatchObject({ body: REVISED_BODY, frontmatter: { condition: JJ_NOT_GIT.pattern } });
+      expect(fixture.host.getBranch().findLast((entry) => entry.message?.toolName === "ask")?.message?.toolCallId).toBe(fixture.applied.approval.askToolCallId);
+      expect((result.details as { approvals: unknown[] }).approvals).toEqual([expect.objectContaining({ note: NOTE, reconciliation: expect.objectContaining(judgment) })]);
+      for (const shown of [NOTE, judgment.reason, REVISED_BODY]) expect(resultText(result)).toContain(shown);
+    }, 30_000);
+
+    it.each<[string, string, Partial<PatternRule>]>([
+      ["identical to the approved rule: the note was not applied", "the note", {}],
+      ["under another rule name", "approved proposal's own rule", { name: "jj-not-git-either", body: REVISED_BODY }],
+    ])("refuses to prepare a revision %s", async (_label, reason, rule) => {
+      const result = await prepareRevision(await noted(), { ...JJ_NOT_GIT, ...rule });
+      expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
     });
   });
 });
@@ -5148,7 +5257,7 @@ describe("evidence-gated instructions", () => {
 });
 
 describe("error-path guidance in tool results", () => {
-  const CONDITIONS: readonly ToolResultCondition[] = ["changed-target", "ledger-append-failed", "cleanup-failed", "custom-input"];
+  const CONDITIONS: readonly ToolResultCondition[] = ["changed-target", "ledger-append-failed", "cleanup-failed", "custom-input", "approval-note"];
   /** Each `## What to do now` section of `text`, as the conditions whose guidance paragraphs it holds, in order; any other paragraph stays text. */
   const whatToDoNow = (text: string) => text.split("\n## What to do now\n\n").slice(1)
     .map((section) => section.split("\n\n").map((paragraph) => CONDITIONS.find((condition) => toolResultGuidance(condition) === paragraph) ?? paragraph));
@@ -5186,12 +5295,15 @@ describe("error-path guidance in tool results", () => {
   it.each<[string, string[], ToolResultCondition[][], boolean?, string?]>([
     ["custom input", ["Other: only for unit tests"], [["custom-input"]]],
     ["custom input beside a plain Apply", ["Apply", "Other: only for unit tests"], [["custom-input"]]],
-    ["custom input beside an Apply with a note", ["Apply", "Other: only for unit tests"], [["custom-input"]], true, "Shorter."],
+    ["custom input beside an Apply with a note", ["Apply", "Other: only for unit tests"], [["custom-input", "approval-note"]], true, "Shorter."],
     ["a plain Apply", ["Apply"], []],
-    ["an Apply with a note", ["Apply"], [], true, "Shorter."],
+    ["an Apply with a note", ["Apply"], [["approval-note"]], true, "Shorter."],
+    ["a Later with a note", ["Later"], [["approval-note"]], true, "After the release."],
+    ["an Apply with a blank note", ["Apply"], [], true, "  "],
     ["Later and no option", ["Later", ""], []],
     ["custom input, outside a pass", ["Other: only for unit tests"], [], false],
-  ])("gives an ask result answered with %s the custom-input guidance only during a pass and when an answer is custom input", async (_label, answers, expected, inPass = true, note) => {
+    ["an Apply with a note, outside a pass", ["Apply"], [], false, "Shorter."],
+  ])("gives an ask result answered with %s the custom-input and approval-note guidance only during a pass, for custom input and for a note", async (_label, answers, expected, inPass = true, note) => {
     const host = loadExtension();
     if (inPass) startPass(host);
     const details: AskDetails = { answers: answers.map((answer, i) => ({ name: `proposal:${i}`, question: "Apply this change?", answer })),

@@ -4,7 +4,8 @@
  * the operation `observer_resolve` would carry out, with the target state it
  * read and a preview rendered from that operation; its successful result is the
  * branch artifact. A candidate that reconciles an approved on-read append or
- * rule with its changed target is prepared the same way, carrying that reconciliation.
+ * rule with the user's approval note, its changed target, or both is prepared the same
+ * way, carrying that reconciliation.
  * Select accepts only references to those results, and renders the one Ask
  * form that shows the proposals it selected.
  */
@@ -169,14 +170,14 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
     fingerprint: z.string().optional(),
     reconciles: z.object({
       approval: z.object(approvalShape(z)).describe("The user's approval of the original proposal, exactly as observer_resolve would cite it."),
-      changedTarget: z.string().describe("How the target amendment or rule file changed since the approved Prepare read it."),
-      reason: z.string().describe("Why this revision of the approved section or rule."),
+      changedTarget: z.string().optional().describe("Only when the target amendment or rule file changed since the approved Prepare read it, and then required: how it changed."),
+      reason: z.string().describe("Why this revision of the approved section or rule: what the user's note asked for, the target's change, or both."),
       preserved: z.string().describe("Why the revision keeps the approved intent and the target's unrelated content."),
-    }).optional().describe("On-read append or rule only: revises an approved proposal whose target changed after its Prepare, in the same pass. The main agent's reconciliation, not the user's approval: a change that would drop or rewrite the target's new content, or delete a target, needs a new proposal and Ask."),
+    }).optional().describe("On-read append or rule only: revises an approved proposal, in the same pass, by the note the user attached to its Apply (read from the Ask; a section, or a rule's body, pattern and samples, not its name), for a target that changed after its Prepare, or both. The main agent's reconciliation, not the user's approval: a change that would drop or rewrite the target's new content, or delete a target, needs a new proposal and Ask."),
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return a reference per proposal plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule for its changed target: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither asks, approves nor publishes and never calls a model.",
+    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return a reference per proposal plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass, the revision makes the same operation on the same target under the same identity, and, under a note, differs from the approved change. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither asks, approves nor publishes and never calls a model.",
     parameters: z.object({
       action: z.enum(["prepare", "select"]),
       candidates: z.array(z.union([

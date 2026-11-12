@@ -36,7 +36,7 @@ import {
   type ProvenanceResolver,
   type SkillRoots,
 } from "./provenance.js";
-import { activeGates, describePayloadEstimate, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate, whatToDoNow } from "./payload.js";
+import { activeGates, describePayloadEstimate, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate, type ToolResultCondition, whatToDoNow } from "./payload.js";
 import { CHECK_TOOL_NAME, registerCheckTool } from "./replay.js";
 import { RESOLVE_TOOL_NAME, registerResolveTool } from "./resolve.js";
 import { rankingModelUnavailable, registerReviewTool, REVIEW_TOOL_NAME } from "./review.js";
@@ -44,7 +44,7 @@ import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
 import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
 import { evidenceReport, isEmptyEvidenceReport, renderEvidenceReport } from "./report.js";
 import { recordHookCall, recordHookResult } from "./session-tool-evidence.js";
-import { hasCustomInput, observationPassStart } from "./proposal-approval.js";
+import { hasApprovalNote, hasCustomInput, observationPassStart } from "./proposal-approval.js";
 
 const STATUS_KEY = "skill-observer";
 /** Global, not per project: feedback about global skills gathers in one place. */
@@ -195,7 +195,11 @@ export default function skillObserver(pi: ExtensionAPI): void {
     const isReceiptTool = ["write", "edit", "bash", "manage_skill", "ask", REVIEW_TOOL_NAME].includes(event.toolName);
     recordHookResult(pi, event, ctx.sessionManager.getBranch());
     if (event.isError || !isReceiptTool || observationPassStart(ctx.sessionManager.getBranch()) === undefined) return;
-    const guidance = event.toolName === "ask" && hasCustomInput(event.details as AskDetails | undefined) ? [{ type: "text", text: whatToDoNow(["custom-input"]) }] : [];
+    const details = event.toolName === "ask" ? event.details as AskDetails | undefined : undefined;
+    const conditions: ToolResultCondition[] = [];
+    if (hasCustomInput(details)) conditions.push("custom-input");
+    if (hasApprovalNote(details)) conditions.push("approval-note");
+    const guidance = conditions.length > 0 ? [{ type: "text", text: whatToDoNow(conditions) }] : [];
     // Opaque host IDs are absent from ordinary model-visible outputs; snapshot tags and commands cannot identify branch receipts.
     return {
       content: [...event.content, { type: "text", text: JSON.stringify({ observerToolCallId: event.toolCallId }) }, ...guidance],

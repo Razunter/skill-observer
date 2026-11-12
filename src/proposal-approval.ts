@@ -13,13 +13,15 @@
  * cached: each check reads the branch as it is, so authority ends as soon as
  * the chain or the pass leaves the branch, or the user speaks after answering.
  *
- * A proposal reconciliation adapts an approved on-read append or rule to a
- * target that changed after its Prepare: a revised proposal, prepared later in
- * the pass, that cites the approval. A stale answer, withdrawal or compaction
- * against a changed target needs a new Prepare and Ask instead: each deletes or
- * rewrites the target without keeping its new content, and a re-pin alone is no
- * change to the instruction content it shows. Code checks its lineage, identity and the target's
- * bytes; the main agent's judgment that the revision keeps the approved intent
+ * A proposal reconciliation adapts an approved on-read append or rule to the
+ * user's approval note on its Apply, to a target that changed after its
+ * Prepare, or to both: a revised proposal, prepared later in the pass, that
+ * cites the approval. An Apply with a note writes nothing without one. A stale
+ * answer, withdrawal or compaction takes no note, and against a changed target
+ * needs a new Prepare and Ask instead: each deletes or rewrites the target
+ * without keeping its new content, and a re-pin alone is no change to the
+ * instruction content it shows. Code checks its lineage, identity and the target's
+ * bytes; the main agent's judgment that the revision follows the note and keeps the approved intent
  * and the target's unrelated content is trusted, and reported as its
  * judgment, never as the user's approval of the revision.
  */
@@ -30,7 +32,7 @@ import { basename, dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { frontmatterField } from "./amendments.js";
 import { OBSERVATION_MESSAGE_TYPE } from "./digest.js";
-import type { AgentMessage, AskDetails, Schema, SchemaBuilder, SessionEntry } from "./omp.js";
+import type { AgentMessage, AskDetails, AskOptionNote, Schema, SchemaBuilder, SessionEntry } from "./omp.js";
 import { isProposalRef, type PreparedChange, type PreparedProposal, type PreparedProposalRef, preparedEntry, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, snapshot } from "./review.js";
 import { hasUnlistedReferenceEntries, readReferenceFiles } from "./references.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
@@ -42,10 +44,14 @@ export interface ProposalAnswerRef {
   askToolCallId: string;
 }
 
-/** What a revised proposal states: the approval it reconciles, how the target changed, why, and why the revision keeps the approved intent and the target's unrelated content. */
+/**
+ * What a revised proposal states: the approval it reconciles, why the revision,
+ * why it keeps the approved intent and the target's unrelated content, and,
+ * when the target changed after the approved Prepare, how.
+ */
 export interface ProposalReconciliation {
   approval: ProposalAnswerRef;
-  changedTarget: string;
+  changedTarget?: string;
   reason: string;
   preserved: string;
 }
@@ -56,8 +62,10 @@ export interface ApprovalEvidence {
   approval: ProposalAnswerRef;
   /** The option the user selected: Apply, or a stale amendment's Update or Delete. */
   selected: string;
-  /** The main agent's reconciliation the written content comes from; the user approved the original, not this revision. */
-  reconciliation?: Omit<ProposalReconciliation, "approval"> & { revision: PreparedProposalRef };
+  /** The approval note the user attached to that option, which the reconciliation revised the proposal by. */
+  note?: string;
+  /** The main agent's reconciliation the written content comes from, with the preview of that content; the user approved the original, not this revision. */
+  reconciliation?: Omit<ProposalReconciliation, "approval"> & { revision: PreparedProposalRef; preview: string };
 }
 
 /** `revision`: the reference of a reconciliation of the approved proposal, whose content is written instead. */
@@ -86,6 +94,17 @@ const CUSTOM_INPUT = "Other: ";
 /** Whether an answer of the Ask `details` is custom input, which approves nothing: the pass prepares a new proposal for what it asks. */
 export function hasCustomInput(details: AskDetails | undefined): boolean {
   return Array.isArray(details?.answers) && details.answers.some((answer) => answer?.answer?.startsWith(CUSTOM_INPUT));
+}
+
+/** Whether the Ask `details` hold an approval note on any chosen option: what it obliges depends on that option. */
+export function hasApprovalNote(details: AskDetails | undefined): boolean {
+  return Array.isArray(details?.notes) && details.notes.some((note) => noteText(note) !== undefined);
+}
+
+/** An option note's text, trimmed; a blank note is none. */
+function noteText(note: AskOptionNote | undefined): string | undefined {
+  const text = typeof note?.text === "string" ? note.text.trim() : "";
+  return text || undefined;
 }
 
 /**
@@ -152,7 +171,8 @@ export function approvedChange(answer: ApprovedAnswer, branch: readonly SessionE
   if (evidence.completedCall(revision.reviewToolCallId).call.position < answeredAt) throw new Error("the reconciliation was prepared before the user answered");
   checkTarget(reconciled, "the reconciliation was prepared; reconcile again or ask again");
   const { approval: _, ...judgment } = revised.reconciles;
-  return { change: reconciled, evidence: { fingerprint, approval, selected, reconciliation: { revision, ...judgment } } };
+  const preview = "preview" in revised ? revised.preview : "";
+  return { change: reconciled, evidence: { fingerprint, approval, selected, ...(note !== undefined && { note }), reconciliation: { revision, ...judgment, preview } } };
 }
 
 /** Throws unless `change`, approved by selecting `selected`, is the change `answer` carries out, on its proposal's identity. */
@@ -179,25 +199,41 @@ function checkCarriedOut(answer: ApprovedAnswer, proposal: PreparedProposal, cha
  * Checks the reconciliation a revised proposal claims, as Prepare drafts it:
  * the approval it cites holds in the current pass, the revision makes the same
  * operation on the same target for the same skill under the same ledger
- * identity, and the target changed since the approved Prepare. Returns it in
- * canonical form; throws with the reason when it doesn't hold.
+ * identity, and it rests on the user's approval note, a target changed since
+ * the approved Prepare, or both. A note-based revision differs from the
+ * approved instruction; a changed target is stated. Returns it in canonical
+ * form; throws with the reason when it doesn't hold.
  */
 export function checkReconciliation(
   claim: Partial<ProposalReconciliation> | undefined, revision: Pick<PreparedProposal, "skill" | "kind" | "fingerprint"> & { change: ReconcilableChange },
   branch: readonly SessionEntry[],
 ): ProposalReconciliation {
   const { changedTarget, reason, preserved } = claim ?? {};
-  if (![changedTarget, reason, preserved].every((text) => typeof text === "string" && text.trim())) {
-    throw new Error("a reconciliation states `changedTarget`, `reason` and `preserved`: how the target changed, why the revision, and why it keeps the approved intent and the target's unrelated content");
+  if (![reason, preserved].every((text) => typeof text === "string" && text.trim())) {
+    throw new Error("a reconciliation states `reason` and `preserved`: why the revision, and why it keeps the approved intent and the target's unrelated content");
   }
   const approval = answerRef(claim?.approval);
-  const { proposal, change } = approvedProposal(approval, sessionToolEvidence(branch), branch);
+  const { proposal, change, note } = approvedProposal(approval, sessionToolEvidence(branch), branch);
   if (!isReconcilable(change)) throw new Error("only an approved on-read append or rule can be reconciled: a changed stale answer or withdrawal needs a new prepared proposal and Ask");
   revisedChange(proposal, change, revision);
-  if (revision.change.target.sha256 === change.target.sha256) {
-    throw new Error("the target is unchanged since the approved Prepare read it: resolve with the original approval");
+  const targetChanged = revision.change.target.sha256 !== change.target.sha256;
+  if (!targetChanged && note === undefined) {
+    throw new Error("the target is unchanged since the approved Prepare read it and the user attached no note: resolve with the original approval");
   }
-  return { approval, changedTarget: changedTarget!, reason: reason!, preserved: preserved! };
+  if (targetChanged && !(typeof changedTarget === "string" && changedTarget.trim())) {
+    throw new Error("the target changed since the approved Prepare read it: state how in `changedTarget`");
+  }
+  if (note !== undefined && isDeepStrictEqual(instruction(revision.change), instruction(change))) {
+    throw new Error(`the revision is the approved change unchanged, so it does not apply the note ${JSON.stringify(note)}: revise it by the note`);
+  }
+  return { approval, ...(targetChanged && { changedTarget }), reason: reason!, preserved: preserved! };
+}
+
+/** What a reconcilable change makes the agent read: an on-read append's section, or a rule's body, pattern, scope and samples. */
+function instruction(change: ReconcilableChange): unknown {
+  if (change.operation === "on-read-append") return change.section;
+  const { body, rule: { condition, scope }, matches, spares } = change;
+  return { body, condition, scope, matches, spares };
 }
 
 /**
@@ -349,7 +385,6 @@ function checkAnswer({ call, result }: CompletedToolCall, askHtml: string, candi
     throw new Error("the answer is custom input, which approves nothing; prepare a new proposal for what it asks and ask again");
   }
   if (!approving.has(selected)) throw new Error(`the user selected \`${selected}\`, not ${[...approving.keys()].join(" or ")}`);
-  const text = details?.notes?.find((given) => given?.name === candidateId && given.option === selected)?.text;
-  const note = typeof text === "string" ? text.trim() : "";
-  return { selected, ...(note && { note }) };
+  const note = noteText(details?.notes?.find((given) => given?.name === candidateId && given.option === selected));
+  return { selected, ...(note !== undefined && { note }) };
 }
