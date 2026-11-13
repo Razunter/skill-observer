@@ -644,8 +644,9 @@ interface ReviewEntry {
 const reviewEntries = (result: ToolResult<unknown>, list: "eligible" | "selected" | "deferred" = "eligible") =>
   (result.details as Record<typeof list, ReviewEntry[]>)[list];
 
-/** Runs the registered Prepare, then Select with every reference that Prepare returned. */
+/** Starts an observation pass, then runs the registered Prepare, then Select with every reference that Prepare returned. */
 async function prepareAndSelect(host: ReturnType<typeof loadExtension>, candidates: unknown[], select: Record<string, unknown> = {}) {
+  startPass(host);
   const prepared = await host.callTool("observer_review", { action: "prepare", candidates });
   expect(prepared.isError).toBeFalsy();
   return host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map((entry) => entry.reference), ...select });
@@ -1145,6 +1146,7 @@ describe("observer_review prepared proposals", () => {
 
   it("selects exactly the proposals its references name, as their successful Prepare saved them, and returns their references, not their bodies", async () => {
     const host = loadExtension();
+    startPass(host);
     const candidates = ["Evidence fix", "Note fix"].map((gist, index) => ({ kind: "upstream", skill: "tdd", gist, priority: index ? "note" : "evidence", remedy,
       change: { operation: "on-read-append", section: `## ${gist}\n\nDo it.` }, evidence: [{ quote: gist, count: 1 }] }));
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates });
@@ -1252,6 +1254,7 @@ describe("observer_review prepared proposals", () => {
 
   const reviewFixture = async () => {
     const host = loadExtension();
+    startPass(host);
     const draft = { kind: "upstream", skill: "tdd", gist: "Name the seam", priority: "evidence", remedy, change: { operation: "on-read-append", section: "## Seams\n\nName the seam." } };
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [draft] });
     const prepareId = lastCallId(host);
@@ -1311,6 +1314,16 @@ describe("observer_review prepared proposals", () => {
     expect(result.details).toMatchObject({ selected: [], deferred: [], failures: [expect.stringContaining(reason)] });
     expect(resultText(result)).not.toContain("Substituted");
     expect(ownedFiles(fixture.host)).toEqual(before);
+  });
+
+  it("rejects Select once a later prompt ended the pass, so no approval form is shown", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [onReadCandidate({ gist: "Name the seam", section: SEAMS })] });
+    host.getBranch().push({ type: "message", id: "prompt", message: { role: "user", content: "Why did you stop?" } });
+    const result = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map((entry) => entry.reference) });
+    expect(result.details).toMatchObject({ selected: [], failures: [expect.stringContaining("no observation pass is current")] });
+    expect(resultText(result)).not.toContain("askHtml");
   });
 
   it.each<[string, (host: ReturnType<typeof loadExtension>) => Record<string, unknown>]>([

@@ -33,7 +33,7 @@ import { isDeepStrictEqual } from "node:util";
 import { frontmatterField } from "./amendments.js";
 import { OBSERVATION_MESSAGE_TYPE } from "./digest.js";
 import type { AgentMessage, AskDetails, AskOptionNote, Schema, SchemaBuilder, SessionEntry } from "./omp.js";
-import { isProposalRef, type PreparedChange, type PreparedProposal, type PreparedProposalRef, preparedEntry, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, snapshot } from "./review.js";
+import { isProposalRef, type PreparedChange, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, preparedEntry, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, snapshot } from "./review.js";
 import { hasUnlistedReferenceEntries, readReferenceFiles } from "./references.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 
@@ -244,7 +244,7 @@ function instruction(change: ReconcilableChange): unknown {
  */
 function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]):
   { proposal: PreparedProposal; change: ApprovedChange; selected: string; note?: string; answeredAt: number } {
-  const proposal = preparedInPass(ref.proposal, evidence, branch);
+  const { proposal } = preparedInPass(ref.proposal, evidence, branch);
   const options = approvingOptions(proposal);
 
   const prepare = evidence.completedCall(ref.proposal.reviewToolCallId);
@@ -269,18 +269,18 @@ function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence,
 }
 
 /**
- * The proposal `ref` locates, prepared in the current observation pass: an
- * answer of this pass, approved or not, cites only a proposal of this pass.
+ * The entry `ref` locates, prepared in the current observation pass: a form
+ * of this pass, and an answer to it, cite only a proposal of this pass.
  * Throws with the precise reason otherwise.
  */
-export function preparedInPass(ref: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): PreparedProposal {
+export function preparedInPass(ref: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): PreparedEntry {
   const passStart = observationPassStart(branch);
   if (passStart === undefined) {
     throw new Error("no observation pass is current on this branch: a later prompt, `/skill:` start or `/clear` ended it, so its answers approve nothing");
   }
-  const { proposal } = preparedEntry(evidence, ref);
+  const entry = preparedEntry(evidence, ref);
   if (evidence.completedCall(ref.reviewToolCallId).call.position < passStart) throw new Error("the proposal was prepared in an earlier observation pass; prepare, select and ask again");
-  return proposal;
+  return entry;
 }
 
 /** The options whose selection approves a change of `proposal`, each with that change. */

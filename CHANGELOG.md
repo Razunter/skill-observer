@@ -21,6 +21,8 @@
 - The digest's `ask` signals (custom input, an answer off the preselected option) fire for HTML-form results. Results saved before OMP 18.18 are still read.
 - A `SKILL.md` that is a byte-identical copy of an installed skill's entry file counts as that skill: the digest shows its provenance and the skill's on-read amendment is delivered on the read. A copy that differs stays provenance unknown.
 - A long tool error is quoted from its end, where a failed command states why, instead of its start.
+- Select refuses proposals once their observation pass has ended (a later prompt, `/skill:` start or `/clear`) or that an earlier pass prepared, so no form is shown whose answers could approve nothing. Before, Select returned the form and only Resolve or a reconciliation Prepare refused the answer.
+- The pass instructions say an Ask interrupted by a message is unanswered: answer the message, then ask the same form again in that turn.
 
 ### Removed
 

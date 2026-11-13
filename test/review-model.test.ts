@@ -39,7 +39,7 @@ function host(options: { assignment?: string; settings?: boolean; models?: boole
     registerTool(definition: ToolDefinition<unknown, unknown>) { tool = definition; },
   } as unknown as ExtensionAPI;
   registerReviewTool(pi, { ledgerFile: () => join(root, "ledger.jsonl"), rulesDir: () => root, amendmentsDir: () => root, referencesDir: () => root });
-  const branch: SessionEntry[] = [];
+  const branch: SessionEntry[] = [{ type: "custom_message", id: "observe", customType: "skill-observer", content: "Observation pass." }];
   const ctx = {
     cwd: root,
     sessionManager: { getBranch: () => branch, getSessionId: () => "review-model" },

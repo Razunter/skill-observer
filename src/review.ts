@@ -23,7 +23,7 @@ import {
 } from "./ledger.js";
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
-import { APPLY, approvalShape, checkReconciliation, isReconcilable, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
+import { APPLY, approvalShape, checkReconciliation, isReconcilable, preparedInPass, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import { createProvenanceResolver, defaultSkillRoots, type ProvenanceResolver } from "./provenance.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
@@ -110,7 +110,7 @@ export type PreparedProposal = {
 ) & (SkillScope | ProjectScope);
 
 export type PreparedProposalRef = Readonly<{ reviewToolCallId: string; candidateId: string; contentHash: string }>;
-interface PreparedEntry { reference: PreparedProposalRef; proposal: PreparedProposal }
+export interface PreparedEntry { reference: PreparedProposalRef; proposal: PreparedProposal }
 
 interface Ranking { id: string; score: number; confidence: number; consistent: boolean }
 interface ReviewParams {
@@ -658,8 +658,9 @@ function contentHash(proposal: PreparedProposal): string {
 
 /**
  * Resolves Select's references to the proposals this branch's successful
- * Prepare results hold, unchanged. Throws on a reference without exactly one
- * matching saved proposal and content hash.
+ * Prepare results of the current observation pass hold, unchanged, so no form
+ * is shown whose answers could approve nothing. Throws on a reference without
+ * exactly one matching saved proposal and content hash.
  */
 function preparedEntries(references: unknown, branch: readonly SessionEntry[]): PreparedEntry[] {
   if (!Array.isArray(references)) throw new Error("Select needs `proposals`: the references a successful Prepare returned");
@@ -669,7 +670,7 @@ function preparedEntries(references: unknown, branch: readonly SessionEntry[]): 
     if (!isProposalRef(reference)) throw new Error("each proposal reference needs reviewToolCallId, candidateId and contentHash");
     if (seen.has(reference.candidateId)) throw new Error(`proposal \`${reference.candidateId}\` is referenced twice`);
     seen.add(reference.candidateId);
-    return preparedEntry(evidence, reference);
+    return preparedInPass(reference, evidence, branch);
   });
 }
 

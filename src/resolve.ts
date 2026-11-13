@@ -418,7 +418,7 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
     return { ...rest, skill: skill!, kind: kind!, gist: gist! };
   }
   if (!isProposalRef(cited)) throw new Error("a cited proposal is its `reference`, exactly as Prepare returned it");
-  const proposal = preparedInPass(cited, sessionToolEvidence(branch), branch);
+  const { proposal } = preparedInPass(cited, sessionToolEvidence(branch), branch);
   if (proposal.kind === "project") throw new Error("the cited proposal is a project proposal, answered as a project outcome");
   const operation = "change" in proposal ? proposal.change.operation : "stale amendment";
   if (reference !== undefined && !CITABLE.includes(operation)) throw new Error(`the cited proposal is a ${operation}, which \`proposal\` does not answer`);
