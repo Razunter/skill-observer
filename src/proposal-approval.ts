@@ -108,6 +108,25 @@ function noteText(note: AskOptionNote | undefined): string | undefined {
 }
 
 /**
+ * The note the user attached to Later on the proposal `ref` cites, read from
+ * the last successful Ask after its Prepare that answered that proposal.
+ * `undefined` when that answer is not Later or has no note. A timed-out Ask
+ * is skipped: its answers are not the user's.
+ */
+export function laterNote(ref: PreparedProposalRef, evidence: SessionToolEvidence): string | undefined {
+  const prepared = evidence.completedCall(ref.reviewToolCallId).result.position;
+  const details = evidence.completedCalls("ask").findLast(({ result }) => result.position > prepared && !result.isError && !isTimedOut(result.details) &&
+    Array.isArray(result.details?.answers) && result.details.answers.some((answer) => answer?.name === ref.candidateId))?.result.details;
+  const answered = details?.answers?.find((answer) => answer?.name === ref.candidateId)?.answer;
+  return answered === "Later" ? noteText(details?.notes?.find((note) => note?.name === ref.candidateId && note.option === answered)) : undefined;
+}
+
+/** Whether the deadline submitted the Ask form as it stood: its answers are not the user's. */
+function isTimedOut(details: AskDetails | undefined): boolean {
+  return details?.timedOut === true;
+}
+
+/**
  * The branch position of the message that started the current observation
  * pass, or `undefined` when no pass is current: a prompt the user typed, a
  * `/skill:` start or a `/clear` reset after it ends the pass. Steering and
@@ -200,9 +219,9 @@ function checkCarriedOut(answer: ApprovedAnswer, proposal: PreparedProposal, cha
  * the approval it cites holds in the current pass, the revision makes the same
  * operation on the same target for the same skill under the same ledger
  * identity, and it rests on the user's approval note, a target changed since
- * the approved Prepare, or both. A note-based revision differs from the
- * approved instruction; a changed target is stated. Returns it in canonical
- * form; throws with the reason when it doesn't hold.
+ * the approved Prepare, or both. A changed target is stated; a note-based
+ * revision may keep the approved text when the note only asked for a check.
+ * Returns it in canonical form; throws with the reason when it doesn't hold.
  */
 export function checkReconciliation(
   claim: Partial<ProposalReconciliation> | undefined, revision: Pick<PreparedProposal, "skill" | "kind" | "fingerprint"> & { change: ReconcilableChange },
@@ -223,17 +242,7 @@ export function checkReconciliation(
   if (targetChanged && !(typeof changedTarget === "string" && changedTarget.trim())) {
     throw new Error("the target changed since the approved Prepare read it: state how in `changedTarget`");
   }
-  if (note !== undefined && isDeepStrictEqual(instruction(revision.change), instruction(change))) {
-    throw new Error(`the revision is the approved change unchanged, so it does not apply the note ${JSON.stringify(note)}: revise it by the note`);
-  }
   return { approval, ...(targetChanged && { changedTarget }), reason: reason!, preserved: preserved! };
-}
-
-/** What a reconcilable change makes the agent read: an on-read append's section, or a rule's body, pattern, scope and samples. */
-function instruction(change: ReconcilableChange): unknown {
-  if (change.operation === "on-read-append") return change.section;
-  const { body, rule: { condition, scope }, matches, spares } = change;
-  return { body, condition, scope, matches, spares };
 }
 
 /**
@@ -375,7 +384,7 @@ function checkAnswer({ call, result }: CompletedToolCall, askHtml: string, candi
   if (call.args.html !== askHtml) throw new Error("the Ask's `html` is not this Select's `askHtml` unchanged: ask again with it exactly as returned");
 
   const details = result.details;
-  if (details?.timedOut) throw new Error("the Ask timed out, which submits the form as it stood, not the user's approval; ask again");
+  if (isTimedOut(details)) throw new Error("the Ask timed out, which submits the form as it stood, not the user's approval; ask again");
   const answers = Array.isArray(details?.answers) ? details.answers.filter((answer) => answer?.name === candidateId) : [];
   const [answer] = answers;
   if (!answer || answers.length > 1) throw new Error(`the Ask's result holds no single answer named \`${candidateId}\``);

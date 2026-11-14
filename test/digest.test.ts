@@ -333,7 +333,7 @@ describe("tool errors and workflow outlines", () => {
   const withoutPrompt = (entries: readonly SessionEntry[]) =>
     entries.filter((entry) => entry.message?.role !== "user");
 
-  it("keeps a long tool error quoted from its end, in its signal and its tool exercise, attributed to the skill loaded in its turn", () => {
+  it("keeps a long tool error's start and end, in its signal and its tool exercise, attributed to the skill loaded in its turn", () => {
     const digest = digestFrom(fx.skillTurnToolError);
     const [error, ...rest] = digest.signals;
     expect(rest).toEqual([]);
@@ -344,9 +344,8 @@ describe("tool errors and workflow outlines", () => {
       skills: ["impeccable"],
     });
     const text = (error as { error: string }).error;
-    expect(text).toMatch(/^….*Command exited with code 127$/);
-    expect(text).not.toContain("impeccable: engine 0.1.5 is not installed");
-    expect(text.length).toBeLessThanOrEqual(301);
+    expect(text).toMatch(/^impeccable: engine 0\.1\.5 is not installed\b.*….*Command exited with code 127$/);
+    expect(text.length).toBeLessThanOrEqual(300);
     expect(digest.toolExercises?.find((exercise) => exercise.failed)?.error).toBe(text);
   });
 

@@ -63,6 +63,8 @@ export interface SessionToolEvidence {
    * still completed; its status is the caller's policy.
    */
   completedCall(id: string): CompletedToolCall;
+  /** Every pair `completedCall` returns for a call named exactly `name`, in branch order of their outcomes; IDs it refuses are left out. */
+  completedCalls(name: string): CompletedToolCall[];
   /**
    * Whether the transcript holds `id` as a call the model made itself under
    * exactly `name`. Hook records never count, so a call nested in `eval`, or
@@ -104,6 +106,15 @@ export function sessionToolEvidence(branch: readonly SessionEntry[]): SessionToo
       const records = byId.get(id);
       return pairCompletedCall(id, records?.calls ?? [], records?.results ?? []);
     },
+    completedCalls: (name) => [...byId].flatMap(([id, { calls, results }]) => {
+      if (!calls.some((call) => call.name === name)) return [];
+      try {
+        const completed = pairCompletedCall(id, calls, results);
+        return completed.call.name === name ? [completed] : [];
+      } catch {
+        return [];
+      }
+    }).sort((a, b) => a.result.position - b.result.position),
     isNativeCall: (id, name) => byId.get(id)?.calls.some((call) => call.origin === "native" && call.name === name) ?? false,
   };
 }

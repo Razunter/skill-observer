@@ -29,6 +29,7 @@ import {
   type ProjectPublication,
   type ProjectLedgerRecord,
   type SkillLedgerRecord,
+  IN_FORCE_OUTCOMES,
   laterReoffer,
   PROPOSAL_KINDS,
   PROPOSAL_OUTCOMES,
@@ -45,10 +46,10 @@ import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
 import { checkProjectPublication } from "./project-publication.js";
-import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
+import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, laterNote, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
 import { type ToolResultCondition, whatToDoNow } from "./payload.js";
-import { isProposalRef, type PreparedProposalRef, proposalRefSchema } from "./review.js";
-import { sessionToolEvidence } from "./session-tool-evidence.js";
+import { isProposalRef, type PreparedEntry, type PreparedProposalRef, proposalRefSchema, REVIEW_TOOL_NAME } from "./review.js";
+import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 
 export const RESOLVE_TOOL_NAME = "observer_resolve";
 
@@ -178,7 +179,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
               .describe("Applied on-read fix, pattern amendment or barrier rule, or withdrawal only, and required for one: where the user's approval of its prepared proposal is saved. The section, rule or withdrawal carried out is the prepared one, or for a fix its reconciliation's; skill, kind, gist, fingerprint and evidence are the prepared proposal's."),
             proposal: proposalRefSchema(z)
               .optional()
-              .describe("Any other answer to a prepared on-read fix, rule or direct edit (Later, Decline, deferred by Select, applied direct edit): its `reference`, exactly as Prepare returned it. Skill, kind, gist, fingerprint and evidence are the prepared proposal's."),
+              .describe("Any other answer to a prepared on-read fix, rule or direct edit (Later, Decline, deferred by Select, applied direct edit), or a Decline of a withdrawal: its `reference` from the pass's latest Prepare holding it, exactly as Prepare returned it. Skill, kind, gist, fingerprint and evidence are the prepared proposal's; a Later without `reoffer` takes the note the user attached to Later."),
             evidence: z
               .array(
                 z.object({
@@ -255,6 +256,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const ledger = files.ledgerFile();
       const records: LedgerRecord[] = [];
       const failures: string[] = [];
+      const kept: string[] = [];
       let targetChanged = false;
       const label = (answer: CitingAnswer | ProjectAnswer) => answer.kind === "project" ? `\`${answer.target?.path}\` (${answer.gist})`
         : answer.gist === undefined ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
@@ -292,6 +294,10 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           const historicalOwner = historical?.kind === "project" ? undefined : historical?.skill ?? answer.skill;
           const owner = claimed.get(fingerprint) ?? historicalOwner;
           if (owner !== answer.skill) throw new Error("proposal fingerprint belongs to another skill");
+          if (answer.outcome === "declined" && historical !== undefined && IN_FORCE_OUTCOMES.has(historical.outcome)) {
+            kept.push(`${label(answer)}, fingerprint \`${fingerprint}\``);
+            return [];
+          }
           const change = approved?.change;
           const checked = change?.operation === "withdrawal"
             ? { answer, fingerprint, withdrawal: change }
@@ -300,7 +306,9 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           return [checked];
         } catch (error) {
           targetChanged ||= error instanceof TargetChangedError;
-          failures.push(`${label(shown)}: ${(error as Error).message}`);
+          const message = (error as Error).message;
+          // A cited proposal's own refusals already name it.
+          failures.push(message.startsWith(`${label(shown)} `) ? message : `${label(shown)}: ${message}`);
           return [];
         }
       });
@@ -374,6 +382,10 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         );
         text.push(...deferred.map((reason) => `- ${reason}`));
       }
+      if (kept.length > 0) {
+        text.push("", `Recorded nothing for ${kept.length} Decline(s) of a fix in force. Each fix stays in force: report that, and don't call again for it:`);
+        text.push(...kept.map((answer) => `- ${answer}`));
+      }
       if (cleanup.length > 0) {
         text.push("", `Carried out as listed, but cleaning up after them failed, ${cleanup.length} deletion(s): don't call \`observer_resolve\` again for them; inspect what is left and report it to the user with the error:`);
         text.push(...cleanup.map((failure) => `- ${failure}`));
@@ -396,7 +408,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
   });
 }
 
-/** Operations whose proposal a skill answer cites through `proposal`; a withdrawal is answered only through its approval, a stale amendment and a compaction in their own lists. */
+/** Operations whose proposal a skill answer cites through `proposal`. A withdrawal is answered through its approval, and only its Decline cites it through `proposal`; a stale amendment and a compaction are answered in their own lists. */
 const CITABLE = ["on-read-append", "rule", "direct-edit"];
 
 /**
@@ -418,15 +430,33 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
     return { ...rest, skill: skill!, kind: kind!, gist: gist! };
   }
   if (!isProposalRef(cited)) throw new Error("a cited proposal is its `reference`, exactly as Prepare returned it");
-  const { proposal } = preparedInPass(cited, sessionToolEvidence(branch), branch);
+  const evidence = sessionToolEvidence(branch);
+  const { proposal } = preparedInPass(cited, evidence, branch);
   if (proposal.kind === "project") throw new Error("the cited proposal is a project proposal, answered as a project outcome");
   const operation = "change" in proposal ? proposal.change.operation : "stale amendment";
-  if (reference !== undefined && !CITABLE.includes(operation)) throw new Error(`the cited proposal is a ${operation}, which \`proposal\` does not answer`);
+  const citable = CITABLE.includes(operation) || (operation === "withdrawal" && answer.outcome === "declined");
+  if (reference !== undefined && !citable) throw new Error(`the cited proposal is a ${operation}, which \`proposal\` does not answer`);
+  const newer = reference === undefined ? undefined : latestPrepared(cited.candidateId, evidence);
+  if (newer !== undefined && newer.reviewToolCallId !== cited.reviewToolCallId) {
+    throw new Error(`a later Prepare of this pass holds this proposal again: cite its reference ${JSON.stringify(newer)}`);
+  }
   const filled = { skill: skill ?? proposal.skill, kind: kind ?? proposal.kind, gist: gist ?? proposal.gist, fingerprint: answer.fingerprint ?? proposal.fingerprint };
   const isThisAnswer = filled.skill === proposal.skill && filled.kind === proposal.kind && filled.gist === proposal.gist && filled.fingerprint === proposal.fingerprint;
   if (reference !== undefined && !isThisAnswer) {
     throw new Error(`the cited proposal is \`${proposal.skill}\` (${proposal.kind}) "${proposal.gist}" under fingerprint \`${proposal.fingerprint}\`, not this answer`);
   }
-  const evidence = proposal.evidence.length > 0 ? proposal.evidence.map(({ source: _, ...item }) => item) : answer.evidence;
-  return { ...rest, ...filled, ...(evidence && { evidence }) };
+  const quoted = proposal.evidence.length > 0 ? proposal.evidence.map(({ source: _, ...item }) => item) : answer.evidence;
+  const note = reference !== undefined && answer.outcome === "later" && answer.reoffer === undefined ? laterNote(reference, evidence) : undefined;
+  return { ...rest, ...filled, ...(quoted && { evidence: quoted }), ...(note !== undefined && { reoffer: note }) };
+}
+
+/** The reference that the branch's last successful Prepare holding `candidateId` returned for it; that Prepare may be native or nested. */
+function latestPrepared(candidateId: string, evidence: SessionToolEvidence): PreparedProposalRef | undefined {
+  let latest: PreparedProposalRef | undefined;
+  for (const { call, result } of evidence.completedCalls(REVIEW_TOOL_NAME)) {
+    if (call.args.action !== "prepare" || result.isError !== false) continue;
+    const eligible = (result.details as { eligible?: PreparedEntry[] } | undefined)?.eligible ?? [];
+    latest = eligible.find(({ reference }) => reference?.candidateId === candidateId && reference.reviewToolCallId === result.id)?.reference ?? latest;
+  }
+  return latest;
 }

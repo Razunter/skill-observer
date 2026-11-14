@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { remedyOutcomes } from "../src/outcomes.js";
+import { remedyOutcomes, renderRemedyOutcomes } from "../src/outcomes.js";
 import { buildDigest, type SessionDigest, type ToolExercise } from "../src/digest.js";
 import type { LedgerRecord } from "../src/ledger.js";
 import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
@@ -83,5 +83,10 @@ describe("project-environment remedy outcomes", () => {
     const digest = buildDigest([...run("early", before), ...run("late", after)] as never, env);
     expect(digest.toolExercises?.map((exercise) => exercise.at)).toEqual([before, after]);
     expect(remedyOutcomes([projectFix], digest)[0]).toMatchObject({ status: "exercised-clean", evidence: ["tool-result:late"] });
+  });
+  it("names a project fix's target path on its line of the payload's remedy outcomes", () => {
+    const digest = { ...empty, toolExercises: [{ ...check, at: after }] };
+    expect(renderRemedyOutcomes(remedyOutcomes([projectFix], digest), [projectFix], digest))
+      .toMatch(/^- project-fix\b.*\bpackage\.json\b.*exercised-clean/m);
   });
 });

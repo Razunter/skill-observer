@@ -43,7 +43,7 @@ export type SkillSignal =
       tool: string;
       /** Short summary of the call's arguments. */
       args: string;
-      /** The error text; a long one keeps its last 300 or so characters, where a failure's reason sits. */
+      /** The error text; a long one keeps its start and its end around `…`, since a failure's reason may sit at either end. */
       error: string;
       /** Skills loaded earlier in the same turn. */
       skills: string[];
@@ -289,6 +289,15 @@ function tail(text: string, max: number): string {
   return `…${midWord ? cut.slice(cut.indexOf(" ") + 1) : cut}`;
 }
 
+/** The first third of `max` and the rest from the end, each cut at a word, so a reason stated at either end survives. */
+function headAndTail(text: string, max: number): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  if (flat.length <= max) return flat;
+  const start = flat.slice(0, Math.floor(max / 3));
+  const head = flat[start.length] === " " || !start.includes(" ") ? start : start.slice(0, start.lastIndexOf(" "));
+  return `${head} ${tail(flat, max - head.length - 2)}`;
+}
+
 /** A short summary of what a tool call acted on; a subagent run names its tasks. */
 function summarizeArgs(args: ToolArguments | undefined): string {
   if (!args) return "";
@@ -529,7 +538,7 @@ export function buildDigest(
       const unfinished = message.details?.async !== undefined || message.details?.service !== undefined;
       if (call && !turn.observing && entry.id && !unfinished) {
         toolExercises.push({ entryId: entry.id, tool: call.name, args: call.exerciseArgs ?? "", failed: Boolean(message.isError),
-          ...(message.isError ? { error: tail(textOf(message.content), ERROR_CHARS) } : {}),
+          ...(message.isError ? { error: headAndTail(textOf(message.content), ERROR_CHARS) } : {}),
           deliveredRules: [...skills.values()].flatMap((skill) => skill.amendmentsDelivered ?? []),
           ...(entry.timestamp !== undefined && { at: entry.timestamp }) });
       }
@@ -544,7 +553,7 @@ export function buildDigest(
           entryId: entry.id,
           tool: message.toolName ?? call?.name ?? "unknown",
           args: call?.args ?? "",
-          error: tail(textOf(message.content), ERROR_CHARS),
+          error: headAndTail(textOf(message.content), ERROR_CHARS),
           skills: [...turn.skills],
         }, turn.calls[0]?.id && `${turn.calls[0].id}:workflow:`);
       } else if (message.toolName === "ask" && message.details) {

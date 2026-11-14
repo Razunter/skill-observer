@@ -56,7 +56,9 @@ export function renderRemedyOutcomes(outcomes: readonly RemedyOutcome[], records
     return record.kind === "project" || loaded.has(record.skill);
   });
   const unlisted = outcomes.length - listed.length;
-  return ["### Remedy outcomes", "", ...listed.map((outcome) =>
-    `- ${outcome.fingerprint}: ${outcome.status}${outcome.evidence.length ? ` (evidence: ${outcome.evidence.join(", ")})` : "; missing relevant delivery/exercise evidence"}.`),
+  return ["### Remedy outcomes", "", ...listed.map((outcome) => {
+    const record = latest.get(outcome.fingerprint)!;
+    return `- ${outcome.fingerprint}${record.kind === "project" ? ` (${record.target.path})` : ""}: ${outcome.status}${outcome.evidence.length ? ` (evidence: ${outcome.evidence.join(", ")})` : "; missing relevant delivery/exercise evidence"}.`;
+  }),
   ...(unlisted ? [`- ${unlisted} more ${unlisted === 1 ? "fix" : "fixes"} not listed: ${unlisted === 1 ? "its skill was" : "their skills were"} not loaded in this session.`] : [])].join("\n");
 }

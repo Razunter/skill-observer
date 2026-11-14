@@ -1461,14 +1461,14 @@ describe("proposal approval of on-read appends", () => {
     await expectNoWrite(host, [applied], "selected `Later`");
   });
 
-  it.each(["Later", "Decline"])("records a %s with a note exactly as one without", async (option) => {
+  it("records a Decline with a note exactly as one without", async () => {
     const recorded = async (answer: AnswerUser) => {
       const { host, applied } = await approved(answer);
-      const result = await resolve(host, [{ proposal: applied.approval.proposal, outcome: option === "Later" ? "later" : "declined" }]);
+      const result = await resolve(host, [{ proposal: applied.approval.proposal, outcome: "declined" }]);
       expect(failures(result)).toEqual([]);
       return { files: ownedFiles(host), records: ledgerRecords(host.ledgerFile).map(({ timestamp: _, sessionId: __, ...record }) => record) };
     };
-    expect(await recorded(() => ({ option, note: "Only for unit tests." }))).toEqual(await recorded(() => option));
+    expect(await recorded(() => ({ option: "Decline", note: "Only for unit tests." }))).toEqual(await recorded(() => "Decline"));
   });
 
   it.each<[string, string, (fixture: Approved) => void]>([
@@ -1767,8 +1767,17 @@ describe("proposal reconciliation of on-read appends", () => {
         .toEqual([expect.objectContaining({ note: NOTE, reconciliation: expect.objectContaining({ changedTarget: claim.changedTarget }) })]);
     });
 
+    it("writes the approved section unchanged under a note that only asks for a check, reporting the note and what was checked", async () => {
+      const fixture = await noted();
+      const checked = { reason: "Checked the amendment: no section covers reds yet.", preserved: "The approved section, unchanged." };
+      const answer = await citing(fixture, { change: { operation: "on-read-append", section: RED }, reconciles: { approval: fixture.applied.approval, ...checked } });
+      const result = await resolve(fixture.host, [answer]);
+      expect(result.isError).toBeFalsy();
+      expect(readRule(amendment(fixture.host)).body).toBe(`${SEAMS}\n\n${RED}`);
+      for (const shown of [NOTE, checked.reason]) expect(resultText(result)).toContain(shown);
+    });
+
     it.each<[string, string, Record<string, unknown>]>([
-      ["identical to the approved section: the note was not applied", "the note", { change: { operation: "on-read-append", section: RED } }],
       ["for another skill", "approved proposal's own", { skill: "domain-modeling" }],
       ["under another ledger identity", "approved proposal's own", { gist: "Reds are diffs of assertions." }],
     ])("refuses to prepare a revision %s", async (_label, reason, overrides) => {
@@ -3718,7 +3727,6 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
     }, 30_000);
 
     it.each<[string, string, Partial<PatternRule>]>([
-      ["identical to the approved rule: the note was not applied", "the note", {}],
       ["under another rule name", "approved proposal's own rule", { name: "jj-not-git-either", body: REVISED_BODY }],
     ])("refuses to prepare a revision %s", async (_label, reason, rule) => {
       const result = await prepareRevision(await noted(), { ...JJ_NOT_GIT, ...rule });
@@ -4421,6 +4429,24 @@ describe("proposal approval of stale answers and withdrawals", () => {
     expect(rulesWritten(host)).toEqual([]);
     expect(existsSync(folder)).toBe(false);
   });
+
+  it("tells the user on stale, withdrawal and compaction fieldsets, and only there, that an answer with a note is asked again", async () => {
+    const host = loadExtension();
+    await twoStaleSections(host);
+    splitAmendment(host, "domain-modeling", "dm-define-terms");
+    const fix = ledgerRecords(host.ledgerFile).at(-1)!;
+    const ask = "Ask one question at a time.";
+    const selection = await prepareAndSelect(host, [
+      ...staleCandidates({ rule: "tdd-amendment", select: "Update", body: SEAMS }),
+      withdrawalCandidate({ skill: "domain-modeling", fingerprint: fix.fingerprint, gist: String(fix.gist) }),
+      onReadCandidate({ skill: "grill-with-docs", gist: ask, section: "## One question\n\nAsk one question at a time." }),
+      compactionCandidate({ skill: "grill-with-docs", includes: [ask], body: "## One question\n\nOne question at a time." }),
+    ]);
+    expect(failures(selection)).toEqual([]);
+    const fieldsets = String(JSON.parse(resultText(selection)).askHtml).split("<fieldset>").slice(1);
+    const warned = (gist: string) => fieldsets.find((fieldset) => fieldset.includes(gist))!.includes("asked again");
+    expect([staleGist("tdd-amendment"), String(fix.gist), compactionGist("grill-with-docs"), ask].map(warned)).toEqual([true, true, true, false]);
+  });
 });
 
 describe("answers citing their prepared proposal", () => {
@@ -4564,12 +4590,6 @@ describe("answers citing their prepared proposal", () => {
       startPass(host);
       return { outcome: "declined", proposal: reference("First") };
     }],
-    ["a Decline citing a withdrawal", "which `proposal` does not answer", async (host) => {
-      splitAmendment(host, "tdd", "tdd-afk-seams");
-      const fix = ledgerRecords(host.ledgerFile).at(-1)!;
-      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [withdrawalCandidate({ fingerprint: fix.fingerprint, gist: String(fix.gist) })] });
-      return { outcome: "declined", proposal: reviewEntries(prepared)[0]!.reference };
-    }],
   ])("records and writes nothing for %s", async (_label, reason, answer) => {
     const host = loadExtension();
     const { reference } = await preparedFixes(host, ["First"]);
@@ -4580,6 +4600,96 @@ describe("answers citing their prepared proposal", () => {
 
     expect(failures(result)).toEqual([expect.stringContaining(reason)]);
     expect(observerBytes(host)).toEqual(before);
+  });
+
+  it("records the user's note on Later as the reoffer of a Later citing its proposal, and a supplied reoffer over it", async () => {
+    const host = loadExtension();
+    const { selection, reference } = await preparedFixes(host, ["First", "Second"]);
+    askUser(host, selection, () => ({ option: "Later", note: "  After the next release.  " }));
+
+    const result = await resolve(host, [
+      { outcome: "later", proposal: reference("First") },
+      { outcome: "later", proposal: reference("Second"), reoffer: "When reds recur." },
+    ]);
+
+    expect(failures(result)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile).map(({ gist, reoffer }) => [gist, reoffer])).toEqual([["First", "After the next release."], ["Second", "When reds recur."]]);
+  });
+
+  it.each<[string, (host: ReturnType<typeof loadExtension>, askId: string) => void]>([
+    ["a timeout's submission", (host, askId) => {
+      const result = host.getBranch().find((entry) => entry.message?.role === "toolResult" && entry.message.toolCallId === askId)!;
+      (result.message!.details as { timedOut?: boolean }).timedOut = true;
+    }],
+    ["an Ask result with no Ask call", (host, askId) => {
+      host.setBranch(host.getBranch().filter((entry) => entry.id !== `call-${askId}`));
+    }],
+  ])("records no Later note from %s", async (_label, edit) => {
+    const host = loadExtension();
+    const { selection, reference } = await preparedFixes(host, ["First"]);
+    edit(host, askUser(host, selection, () => ({ option: "Later", note: "After the next release." })));
+
+    const result = await resolve(host, [{ outcome: "later", proposal: reference("First") }]);
+
+    expect(failures(result)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.not.objectContaining({ reoffer: expect.anything() })]);
+  });
+
+  it.each(["cited", "typed"])("records nothing for a %s Decline of a withdrawal: the fix stays in force", async (how) => {
+    const host = loadExtension();
+    splitAmendment(host, "tdd", "tdd-afk-seams");
+    const fix = ledgerRecords(host.ledgerFile).at(-1)!;
+    const { entry } = await approveCandidates(host, [withdrawalCandidate({ fingerprint: fix.fingerprint, gist: String(fix.gist) })], () => "Decline");
+    const answer = how === "cited"
+      ? { outcome: "declined", proposal: entry(String(fix.gist)).reference }
+      : { ...outcome("tdd", "upstream", String(fix.gist), "declined"), fingerprint: fix.fingerprint };
+    const before = observerBytes(host);
+
+    const result = await resolve(host, [answer]);
+
+    expect(result.isError).toBeFalsy();
+    expect(resultText(result)).toContain("stays in force");
+    expect(observerBytes(host)).toEqual(before);
+  });
+
+  it("refuses an answer citing a proposal that a later Prepare of the pass holds again, naming the latest reference", async () => {
+    const host = loadExtension();
+    const { reference } = await preparedFixes(host, ["First"]);
+    const again = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...onReadCandidate({ gist: "First", section: "## First\n\nNewer text." }), evidence: sourced("First") }] });
+    const latest = reviewEntries(again)[0]!.reference;
+    const before = observerBytes(host);
+
+    const result = await resolve(host, [{ outcome: "declined", proposal: reference("First") }]);
+
+    expect(failures(result)).toEqual([expect.stringContaining(latest.reviewToolCallId)]);
+    expect(observerBytes(host)).toEqual(before);
+  });
+
+  it("takes the latest Prepare of a proposal from a nested, hook-recorded Prepare too", async () => {
+    const host = loadExtension();
+    const { reference } = await preparedFixes(host, ["First"]);
+    await host.callTool("observer_review", { action: "prepare", candidates: [{ ...onReadCandidate({ gist: "First", section: "## First\n\nNewer text." }), evidence: sourced("First") }] });
+    const [call, result] = host.getBranch().slice(-2);
+    const { id, name, arguments: input } = (call!.message!.content as Array<{ id: string; name: string; arguments: unknown }>)[0]!;
+    const latest = (result!.message!.details as { eligible: ReviewEntry[] }).eligible[0]!.reference;
+    host.setBranch([...host.getBranch().slice(0, -2),
+      { type: "custom", id: "hook-call", customType: "skill-observer-tool-call", data: { toolCallId: id, toolName: name, input } },
+      { type: "custom", id: "hook-result", customType: "skill-observer-tool-result",
+        data: { toolCallId: id, toolName: name, input, isError: false, details: result!.message!.details, content: [] } } as SessionEntry,
+    ]);
+
+    expect(failures(await resolve(host, [{ outcome: "declined", proposal: reference("First") }]))).toEqual([expect.stringContaining(latest.reviewToolCallId)]);
+    expect(failures(await resolve(host, [{ outcome: "declined", proposal: latest }]))).toEqual([]);
+  });
+
+  it("names a cited proposal once in its refusal", async () => {
+    const host = loadExtension();
+    const { reference } = await preparedFixes(host, ["First"]);
+    const forged = { ...(reference("First") as Record<string, string>), contentHash: "0".repeat(64) };
+
+    const [failure] = failures(await resolve(host, [{ outcome: "declined", proposal: forged }]));
+
+    expect(failure).toMatch(/^proposal `[^`]+` of review `[^`]+`: content hash/);
   });
 });
 
@@ -5498,7 +5608,7 @@ describe("remedy outcomes in the observation payload", () => {
 
     expect(lines).toEqual([
       expect.stringMatching(new RegExp(`^- ${loaded}: delivered\\b`)),
-      expect.stringMatching(new RegExp(`^- ${project}: inconclusive\\b`)),
+      expect.stringMatching(new RegExp(`^- ${project} \\(package\\.json\\): inconclusive\\b`)),
       expect.stringMatching(/\b1\b.*not loaded in this session/),
     ]);
     expect(lines!.join("\n")).not.toContain(unloaded!);

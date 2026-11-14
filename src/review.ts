@@ -179,7 +179,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass, the revision makes the same operation on the same target under the same identity, and, under a note, differs from the approved change. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither asks, approves nor publishes and never calls a model.",
+    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither asks, approves nor publishes and never calls a model.",
     parameters: z.object({
       action: z.enum(["prepare", "select"]),
       candidates: z.array(z.union([
@@ -296,6 +296,9 @@ function renderFieldset(proposal: PreparedProposal): string {
     : [previewParagraph(proposal.preview)];
   const labels = isStale ? ["Keep", ...staleLabels]
     : proposal.change.operation === "withdrawal" ? [APPLY, "Decline"] : [APPLY, "Later", "Decline"];
+  // Approval of these takes no note, so a noted answer becomes a new Prepare and Ask.
+  const notedAsksAgain = isStale ? "An Update or Delete with a note is asked again."
+    : ["withdrawal", "compaction"].includes(proposal.change.operation) ? "An Apply with a note is asked again." : undefined;
   const evidence = proposal.evidence.map(({ quote, count, source }) => `<li>${escapeHtml(`"${quote}" (×${count}${source ? `, ${source}` : ""})`)}</li>`);
   const name = escapeHtml(proposal.candidateId).replace(/"/g, "&quot;");
   return [
@@ -304,6 +307,7 @@ function renderFieldset(proposal: PreparedProposal): string {
     `<p>${escapeHtml(proposal.remedy)}</p>`,
     ...(evidence.length > 0 ? ["<ul>", ...evidence, "</ul>"] : []),
     ...previews,
+    ...(notedAsksAgain ? [`<p>${notedAsksAgain}</p>`] : []),
     // The host reports the text block right before a group as the answer's question.
     `<p><b>${isStale ? "Keep, update or delete this stale amendment?" : "Apply this change?"}</b></p>`,
     // The host reports text typed into the group's Other row as an option's label when it equals that option's value, so no value is a bare label.
