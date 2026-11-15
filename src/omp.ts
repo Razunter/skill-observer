@@ -36,6 +36,23 @@ export interface AgentMessage {
   toolCallId?: string;
   isError?: boolean;
   details?: ToolResultDetails;
+  /** Session digest projection only: the supplier the hook copy of this result recorded. */
+  supplier?: ToolSupplier;
+}
+
+/** A tool as the host lists it among all its tools; only the fields naming its supplier are typed. */
+export interface ToolInfo {
+  name: string;
+  /** `source` is `builtin`, `extension`, `mcp` or `sdk`; `path` is the extension file, or a placeholder such as `<builtin:read>`. */
+  sourceInfo: { source: string; path: string };
+  mcpServerName?: string;
+}
+
+/** Who supplied a tool, as the host listed it when the extension copied the tool's result. */
+export interface ToolSupplier {
+  source: string;
+  path: string;
+  mcpServerName?: string;
 }
 
 /**
@@ -323,6 +340,8 @@ export interface ExtensionAPI {
   registerTool<TParams, TDetails>(tool: ToolDefinition<TParams, TDetails>): void;
   /** Names of the tools the model can call now, top-level and `xd://` devices alike. */
   getActiveTools(): string[];
+  /** Every configured tool with its supplier, read from the host's registry at call time. */
+  getAllTools(): ToolInfo[];
   setActiveTools(toolNames: string[]): Promise<void>;
   sendMessage(message: CustomMessage, options?: SendMessageOptions): void;
   /** Persists a `custom` entry on the session's current branch; the model never sees it. */

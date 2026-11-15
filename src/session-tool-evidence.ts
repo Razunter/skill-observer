@@ -11,7 +11,7 @@
 
 import { isDeepStrictEqual } from "node:util";
 import type {
-  AgentMessage, ExtensionAPI, SessionEntry, ToolArguments, ToolCallEvent, ToolResultDetails, ToolResultEvent,
+  AgentMessage, ExtensionAPI, SessionEntry, ToolArguments, ToolCallEvent, ToolResultDetails, ToolResultEvent, ToolSupplier,
 } from "./omp.js";
 
 const HOOK_CALL_TYPE = "skill-observer-tool-call";
@@ -39,6 +39,8 @@ export interface ToolResultEvidence {
   readonly details: ToolResultDetails | undefined;
   /** Hook results only: the input the tool executed with, which can differ from the recorded request. */
   readonly input?: unknown;
+  /** Hook results only: who supplied the tool, when the host's lookup found it. */
+  readonly supplier?: ToolSupplier;
 }
 
 export interface CompletedToolCall {
@@ -132,10 +134,25 @@ export function recordHookResult(pi: ExtensionAPI, event: ToolResultEvent, branc
   // The copied start is usually recent, so search backward and decode only hook call records.
   const isCopied = branch.findLast((entry, position) => entry.customType === HOOK_CALL_TYPE &&
     callsIn(entry, position).some((call) => call.id === event.toolCallId && call.name === event.toolName)) !== undefined;
-  if (isCopied) pi.appendEntry(HOOK_RESULT_TYPE, {
+  if (!isCopied) return;
+  const supplier = toolSupplier(pi, event.toolName);
+  pi.appendEntry(HOOK_RESULT_TYPE, {
     toolCallId: event.toolCallId, toolName: event.toolName, input: structuredClone(event.input),
-    content: event.content, details: event.details, isError: event.isError,
+    content: event.content, details: event.details, isError: event.isError, ...(supplier && { supplier }),
   });
+}
+
+/** The host's supplier for `name`; none when the lookup fails, which the digest shows as a supplier not recorded. */
+function toolSupplier(pi: ExtensionAPI, name: string): ToolSupplier | undefined {
+  try {
+    const tool = pi.getAllTools().find((candidate) => candidate.name === name);
+    if (!tool) return undefined;
+    const { source, path } = tool.sourceInfo;
+    return { source, path, ...(tool.mcpServerName !== undefined && { mcpServerName: tool.mcpServerName }) };
+  } catch {
+    // The copy serves the digest and receipts without a supplier, so a host lookup failure must not cost it.
+    return undefined;
+  }
 }
 
 function projectDigestEntries(
@@ -174,8 +191,10 @@ function projectDigestEntries(
     if (settled.has(result.id) || isDispatchLayer(result.id, name)) return [];
     settled.add(result.id);
     const { timestamp } = branch[result.position]!;
+    const supplier = byId.get(result.id)?.results.find((copy) => copy.origin === "hook" && digestName(copy.name) === name)?.supplier;
     return [{ type: "message", id: `tool-result:${result.id}`, ...(timestamp !== undefined && { timestamp }), message: {
       role: "toolResult", toolCallId: result.id, toolName: name, isError: result.isError, content: result.content, details: result.details,
+      ...(supplier && { supplier }),
     } }];
   };
   return branch.flatMap((entry, position): SessionEntry[] => {
@@ -226,7 +245,14 @@ function resultIn(entry: SessionEntry, position: number): ToolResultEvidence | u
   return { origin: "hook", position, id: data.toolCallId, name: data.toolName, isError: data.isError,
     content: "content" in data ? data.content as AgentMessage["content"] : undefined,
     details: "details" in data ? data.details as ToolResultDetails : undefined,
-    input: "input" in data ? data.input : undefined };
+    input: "input" in data ? data.input : undefined,
+    ...("supplier" in data && isToolSupplier(data.supplier) && { supplier: data.supplier }) };
+}
+
+function isToolSupplier(value: unknown): value is ToolSupplier {
+  return !!value && typeof value === "object" && "source" in value && typeof value.source === "string" &&
+    "path" in value && typeof value.path === "string" &&
+    (!("mcpServerName" in value) || typeof value.mcpServerName === "string");
 }
 
 function pairCompletedCall(id: string, calls: readonly ToolCallEvidence[], results: readonly ToolResultEvidence[]): CompletedToolCall {

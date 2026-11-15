@@ -66,7 +66,7 @@ afterEach(() => {
  * available judge role unless `judge` is false. Given another host's
  * `skillHome`, it is a second session of the same agent dir and project.
  */
-function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome> } = {}) {
+function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; allTools?: ExtensionAPI["getAllTools"] } = {}) {
   const skillHome = options.skillHome ?? makeSkillHome();
   mkdirSync(skillHome.roots.cwd, { recursive: true });
   vi.stubEnv("HOME", skillHome.home);
@@ -90,6 +90,10 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
       if (!tool.defaultInactive) activeTools.push(tool.name);
     },
     getActiveTools: () => [...activeTools],
+    getAllTools: options.allTools ?? (() => [
+      ...["read", "ask", "bash", "write", "edit", "eval", "task"].map((name) => ({ name, sourceInfo: { source: "builtin", path: `<builtin:${name}>` } })),
+      ...Object.keys(tools).map((name) => ({ name, sourceInfo: { source: "extension", path: "/extensions/skill-observer/src/skill-observer.ts" } })),
+    ]),
     setActiveTools: async (names) => {
       activeTools = [...names];
     },
@@ -539,6 +543,88 @@ describe("retrospective availability", () => {
     expect(host.noticeEvents).toEqual([]);
     expect(host.activeTools()).not.toContain("observer_resolve");
     expect(existsSync(host.ledgerFile)).toBe(false);
+  });
+});
+
+describe("supplier label on tool errors", () => {
+  const EXTENSION_TOOL = { name: "deploy", sourceInfo: { source: "extension", path: "/extensions/deployer/index.ts" } };
+  const MCP_TOOL = { name: "mcp__docs_search", sourceInfo: { source: "mcp", path: "<mcp:mcp__docs_search>" }, mcpServerName: "docs" };
+  const SDK_TOOL = { name: "embedded", sourceInfo: { source: "sdk", path: "<sdk:embedded>" } };
+  const BUILTIN_BASH = { name: "bash", sourceInfo: { source: "builtin", path: "<builtin:bash>" } };
+  const ALL_TOOLS = [EXTENSION_TOOL, MCP_TOOL, SDK_TOOL, BUILTIN_BASH];
+  const userStart: SessionEntry = { type: "message", id: "user-start", message: { role: "user", content: "Do the work" } };
+
+  /** Runs a failing call through the tool hooks, as OMP does for a call nested in `eval`, then starts a pass and returns its payload. */
+  const payloadAfterFailure = async (host: ReturnType<typeof loadExtension>, toolName: string) => {
+    host.setBranch([userStart]);
+    await host.toolCall(toolName, { target: "staging" }, "failing");
+    await host.toolResult({ toolName, toolCallId: "failing", input: { target: "staging" }, content: [{ type: "text", text: "It broke" }], isError: true });
+    await host.runCommand("observe");
+    return String(host.sent[0]?.message.content);
+  };
+  const errorLine = (payload: string) => payload.split("\n").find((line) => line.includes('Tool error in')) ?? "";
+
+  it.each([
+    ["an extension tool, by its file path", EXTENSION_TOOL.name, "Supplier: `/extensions/deployer/index.ts`."],
+    ["an MCP tool, by its server name", MCP_TOOL.name, "Supplier: MCP server `docs`."],
+    ["an SDK tool, by the host's placeholder name", SDK_TOOL.name, "Supplier: `<sdk:embedded>`."],
+  ])("names the supplier of %s in the next /observe payload", async (_, toolName, label) => {
+    const host = loadExtension({ allTools: () => ALL_TOOLS });
+    const line = errorLine(await payloadAfterFailure(host, toolName));
+    expect(line).toContain(`Tool error in \`${toolName}\``);
+    expect(line).toContain(label);
+  });
+
+  it("adds no supplier text to a failing built-in tool", async () => {
+    const host = loadExtension({ allTools: () => ALL_TOOLS });
+    const line = errorLine(await payloadAfterFailure(host, "bash"));
+    expect(line).toContain("Tool error in `bash`");
+    expect(line).not.toContain("Supplier");
+  });
+
+  it.each([
+    ["the host lookup throws", () => { throw new Error("registry unavailable"); }],
+    ["the host lists no such tool", () => [BUILTIN_BASH]],
+  ])("says the supplier was not recorded, without failing the hook, when %s", async (_, allTools) => {
+    const host = loadExtension({ allTools });
+    const line = errorLine(await payloadAfterFailure(host, EXTENSION_TOOL.name));
+    expect(line).toContain("Tool error in `deploy`");
+    expect(line).toContain("Supplier not recorded.");
+  });
+
+  it.each([
+    ["a result copied before suppliers were recorded", [
+      { type: "custom", id: "old-call", customType: "skill-observer-tool-call", data: { toolCallId: "old", toolName: "deploy", input: { target: "staging" } } },
+      { type: "custom", id: "old-result", customType: "skill-observer-tool-result", data: { toolCallId: "old", toolName: "deploy", input: { target: "staging" }, content: [{ type: "text", text: "It broke" }], isError: true } },
+    ]],
+    ["a result the extension did not copy", [
+      { type: "message", id: "native-call", message: { role: "assistant", content: [{ type: "toolCall", id: "native", name: "deploy", arguments: { target: "staging" } }] } },
+      { type: "message", id: "native-result", message: { role: "toolResult", toolCallId: "native", toolName: "deploy", content: "It broke", isError: true } },
+    ]],
+  ])("says the supplier was not recorded for %s", async (_, entries) => {
+    const host = loadExtension({ allTools: () => ALL_TOOLS });
+    host.setBranch([userStart, ...entries as SessionEntry[]]);
+    await host.runCommand("observe");
+    const line = errorLine(String(host.sent[0]?.message.content));
+    expect(line).toContain("Tool error in `deploy`");
+    expect(line).toContain("Supplier not recorded.");
+  });
+
+  it("labels a device dispatch with its inner tool's supplier, not the dispatching write's", async () => {
+    const host = loadExtension({ allTools: () => [...ALL_TOOLS, { name: "write", sourceInfo: { source: "builtin", path: "<builtin:write>" } }] });
+    const outer = { path: "xd://mcp__docs_search", content: '{"query":"zod"}' };
+    host.setBranch([userStart,
+      { type: "message", id: "dispatching", message: { role: "assistant", content: [{ type: "toolCall", id: "dispatch", name: "write", arguments: outer }] } }]);
+    await host.toolCall("write", outer, "dispatch");
+    await host.toolCall(MCP_TOOL.name, { query: "zod" }, "dispatch");
+    // The inner result fires before the outer one, as observed in OMP 18.20.2.
+    await host.toolResult({ toolName: MCP_TOOL.name, toolCallId: "dispatch", input: { query: "zod" }, content: [{ type: "text", text: "Server down" }], isError: true });
+    await host.toolResult({ toolName: "write", toolCallId: "dispatch", input: outer, content: [{ type: "text", text: "Server down" }], isError: true });
+    host.getBranch().push({ type: "message", id: "dispatched", message: { role: "toolResult", toolCallId: "dispatch", toolName: "write", content: "Server down", isError: true } });
+    await host.runCommand("observe");
+    const line = errorLine(String(host.sent[0]?.message.content));
+    expect(line).toContain(`Tool error in \`${MCP_TOOL.name}\``);
+    expect(line).toContain("Supplier: MCP server `docs`.");
   });
 });
 

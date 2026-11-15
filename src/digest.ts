@@ -11,6 +11,7 @@ import type {
   AskQuestion,
   SessionEntry,
   ToolArguments,
+  ToolSupplier,
 } from "./omp.js";
 import type { ProvenanceResolver, SkillProvenance } from "./provenance.js";
 import { AMENDMENT_REMINDER_TYPE, amendmentDelivery, remindedAmendments } from "./reminder.js";
@@ -47,6 +48,8 @@ export type SkillSignal =
       error: string;
       /** Skills loaded earlier in the same turn. */
       skills: string[];
+      /** Who supplied the failing tool; absent when its copied result recorded none. */
+      supplier?: ToolSupplier;
     })
   | (SignalBase & {
       kind: "workflow";
@@ -555,6 +558,7 @@ export function buildDigest(
           args: call?.args ?? "",
           error: headAndTail(textOf(message.content), ERROR_CHARS),
           skills: [...turn.skills],
+          ...(message.supplier && { supplier: message.supplier }),
         }, turn.calls[0]?.id && `${turn.calls[0].id}:workflow:`);
       } else if (message.toolName === "ask" && message.details) {
         const askCall = askCalls.get(message.toolCallId ?? "") ?? {};
@@ -636,7 +640,7 @@ function signalBody(signal: SkillSignal): string {
         signal.skills.length > 0
           ? `Skills loaded this turn: ${signal.skills.map((skill) => `\`${skill}\``).join(", ")}.`
           : "No skill loaded this turn.";
-      return `${toolErrorText(signal.tool, signal.args, signal.error)} ${skills}`;
+      return `${toolErrorText(signal.tool, signal.args, signal.error)} ${skills}${supplierLabel(signal.supplier)}`;
     }
     case "workflow":
       return [
@@ -644,6 +648,14 @@ function signalBody(signal: SkillSignal): string {
         ...signal.calls.map((call) => `   - ${call}`),
       ].join("\n");
   }
+}
+
+/** Names who supplied a tool, never who caused its failure: built-in tools need no name. */
+function supplierLabel(supplier: ToolSupplier | undefined): string {
+  if (!supplier) return " Supplier not recorded.";
+  if (supplier.source === "builtin") return "";
+  if (supplier.source === "mcp" && supplier.mcpServerName) return ` Supplier: MCP server \`${supplier.mcpServerName}\`.`;
+  return ` Supplier: \`${supplier.path}\`.`;
 }
 
 function renderSignal(signal: SkillSignal): string {
