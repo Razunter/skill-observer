@@ -42,8 +42,11 @@ export function checkCompanionCommand(command: string): void {
   if (!BUN_TEST.test(command.trim())) throw new Error(`\`${command}\` is not the companion's check: run \`bun test\` in the companion directory`);
 }
 
-/** Plain or single-quoted words, which the shell passes on as they read: no expansion, redirection or second command. */
-const PLAIN_WORDS = /^(?:(?:'[^']*'|[\w@%+=:,./-]+)(?:\s+|$))+$/;
+/** `command`'s words when each is plain or single-quoted and split by spaces or tabs, so the shell passes them on as they read: no expansion, redirection, line break or second command. */
+function plainWords(command: string): string[] {
+  if (!/^[ \t]*(?:(?:'[^'\r\n]*'|[\w@%+=:,./-]+)(?:[ \t]+|$))+$/.test(command)) return [];
+  return [...command.matchAll(/'([^']*)'|(\S+)/g)].map(([, quoted, plain]) => quoted ?? plain!);
+}
 
 /**
  * Throws unless `command` is the hook check on the hook at `file` in `root`:
@@ -51,8 +54,7 @@ const PLAIN_WORDS = /^(?:(?:'[^']*'|[\w@%+=:,./-]+)(?:\s+|$))+$/;
  * hook named so that the command, rerun in `root` after the write, checks the written hook.
  */
 export function checkHookCommand(command: string, root: string, file: string): void {
-  const words = PLAIN_WORDS.test(command.trim()) ? [...command.trim().matchAll(/'([^']*)'|(\S+)/g)].map(([, quoted, plain]) => quoted ?? plain!) : [];
-  const [bun, flag, script, hook, samples, ...rest] = words;
+  const [bun, flag, script, hook, samples, ...rest] = plainWords(command);
   const isHookCheck = bun === "bun" && flag === "--no-env-file" && script !== undefined && resolvePath(root, script) === HOOK_CHECK_PATH &&
     hook !== undefined && resolvePath(root, hook) === join(root, file) && samples !== undefined && rest.length === 0;
   if (!isHookCheck) {
