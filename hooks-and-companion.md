@@ -40,12 +40,13 @@ After the intent's Apply, give one subagent the intent text, both samples, the t
 
 A hook file default-exports a factory: `export default function (pi) { pi.on("tool_call", (event, ctx) => …) }`. A `tool_call` event carries `toolCallId`, `toolName` and `input`; a `tool_result` event adds `content` and `isError`. A handler blocks with `{ block: true, reason }` and adds context with `{ additionalContext }`.
 
-The hook samples file is a JSON array. Each sample is `{ name, role, event, toolName, input, content?, isError?, expect }`:
+The hook samples file is a JSON array. Each sample is `{ name, role, event, toolName, input, toolCallId?, content?, isError?, expect }`:
 
 - `role` is `"mistake"` or `"legitimate"`. The file holds at least one of each.
 - `event` is `"tool_call"` or `"tool_result"`; `content` and `isError` belong to a `tool_result`.
 - `expect` is `"blocked"`, `"context"` or `"untouched"`.
 - A hook that keeps state gets the sequence its state needs, in order. Every sample runs against the same loaded hook.
+- `toolCallId` is the call's ID. A sample without one gets an ID of its own, so give a `tool_call` and its `tool_result` the same `toolCallId` when the hook relates them by it.
 
 Run the hook check from the temporary directory with `bun --no-env-file <hook check script> <hook path> <samples file>`: the script and samples file by absolute path, the hook by its root-relative path. The same command then reruns in the target root on the written hook, and Prepare refuses a hook check of any other form. It passes when it exits 0 and prints an `OK:` line. Run it with no arguments for its full usage.
 

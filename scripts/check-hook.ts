@@ -11,6 +11,7 @@ interface Sample {
   event: "tool_call" | "tool_result";
   toolName: string;
   input: Record<string, unknown>;
+  toolCallId?: string;
   content?: string;
   isError?: boolean;
   expect: Expectation;
@@ -32,6 +33,7 @@ The samples file is a JSON array of samples:
     "event": "tool_call" | "tool_result",
     "toolName": "bash",
     "input": { "command": "git push --force" }, // the tool call's arguments
+    "toolCallId": "push-1",                     // optional: the call's ID, shared by a tool_call and its tool_result
     "content": "text",                          // tool_result only: the result's text
     "isError": true,                            // tool_result only, default false
     "expect": "blocked" | "context" | "untouched"
@@ -45,7 +47,9 @@ handler, is reported as such and matches no expectation.
 "role" says what the sample stands for, independent of "expect". The file holds
 at least one "mistake" sample and one "legitimate" sample, or it is refused. A
 hook that keeps state gets the sequence its state needs, in order: every sample
-runs against the same loaded hook.`;
+runs against the same loaded hook. A sample without "toolCallId" gets an ID of
+its own, so give a tool_call and its tool_result the same "toolCallId" when the
+hook relates them by it.`;
 
 const [hookFile, samplesFile] = process.argv.slice(2);
 if (!hookFile || !samplesFile) fail(USAGE);
@@ -59,8 +63,8 @@ const ctx = {
 };
 
 let failed = 0;
-for (const [index, sample] of samples.entries()) {
-  const outcome = await run(sample, index);
+for (const sample of samples) {
+  const outcome = await run(sample);
   const passed = outcome.kind === sample.expect;
   if (!passed) failed++;
   const got = outcome.detail ? `${outcome.kind} (${outcome.detail})` : outcome.kind;
@@ -90,12 +94,13 @@ function readSamples(file: string): Sample[] {
 
 function sampleProblem(sample: unknown): string | undefined {
   if (typeof sample !== "object" || sample === null) return "not an object";
-  const { name, role, event, toolName, input, content, isError, expect } = sample as Record<string, unknown>;
+  const { name, role, event, toolName, input, toolCallId, content, isError, expect } = sample as Record<string, unknown>;
   if (typeof name !== "string" || !name) return "name must be a non-empty string";
   if (role !== "mistake" && role !== "legitimate") return 'role must be "mistake" or "legitimate"';
   if (event !== "tool_call" && event !== "tool_result") return 'event must be "tool_call" or "tool_result"';
   if (typeof toolName !== "string" || !toolName) return "toolName must be a non-empty string";
   if (typeof input !== "object" || input === null || Array.isArray(input)) return "input must be an object";
+  if (toolCallId !== undefined && (typeof toolCallId !== "string" || !toolCallId)) return "toolCallId must be a non-empty string";
   if (content !== undefined && typeof content !== "string") return "content must be a string";
   if (isError !== undefined && typeof isError !== "boolean") return "isError must be a boolean";
   if (typeof expect !== "string" || !(EXPECTATIONS as readonly string[]).includes(expect)) return `expect must be one of ${EXPECTATIONS.join(", ")}`;
@@ -129,8 +134,8 @@ async function loadHook(file: string): Promise<Map<string, Handler[]>> {
   return registered;
 }
 
-async function run(sample: Sample, index: number): Promise<{ kind: string; detail?: string }> {
-  const toolCallId = `sample-${index + 1}`;
+async function run(sample: Sample): Promise<{ kind: string; detail?: string }> {
+  const toolCallId = sample.toolCallId ?? crypto.randomUUID();
   const event =
     sample.event === "tool_call"
       ? { type: "tool_call", toolCallId, toolName: sample.toolName, input: sample.input }

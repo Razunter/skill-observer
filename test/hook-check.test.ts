@@ -125,6 +125,33 @@ export default function (pi) {
     expect(failing.code).not.toBe(0);
   });
 
+  it("lets a tool_call sample and its tool_result share a toolCallId, and gives samples without one IDs of their own", async () => {
+    const hook = `
+export default function (pi) {
+  const commands = new Map();
+  pi.on("tool_call", (event) => { commands.set(event.toolCallId, String(event.input.command ?? "")); });
+  pi.on("tool_result", (event) => {
+    if (event.isError && commands.get(event.toolCallId)?.startsWith("git commit")) return { additionalContext: "this is a jj repository: use jj commit" };
+  });
+}
+`;
+    const failedResult = { event: "tool_result", toolName: "bash", input: {}, content: "fatal: not a git repository", isError: true };
+    const { hookFile, samplesFile } = fixture(hook, [
+      { name: "git commit", role: "mistake", event: "tool_call", toolName: "bash", toolCallId: "commit", input: { command: "git commit -m fix" }, expect: "untouched" },
+      { ...failedResult, name: "git commit fails", role: "mistake", toolCallId: "commit", expect: "context" },
+      { name: "git status", role: "legitimate", event: "tool_call", toolName: "bash", toolCallId: "status", input: { command: "git status" }, expect: "untouched" },
+      { ...failedResult, name: "git status fails", role: "legitimate", toolCallId: "status", expect: "untouched" },
+      { ...failedResult, name: "a result of no recorded call", role: "legitimate", expect: "untouched" },
+    ]);
+
+    const { code, out } = await run(hookFile, samplesFile);
+
+    expect(out).toContain("PASS git commit fails: context (this is a jj repository: use jj commit)");
+    expect(out).toContain("PASS git status fails: untouched");
+    expect(out).toContain("PASS a result of no recorded call: untouched");
+    expect(code).toBe(0);
+  });
+
   it.each([
     ["a syntax error", "export default function (pi) {", "did not load"],
     ["no default factory", "export const hook = () => {};", "did not load: no default-exported factory function"],
