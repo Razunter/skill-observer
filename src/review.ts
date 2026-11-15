@@ -17,15 +17,15 @@ import {
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
-  canonicalHarnessTarget, canonicalPathIn, canonicalProjectTarget, type Evidence, harnessFingerprint, harnessRootDirs, hookFileKey, hookFileName, ledgerForProject, type LedgerRecord,
-  projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind, removalFingerprint,
+  canonicalHarnessTarget, canonicalPathIn, canonicalProjectTarget, type Evidence, HARNESS_ROOT_NAMES, type HarnessFile, harnessFingerprint, harnessRootDirs, hookFileKey, hookPath,
+  ledgerForProject, type LedgerRecord, projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind, removalFingerprint,
   proposalFingerprint, readLedger, targetLabel, type TargetScope,
 } from "./ledger.js";
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver } from "./provenance.js";
-import { BUN_TEST } from "./project-publication.js";
+import { checkCompanionCommand } from "./project-publication.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
 import { type PatternDraft, type Sample, sampleSchemas } from "./replay.js";
@@ -62,8 +62,7 @@ const INTENT_LINES: ReadonlyArray<[keyof HarnessIntent, string]> = [
   ["event", "Event"], ["predicate", "Predicate"], ["action", "Action"], ["mistake", "Mistake sample"], ["legitimate", "Legitimate sample"],
   ["scope", "Scope"], ["lowerRungs", "Why each lower rung fails"],
 ];
-/** One file of drafted hook or companion code: its path relative to the target root and its exact text. */
-export interface HarnessFile { path: string; text: string }
+
 /** The check the drafting ran on the code, and its observed output. */
 interface HarnessCheck { command: string; output: string }
 
@@ -649,7 +648,7 @@ function proposalIdentity(candidate: ReviewCandidate, ledger: readonly LedgerRec
 function intentPreview(target: HarnessTarget, fingerprint: string, intent: HarnessIntent, { cwd, agentDir }: PrepareContext): string {
   const dirs = harnessRootDirs(cwd, agentDir);
   const where = target.root === "companion" ? `The companion extension \`${dirs.companion}\``
-    : `The ${target.root === "project-hooks" ? "project" : "global"} hook \`${join(dirs[target.root], target.path ?? hookFileName(fingerprint))}\``;
+    : `The ${HARNESS_ROOT_NAMES[target.root]} \`${join(dirs[target.root], hookPath(target, fingerprint))}\``;
   return [
     `${where}:`, "", ...INTENT_LINES.map(([field, label]) => `${label}: ${intent[field].trim()}`), "",
     "Apply authorises drafting only: the drafted code and its check result are shown and asked again before any file is written.",
@@ -668,10 +667,10 @@ function codeStage(target: HarnessTarget, fingerprint: string, draft: Extract<Ch
   if (intent.fingerprint !== fingerprint) throw new Error(`the cited intent Apply approved another hook or companion change, \`${intent.fingerprint}\`, not \`${fingerprint}\``);
   const root = harnessRootDirs(cwd, agentDir)[target.root];
   const isCompanion = target.root === "companion";
-  const files = isCompanion ? companionFiles(root, draft.files) : [hookFile(target.path ?? hookFileName(fingerprint), draft.files)];
+  const files = isCompanion ? companionFiles(root, draft.files) : [hookFile(hookPath(target, fingerprint), draft.files)];
   const { command, output } = draft.check ?? {};
   if (typeof command !== "string" || !command.trim() || typeof output !== "string") throw new Error("the code needs the check command it passed and that check's observed output");
-  if (isCompanion && !BUN_TEST.test(command.trim())) throw new Error(`\`${command}\` is not the companion's check: run \`bun test\` in the companion directory`);
+  if (isCompanion) checkCompanionCommand(command);
   const preview = [
     ...files.flatMap(({ path, text }) => [`${existsSync(join(root, path)) ? "Replace" : "Create"} \`${join(root, path)}\` with:`, "", text, ""]),
     `Check command: ${command}`, "Check result:", output, "",
@@ -705,12 +704,22 @@ function companionFiles(root: string, drafted: readonly HarnessFile[] | undefine
   const manifest = files.find(({ path }) => path === "package.json")?.text ?? (existsSync(manifestFile) ? readFileSync(manifestFile, "utf8") : undefined);
   if (manifest === undefined) throw new Error("a new companion extension needs its `package.json`, declaring its entry files under `omp.extensions`");
   if (!declaresEntries(manifest)) throw new Error("the companion's `package.json` must declare its entry files under `omp.extensions`: host discovery loads nothing else in the directory");
-  const kept = existsSync(root) ? readdirSync(root, { recursive: true, encoding: "utf8" }) : [];
-  const isTestFile = (path: string) => !path.split(sep).includes("node_modules") && /[._](test|spec)\.[cm]?[jt]sx?$/.test(path);
-  if (![...files.map(({ path }) => path), ...kept].some(isTestFile)) {
+  const isTestFile = (path: string) => !path.split(sep).includes("node_modules") && TEST_FILE.test(path);
+  if (!files.some(({ path }) => isTestFile(path)) && !(existsSync(root) && keepsTestFile(root))) {
     throw new Error("a companion change adds or keeps a test file, such as `index.test.ts`, outside `node_modules` for `bun test` to run");
   }
   return files;
+}
+
+const TEST_FILE = /[._](test|spec)\.[cm]?[jt]sx?$/;
+
+/** Whether `dir` holds a test file outside `node_modules`, at any depth. */
+function keepsTestFile(dir: string): boolean {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === "node_modules") continue;
+    if (TEST_FILE.test(entry.name) || (entry.isDirectory() && keepsTestFile(join(dir, entry.name)))) return true;
+  }
+  return false;
 }
 
 function declaresEntries(manifest: string): boolean {
@@ -730,7 +739,7 @@ function declaresEntries(manifest: string): boolean {
 function hookRemoval(target: HarnessTarget, { cwd, agentDir }: PrepareContext): HookRemoval {
   if (target.root === "companion") throw new Error("only a hook file is removed this way, not the companion extension");
   const hook = harnessFingerprint(target);
-  const path = target.path ?? hookFileName(hook);
+  const path = hookPath(target, hook);
   return { target: { ...target, path }, fingerprint: removalFingerprint(hookFileKey(target, hook)!), file: join(harnessRootDirs(cwd, agentDir)[target.root], path) };
 }
 interface HookRemoval { target: HarnessTarget; fingerprint: string; file: string }
@@ -739,7 +748,7 @@ interface HookRemoval { target: HarnessTarget; fingerprint: string; file: string
 function removalStage({ target, file }: HookRemoval): { change: Extract<PreparedChange, { stage: "removal" }>; preview: string } {
   if (!existsSync(file)) throw new Error(`there is no hook file \`${file}\` to remove`);
   const preview = [
-    `Delete the ${target.root === "project-hooks" ? "project" : "global"} hook \`${file}\`, which holds:`, "", readFileSync(file, "utf8"), "",
+    `Delete the ${HARNESS_ROOT_NAMES[target.root]} \`${file}\`, which holds:`, "", readFileSync(file, "utf8"), "",
     "Apply lets the agent delete this file; the removal is recorded once it is gone. A removed hook stops acting only after omp restarts.",
   ].join("\n");
   return { change: { operation: "harness", stage: "removal", file }, preview };

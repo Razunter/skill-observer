@@ -1,9 +1,10 @@
-/** Checks an observer hook against sample events before it is published; USAGE below states how. */
+/** Checks an observer hook against sample events before it is published. */
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-type Expectation = "blocked" | "context" | "untouched";
+const EXPECTATIONS = ["blocked", "context", "untouched"] as const;
+type Expectation = (typeof EXPECTATIONS)[number];
 interface Sample {
   name: string;
   role: "mistake" | "legitimate";
@@ -45,7 +46,6 @@ handler, is reported as such and matches no expectation.
 at least one "mistake" sample and one "legitimate" sample, or it is refused. A
 hook that keeps state gets the sequence its state needs, in order: every sample
 runs against the same loaded hook.`;
-const EXPECTATIONS: readonly string[] = ["blocked", "context", "untouched"];
 
 const [hookFile, samplesFile] = process.argv.slice(2);
 if (!hookFile || !samplesFile) fail(USAGE);
@@ -98,7 +98,7 @@ function sampleProblem(sample: unknown): string | undefined {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return "input must be an object";
   if (content !== undefined && typeof content !== "string") return "content must be a string";
   if (isError !== undefined && typeof isError !== "boolean") return "isError must be a boolean";
-  if (typeof expect !== "string" || !EXPECTATIONS.includes(expect)) return `expect must be one of ${EXPECTATIONS.join(", ")}`;
+  if (typeof expect !== "string" || !(EXPECTATIONS as readonly string[]).includes(expect)) return `expect must be one of ${EXPECTATIONS.join(", ")}`;
   return undefined;
 }
 

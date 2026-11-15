@@ -93,7 +93,12 @@ export interface ProjectLedgerRecord extends LedgerEntry {
  * change by the companion root alone, since it may touch several files.
  */
 export type HarnessTarget =
-  | { scope: "harness"; root: "project-hooks"; /** The canonical project root whose hooks directory holds the hook. */ project: string; path?: string; mechanism: string }
+  | {
+    scope: "harness"; root: "project-hooks";
+    /** The canonical project root whose hooks directory holds the hook. */
+    project: string;
+    path?: string; mechanism: string;
+  }
   | { scope: "harness"; root: "global-hooks"; path?: string; mechanism: string }
   | { scope: "harness"; root: "companion"; path?: never; mechanism: string };
 export type HarnessRoot = HarnessTarget["root"];
@@ -105,6 +110,9 @@ export interface HarnessPublication {
   checkToolCallIds: string[];
   files: Array<{ path: string; afterHash: string }>;
 }
+
+/** One file of drafted hook or companion code: its path relative to the target root and its exact text. */
+export interface HarnessFile { path: string; text: string }
 
 export interface HarnessLedgerRecord extends LedgerEntry {
   kind: "harness";
@@ -123,7 +131,7 @@ export type TargetScope =
   | { kind: "project"; target: ProjectTarget; skill?: never }
   | { kind: "harness"; target: HarnessTarget; skill?: never };
 
-const HARNESS_ROOT_NAMES: Record<HarnessRoot, string> = { "project-hooks": "project hook", "global-hooks": "global hook", companion: "companion extension" };
+export const HARNESS_ROOT_NAMES: Record<HarnessRoot, string> = { "project-hooks": "project hook", "global-hooks": "global hook", companion: "companion extension" };
 const COMPANION_DIR = "skill-observer-companion";
 
 /** How the form, the ledger section and the resolver name a target: `` `name` (kind) ``. */
@@ -133,7 +141,7 @@ export function targetLabel(entry: TargetScope & { fingerprint: string }): strin
       return `\`${entry.target.path}\` (project)`;
     case "harness": {
       const { target } = entry;
-      return `\`${target.root === "companion" ? COMPANION_DIR : target.path ?? hookFileName(entry.fingerprint)}\` (${HARNESS_ROOT_NAMES[target.root]})`;
+      return `\`${target.root === "companion" ? COMPANION_DIR : hookPath(target, entry.fingerprint)}\` (${HARNESS_ROOT_NAMES[target.root]})`;
     }
     default:
       return `\`${entry.skill}\` (${entry.kind})`;
@@ -151,6 +159,9 @@ export function harnessRootDirs(cwd: string, agentDir: string): Record<HarnessRo
 
 /** A new hook's file name: a fixed prefix and its fingerprint, so a project hook and a global hook never share a name and hide one another. */
 export const hookFileName = (fingerprint: string) => `skill-observer-${fingerprint}.ts`;
+
+/** The root-relative file a hook target names: its `path`, or the new hook's file name. */
+export const hookPath = (target: HarnessTarget, fingerprint: string) => target.path ?? hookFileName(fingerprint);
 
 /** The launch directory defines project scope; symlink aliases share one identity. */
 export function canonicalProjectTarget(cwd: string, target: ProjectTarget): ProjectTarget {
@@ -179,9 +190,10 @@ export function canonicalHarnessTarget(cwd: string, agentDir: string, target: Ha
     return { scope: "harness", root: "companion", mechanism };
   }
   if (target.path !== undefined && typeof target.path !== "string") throw new Error("a hook target's path is a root-relative file path");
-  const root = canonicalMissingPath(harnessRootDirs(cwd, agentDir)[target.root]);
+  const project = realpathSync(cwd);
+  const root = canonicalMissingPath(harnessRootDirs(project, agentDir)[target.root]);
   const path = target.path === undefined ? undefined : canonicalPathIn(root, target.path, "hook target");
-  const named = target.root === "project-hooks" ? { root: target.root, project: realpathSync(cwd), mechanism } : { root: target.root, mechanism };
+  const named = target.root === "project-hooks" ? { root: target.root, project, mechanism } : { root: target.root, mechanism };
   const canonical: HarnessTarget = { scope: "harness", ...named, ...(path !== undefined && { path }) };
   // A new hook named by its own file stays the identity it was proposed under.
   return path !== undefined && path === hookFileName(harnessFingerprint({ ...canonical, path: undefined })) ? { scope: "harness", ...named } : canonical;
@@ -233,7 +245,7 @@ export function harnessFingerprint(target: HarnessTarget): string {
 /** The hook file a harness target names, as a key: root kind, the project for a project hook, and file name; none for the companion. */
 export function hookFileKey(target: HarnessTarget, fingerprint: string): string | undefined {
   if (target.root === "companion") return undefined;
-  return JSON.stringify([target.root, target.root === "project-hooks" ? target.project : null, target.path ?? hookFileName(fingerprint)]);
+  return JSON.stringify([target.root, target.root === "project-hooks" ? target.project : null, hookPath(target, fingerprint)]);
 }
 
 /** A hook removal's identity is its file alone, so a declined removal stays declined however it is worded and never suppresses a change to that hook. */

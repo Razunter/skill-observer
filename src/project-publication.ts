@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { canonicalPathIn, canonicalProjectTarget, type HarnessPublication, type ProjectPublication, type ProjectTarget } from "./ledger.js";
-import type { HarnessFile } from "./review.js";
+import { canonicalPathIn, canonicalProjectTarget, type HarnessFile, type HarnessPublication, type ProjectPublication, type ProjectTarget } from "./ledger.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 import type { SessionEntry } from "./omp.js";
 
@@ -34,16 +33,21 @@ export function checkProjectPublication(target: ProjectTarget, publication: Proj
 }
 
 /** The one check a companion change runs: its own tests, with `bun test` in the companion directory. */
-export const BUN_TEST = /^bun test(?:\s|$)/;
+const BUN_TEST = /^bun test(?:\s|$)/;
+
+/** Throws unless `command` is the companion's check. */
+export function checkCompanionCommand(command: string): void {
+  if (!BUN_TEST.test(command.trim())) throw new Error(`\`${command}\` is not the companion's check: run \`bun test\` in the companion directory`);
+}
 
 /**
  * An applied hook or companion change's receipts: a successful normal write of
  * each approved file, still inside the target root, foreground checks in the
- * target root after every write, each running `checkCommand` when given, and
- * each file's stated hash equal to the hash of its approved text and of the
- * file as it is now.
+ * target root after every write, each the companion's check for a companion
+ * change, and each file's stated hash equal to the hash of its approved text
+ * and of the file as it is now.
  */
-export function checkHarnessPublication(change: { root: string; files: readonly HarnessFile[] }, publication: HarnessPublication | undefined, cwd: string, branch: readonly SessionEntry[], checkCommand?: RegExp): void {
+export function checkHarnessPublication(change: { root: string; files: readonly HarnessFile[] }, publication: HarnessPublication | undefined, cwd: string, branch: readonly SessionEntry[], isCompanion: boolean): void {
   if (!publication || !Array.isArray(publication.writeToolCallIds) || !Array.isArray(publication.checkToolCallIds) || !Array.isArray(publication.files) ||
       publication.checkToolCallIds.length === 0 || [...publication.writeToolCallIds, ...publication.checkToolCallIds].some((id) => typeof id !== "string" || !id)) {
     throw new Error("an applied hook or companion change needs `publication`: its observed write calls, foreground check calls and each written file's afterHash");
@@ -61,18 +65,18 @@ export function checkHarnessPublication(change: { root: string; files: readonly 
     if (publication.files.find((stated) => stated?.path === path)?.afterHash !== approved) throw new Error(`\`${file}\`: the stated afterHash is not the hash of its approved text`);
     if (!existsSync(file) || sha256(readFileSync(file)) !== approved) throw new Error(`\`${file}\` does not hold its approved text`);
   }
-  checkForegroundChecks(evidence, publication.checkToolCallIds, Math.max(...writes.map(({ result }) => result.position)), change.root, checkCommand);
+  checkForegroundChecks(evidence, publication.checkToolCallIds, Math.max(...writes.map(({ result }) => result.position)), change.root, isCompanion);
 }
 
-/** Each check is a completed, successful foreground bash call with `root` as working directory, made after branch position `after`, running `command` when given. */
-function checkForegroundChecks(evidence: SessionToolEvidence, ids: readonly string[], after: number, root: string, command?: RegExp): void {
+/** Each check is a completed, successful foreground bash call with `root` as working directory, made after branch position `after`, the companion's check when `isCompanion`. */
+function checkForegroundChecks(evidence: SessionToolEvidence, ids: readonly string[], after: number, root: string, isCompanion = false): void {
   for (const id of ids) {
     const check = successfulCall(evidence, id);
     const checkArgs = check.call.args;
     if (check.call.name !== "bash" || check.call.position <= after || typeof checkArgs.cwd !== "string" ||
         canonical(checkArgs.cwd) !== canonical(root) || typeof checkArgs.command !== "string" || !checkArgs.command.trim() ||
         checkArgs.async === true || checkArgs.name != null) throw new Error("verification must be a completed foreground check in the target root after its write");
-    if (command && !command.test(checkArgs.command.trim())) throw new Error(`\`${checkArgs.command}\` is not the companion's check: run \`bun test\` in the companion directory`);
+    if (isCompanion) checkCompanionCommand(checkArgs.command);
     const details = check.result.details;
     if (!details || typeof details !== "object" ||
         !(details.exitCode === 0 || typeof details.wallTimeMs === "number" && Number.isFinite(details.wallTimeMs) && details.wallTimeMs >= 0) ||

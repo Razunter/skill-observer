@@ -50,7 +50,7 @@ import { createProvenanceResolver, defaultSkillRoots } from "./provenance.js";
 import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
-import { BUN_TEST, checkHarnessPublication, checkProjectPublication } from "./project-publication.js";
+import { checkHarnessPublication, checkProjectPublication } from "./project-publication.js";
 import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedHarness, laterNote, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
 import { type ToolResultCondition, whatToDoNow } from "./payload.js";
 import { isProposalRef, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, proposalRefSchema, REVIEW_TOOL_NAME } from "./review.js";
@@ -179,7 +179,7 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
     const { proposal, change } = approvedHarness(answer.approval, ["code", "removal"], branch);
     const identity = harnessIdentity(proposal);
     if (change.stage === "removal") return removalRecords(identity, change.file, ledger, timestamp, sessionId);
-    checkHarnessPublication(change, answer.publication, cwd, branch, identity.target.root === "companion" ? BUN_TEST : undefined);
+    checkHarnessPublication(change, answer.publication, cwd, branch, identity.target.root === "companion");
     return [{ ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId }];
   }
   if (!isProposalRef(answer.proposal) || answer.approval !== undefined) {
@@ -187,10 +187,7 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
   }
   const evidence = sessionToolEvidence(branch);
   const { proposal } = preparedInPass(answer.proposal, evidence, branch);
-  const newer = latestPrepared(answer.proposal.candidateId, evidence);
-  if (newer !== undefined && newer.reviewToolCallId !== answer.proposal.reviewToolCallId) {
-    throw new Error(`a later Prepare of this pass holds this proposal again: cite its reference ${JSON.stringify(newer)}`);
-  }
+  requireLatestReference(answer.proposal, evidence);
   const note = answer.outcome === "later" && answer.reoffer === undefined ? laterNote(answer.proposal, evidence) : undefined;
   const reoffer = answer.reoffer ?? note;
   const drafted = "change" in proposal && proposal.change.operation === "harness" && proposal.change.stage === "code";
@@ -349,8 +346,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const kept: string[] = [];
       let targetChanged = false;
       const label = (answer: CitingAnswer | ProjectAnswer | HarnessAnswer) => answer.kind === "project" ? `\`${answer.target?.path}\` (${answer.gist})`
-        : answer.kind === "harness" ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\``
-        : answer.gist === undefined ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
+        : answer.kind === "harness" || answer.gist === undefined ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
       // The latest record per fingerprint wins: it holds the fix a withdrawal takes back, and the evidence an answer citing nothing keeps.
       const latest = new Map(readLedger(ledger).map((record) => [record.fingerprint, record]));
 
@@ -537,10 +533,7 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
   const operation = "change" in proposal ? proposal.change.operation : "stale amendment";
   const citable = CITABLE.includes(operation) || (operation === "withdrawal" && answer.outcome === "declined");
   if (reference !== undefined && !citable) throw new Error(`the cited proposal is a ${operation}, which \`proposal\` does not answer`);
-  const newer = reference === undefined ? undefined : latestPrepared(cited.candidateId, evidence);
-  if (newer !== undefined && newer.reviewToolCallId !== cited.reviewToolCallId) {
-    throw new Error(`a later Prepare of this pass holds this proposal again: cite its reference ${JSON.stringify(newer)}`);
-  }
+  if (reference !== undefined) requireLatestReference(cited, evidence);
   const filled = { skill: skill ?? proposal.skill, kind: kind ?? proposal.kind, gist: gist ?? proposal.gist, fingerprint: answer.fingerprint ?? proposal.fingerprint };
   const isThisAnswer = filled.skill === proposal.skill && filled.kind === proposal.kind && filled.gist === proposal.gist && filled.fingerprint === proposal.fingerprint;
   if (reference !== undefined && !isThisAnswer) {
@@ -549,6 +542,14 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
   const quoted = proposal.evidence.length > 0 ? proposal.evidence.map(({ source: _, ...item }) => item) : answer.evidence;
   const note = reference !== undefined && answer.outcome === "later" && answer.reoffer === undefined ? laterNote(reference, evidence) : undefined;
   return { ...rest, ...filled, ...(quoted && { evidence: quoted }), ...(note !== undefined && { reoffer: note }) };
+}
+
+/** Throws unless `ref` is the reference the branch's last Prepare holding its candidate returned. */
+function requireLatestReference(ref: PreparedProposalRef, evidence: SessionToolEvidence): void {
+  const newer = latestPrepared(ref.candidateId, evidence);
+  if (newer !== undefined && newer.reviewToolCallId !== ref.reviewToolCallId) {
+    throw new Error(`a later Prepare of this pass holds this proposal again: cite its reference ${JSON.stringify(newer)}`);
+  }
 }
 
 /** The reference that the branch's last successful Prepare holding `candidateId` returned for it; that Prepare may be native or nested. */
