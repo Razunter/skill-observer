@@ -44,11 +44,14 @@ import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
 import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
 import { evidenceReport, isEmptyEvidenceReport, renderEvidenceReport } from "./report.js";
 import { recordHookCall, recordHookResult } from "./session-tool-evidence.js";
+import { type Observation, pendingObservations, recordObservation, renderObservations } from "./observations.js";
 import { hasApprovalNote, hasCustomInput, observationPassStart } from "./proposal-approval.js";
 
 const STATUS_KEY = "skill-observer";
 /** Global, not per project: feedback about global skills gathers in one place. */
 const ledgerFile = () => join(ompAgentDir(), "skill-observer", "ledger.jsonl");
+/** Next to the ledger; each row names its project, so one file serves every project. */
+const observationsFile = () => join(ompAgentDir(), "skill-observer", "observations.jsonl");
 /** Next to the ledger, outside the rules directory, so OMP never loads a reference file as a rule. */
 const referencesDir = () => join(ompAgentDir(), "skill-observer", "references");
 const ruleDirs = (): RuleDirs => ({ rulesDir: userRulesDir(), amendmentsDir: amendmentsDir() });
@@ -86,6 +89,8 @@ interface PassEvidence {
   note: string;
   digest: SessionDigest;
   stale: readonly ObserverRule[];
+  /** The project's pending observations. */
+  observations: readonly Observation[];
   roots: SkillRoots;
   provenance: ProvenanceResolver;
 }
@@ -109,7 +114,7 @@ interface ObservationPayload {
 async function observationPayload(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  { note, digest, stale, roots, provenance }: PassEvidence,
+  { note, digest, stale, observations, roots, provenance }: PassEvidence,
 ): Promise<ObservationPayload> {
   const ledger = ledgerForProject(readLedger(ledgerFile()), ctx.cwd);
   const inForce = rulesInForce(ledger, readObserverRules(ruleDirs()), digest, referencesDir());
@@ -135,6 +140,7 @@ async function observationPayload(
     },
     { name: "note", text: note && `## User note\n\n${note}` },
     { name: "digest", text: `## Session digest\n\n${renderDigest(digest)}` },
+    { name: "observations", text: renderObservations(observations) },
     { name: "ledger", text: renderLedger(ledger) },
     { name: "outcomes", text: renderRemedyOutcomes(remedyOutcomes(ledger, digest), ledger, digest) },
     { name: "rules-in-force", text: renderRulesInForce(inForce, readHandWrittenRules(userRulesDir())) },
@@ -230,6 +236,26 @@ export default function skillObserver(pi: ExtensionAPI): void {
   registerCheckTool(pi);
   registerReviewTool(pi, { ledgerFile, rulesDir: userRulesDir, amendmentsDir, referencesDir });
 
+  pi.registerTool<{ text: string }, undefined>({
+    name: "observe",
+    label: "Observe",
+    description:
+      "Record an observation for the user's next `/observe` pass: something a skill, a rule or the project setup got wrong, or that cost you a detour. It fixes nothing now; record it and continue.",
+    parameters: pi.zod.object({
+      text: pi.zod.string().describe("One problem, up to 500 characters: what happened, where, and the fix you want."),
+    }),
+    approval: "read",
+    loadMode: "essential",
+    async execute(_toolCallId, { text }, _signal, _onUpdate, ctx) {
+      try {
+        recordObservation(observationsFile(), ctx.cwd, text, new Date());
+      } catch (error) {
+        return { content: [{ type: "text", text: `Nothing was recorded: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+      }
+      return { content: [{ type: "text", text: "Observation recorded." }] };
+    },
+  });
+
   pi.registerCommand("observe", {
     description: "Review session evidence for skill improvements and project-environment fixes; text after the command adds a note",
     handler: async (args, ctx) => {
@@ -239,13 +265,15 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const provenance = createProvenanceResolver(roots);
       const digest = buildDigest(ctx.sessionManager.getBranch(), { provenance });
       const stale = findStaleAmendments(ruleDirs(), provenance);
-      if (!note && isEmptyDigest(digest) && stale.length === 0) {
-        ctx.ui.notify("No skill signals in this session: nothing to observe.", "info");
-        return;
-      }
+      let observations: Observation[];
       let payload: ObservationPayload;
       try {
-        payload = await observationPayload(pi, ctx, { note, digest, stale, roots, provenance });
+        observations = pendingObservations(observationsFile(), ctx.cwd);
+        if (!note && isEmptyDigest(digest) && stale.length === 0 && observations.length === 0) {
+          ctx.ui.notify("Nothing to observe: no skill signals, stale amendments or pending observations, and no note.", "info");
+          return;
+        }
+        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, roots, provenance });
       } catch (error) {
         ctx.ui.notify(`Observation pass not started: ${error instanceof Error ? error.message : String(error)}`, "error");
         return;
@@ -257,7 +285,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
         { triggerTurn: true, deliverAs: "followUp" },
       );
       ctx.ui.notify(
-        `Observation pass started: ${note ? "your note, " : ""}${digest.signals.length} signal(s), ${digest.skills.length} loaded skill(s), ${stale.length} stale amendment(s); payload ${describePayloadEstimate(payloadEstimate(payload.sections))}.`,
+        `Observation pass started: ${note ? "your note, " : ""}${digest.signals.length} signal(s), ${digest.skills.length} loaded skill(s), ${stale.length} stale amendment(s), ${observations.length} observation(s); payload ${describePayloadEstimate(payloadEstimate(payload.sections))}.`,
         "info",
       );
     },
@@ -274,7 +302,8 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const report = evidenceReport({ digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale });
       if (!isEmptyEvidenceReport(report)) {
         try {
-          report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, roots, provenance })).sections);
+          const observations = pendingObservations(observationsFile(), ctx.cwd);
+          report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, roots, provenance })).sections);
         } catch (error) {
           ctx.ui.notify(`Evidence report not shown: ${error instanceof Error ? error.message : String(error)}`, "error");
           return;

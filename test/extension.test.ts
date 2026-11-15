@@ -35,10 +35,16 @@ const ompAvailable = process.env.SKILL_OBSERVER_NATIVE_TESTS === "1" && spawnSyn
 
 type Handler = (event: unknown, ctx: ExtensionContext) => unknown;
 
-/** Stands in for `pi.zod`: OMP validates parameters, so the fake host only needs the builder calls to succeed. */
-const schema: Schema = { optional: () => schema, describe: () => schema };
+/** Stands in for `pi.zod`: OMP validates parameters, so the fake host keeps only object shapes and descriptions, which reach the model. */
+type FakeSchema = Schema & { shape?: Record<string, Schema>; description?: string };
+const fakeSchema = (fields: Omit<FakeSchema, "optional" | "describe"> = {}): FakeSchema => ({
+  ...fields,
+  optional: () => fakeSchema(fields),
+  describe: (description) => fakeSchema({ ...fields, description }),
+});
+const schema = fakeSchema();
 const zod: ExtensionAPI["zod"] = {
-  object: () => schema,
+  object: (shape) => fakeSchema({ shape }),
   array: () => schema,
   string: () => schema,
   number: () => schema,
@@ -56,10 +62,11 @@ afterEach(() => {
 /**
  * Loads the extension against a fake OMP host whose home directory is a temp
  * skill home, and records what it shows and sends. The host has an explicit,
- * available judge role unless `judge` is false.
+ * available judge role unless `judge` is false. Given another host's
+ * `skillHome`, it is a second session of the same agent dir and project.
  */
-function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; judge?: boolean } = {}) {
-  const skillHome = makeSkillHome();
+function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome> } = {}) {
+  const skillHome = options.skillHome ?? makeSkillHome();
   mkdirSync(skillHome.roots.cwd, { recursive: true });
   vi.stubEnv("HOME", skillHome.home);
   vi.stubEnv("PI_CODING_AGENT_DIR", `${skillHome.home}/.omp/agent`);
@@ -204,6 +211,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; j
     rulesDir: join(skillHome.home, ".omp/agent/rules"),
     amendmentsDir: join(skillHome.home, ".omp/agent/skill-observer/amendments"),
     activeTools: () => activeTools,
+    tools,
     statusTexts: () => [...status.values()],
     statusCalls,
     notices,
@@ -343,9 +351,9 @@ describe("/observe", () => {
   it("keeps observer tools inactive until a pass starts, then adds them", async () => {
     const host = loadExtension();
     host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
-    expect(host.activeTools()).toEqual(["read", "ask"]);
+    expect(host.activeTools()).toEqual(["read", "ask", "observe"]);
     await host.runCommand("observe");
-    expect(host.activeTools()).toEqual(["read", "ask", "observer_resolve", "observer_check", "observer_review"]);
+    expect(host.activeTools()).toEqual(["read", "ask", "observe", "observer_resolve", "observer_check", "observer_review"]);
   });
 
   it.each([
@@ -5453,7 +5461,7 @@ describe("evidence-gated instructions", () => {
     await host.runCommand("observe");
     const content = String(host.sent[0]?.message.content);
     const notice = host.notices.at(-1) ?? "";
-    const [, total = "", list = ""] = /^Observation pass started: 1 signal\(s\), 1 loaded skill\(s\), 0 stale amendment\(s\); payload ≈ (\d+) tokens \((.*); chars\/4 estimate\)\.$/.exec(notice) ?? [];
+    const [, total = "", list = ""] = /^Observation pass started: 1 signal\(s\), 1 loaded skill\(s\), 0 stale amendment\(s\), 0 observation\(s\); payload ≈ (\d+) tokens \((.*); chars\/4 estimate\)\.$/.exec(notice) ?? [];
     const sections = list.split(", ").map((entry) => entry.split(" "));
     expect(sections.map(([name]) => name)).toEqual(["instructions", "digest", "ledger", "rules-in-force"]);
     expect(sections.reduce((sum, [, tokens]) => sum + Number(tokens), 0)).toBe(Number(total));
@@ -5737,5 +5745,95 @@ describe("/observe-report", () => {
     await host.runCommand("observe-report");
     expect(host.notices).toEqual([]);
     expect(host.sent).toEqual([]);
+  });
+});
+
+describe("observations", () => {
+  const OBSERVATION = "Recalled memories repeat the commit-style fact in twelve entries; merge them into one.";
+  const today = () => new Date().toISOString().slice(0, 10);
+
+  /** The list lines of the Observations section of the last payload `/observe` sent. */
+  const observationLines = (host: ReturnType<typeof loadExtension>) => {
+    const content = String(host.sent.at(-1)?.message.content ?? "");
+    const section = /\n## Observations\n\n([\s\S]*?)(?=\n## |$)/.exec(content)?.[1] ?? "";
+    return section.split("\n").filter((line) => line.startsWith("- "));
+  };
+
+  /** Records `text` from `cwd` in one session, then runs `/observe` from `observeCwd` in a second session of the same agent dir. */
+  async function recordThenObserve(text: string, cwd?: string, observeCwd?: string) {
+    const first = loadExtension();
+    if (cwd) first.setCwd(cwd);
+    const result = await first.callTool("observe", { text });
+    expect(result.isError).toBeFalsy();
+    const second = loadExtension({ skillHome: first.skillHome });
+    if (observeCwd) second.setCwd(observeCwd);
+    second.setBranch(fx.plainUserMessage);
+    await second.runCommand("observe");
+    return second;
+  }
+
+  const git = (cwd: string, ...args: string[]) => {
+    const run = spawnSync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.com", ...args], { cwd, encoding: "utf8" });
+    expect(run.status, run.stderr).toBe(0);
+  };
+
+  it("lists an observation recorded in one session in the next session's /observe as one line, marked as the agent's unverified remark", async () => {
+    const host = await recordThenObserve(OBSERVATION);
+    expect(observationLines(host)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${today()})`]);
+    const content = String(host.sent[0]?.message.content);
+    const section = content.slice(content.indexOf("\n## Observations"));
+    expect(section).toMatch(/unverified/);
+    expect(section).toMatch(/another worktree/);
+  });
+
+  it("starts a pass on a pending observation alone, counting it in the start notice and naming its section in the estimate", async () => {
+    const host = await recordThenObserve(OBSERVATION);
+    expect(host.sent).toHaveLength(1);
+    expect(host.notices.at(-1)).toMatch(/^Observation pass started: 0 signal\(s\), 0 loaded skill\(s\), 0 stale amendment\(s\), 1 observation\(s\); payload ≈ \d+ tokens \(instructions \d+, digest \d+, observations \d+, /);
+  });
+
+  it("says there is nothing to observe without speaking of skill signals only when no observation is pending", async () => {
+    const host = loadExtension();
+    host.setBranch(fx.plainUserMessage);
+    await host.runCommand("observe");
+    expect(host.sent).toEqual([]);
+    expect(host.notices).toEqual([expect.stringMatching(/observations/)]);
+  });
+
+  it("shares observations between worktrees of one repository, its subfolders and a bare repository's worktrees", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "skill-observer-git-")));
+    const main = join(root, "main");
+    mkdirSync(join(main, "sub"), { recursive: true });
+    git(main, "init", "-q", "-b", "main");
+    git(main, "commit", "-q", "--allow-empty", "-m", "init");
+    git(main, "worktree", "add", "-q", join(root, "linked"));
+    expect(observationLines(await recordThenObserve(OBSERVATION, join(main, "sub"), join(root, "linked")))).toHaveLength(1);
+
+    git(root, "init", "-q", "--bare", "bare.git");
+    git(join(root, "bare.git"), "worktree", "add", "-q", "--orphan", "-b", "main", join(root, "bare-linked"));
+    expect(observationLines(await recordThenObserve(OBSERVATION, join(root, "bare-linked"), join(root, "bare.git")))).toHaveLength(1);
+  });
+
+  it("keeps another project's observations out, and outside git identifies a project by the working directory's real path", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "skill-observer-plain-")));
+    for (const dir of ["one", "two"]) mkdirSync(join(root, dir));
+    symlinkSync(join(root, "one"), join(root, "one-link"));
+    expect(observationLines(await recordThenObserve(OBSERVATION, join(root, "one-link"), join(root, "one")))).toHaveLength(1);
+    const other = await recordThenObserve(OBSERVATION, join(root, "one"), join(root, "two"));
+    expect(other.sent).toEqual([]);
+  });
+
+  it("registers observe active from load, top-level, without approval prompts, with the spec's agent-facing text", () => {
+    const host = loadExtension();
+    const tool = host.tools.observe!;
+    expect(host.activeTools()).toContain("observe");
+    expect(tool).toMatchObject({ approval: "read", loadMode: "essential" });
+    expect(tool.defaultInactive).toBeFalsy();
+    expect(tool.description).toBe(
+      "Record an observation for the user's next `/observe` pass: something a skill, a rule or the project setup got wrong, or that cost you a detour. It fixes nothing now; record it and continue.",
+    );
+    expect(((tool.parameters as FakeSchema).shape?.text as FakeSchema).description).toBe(
+      "One problem, up to 500 characters: what happened, where, and the fix you want.",
+    );
   });
 });

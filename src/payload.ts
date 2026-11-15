@@ -176,7 +176,7 @@ export function whatToDoNow(conditions: readonly ToolResultCondition[]): string 
   }
 }
 
-export type PayloadSectionName = "instructions" | "note" | "digest" | "ledger" | "outcomes" | "rules-in-force" | "project" | "retro" | "stale";
+export type PayloadSectionName = "instructions" | "note" | "digest" | "observations" | "ledger" | "outcomes" | "rules-in-force" | "project" | "retro" | "stale";
 
 export interface PayloadSection {
   name: PayloadSectionName;
