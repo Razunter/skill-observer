@@ -5846,6 +5846,17 @@ describe("observations", () => {
     expect(observationLines(second)).toEqual([`- ${OBSERVATION} (count 2, last recorded ${today()})`]);
   });
 
+  it("keeps a text recorded again pending when the shown row for its earlier recording lands after it", async () => {
+    const host = loadExtension();
+    await host.callTool("observe", { text: OBSERVATION });
+    const [first] = readFileSync(host.observationsFile, "utf8").trim().split("\n");
+    await host.callTool("observe", { text: OBSERVATION });
+    appendFileSync(host.observationsFile, `${JSON.stringify({ ...JSON.parse(first!), shownAt: new Date().toISOString() })}\n`);
+    host.setBranch(fx.plainUserMessage);
+    await host.runCommand("observe");
+    expect(observationLines(host)).toEqual([`- ${OBSERVATION} (count 2, last recorded ${today()})`]);
+  });
+
   it("keeps another project's observations out, and outside git identifies a project by the working directory's real path", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "skill-observer-plain-")));
     for (const dir of ["one", "two"]) mkdirSync(join(root, dir));

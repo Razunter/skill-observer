@@ -18,7 +18,7 @@ const PENDING_MS = 30 * 86_400_000;
 
 /**
  * Records `text` for the project of `cwd` and returns how many observations
- * are now pending for it. Throws when the text breaks a rule or the append fails.
+ * are now pending for it. Throws when the text is refused or the append fails.
  */
 export function recordObservation(file: string, cwd: string, text: string, now: Date): number {
   const trimmed = text.trim();
@@ -28,33 +28,37 @@ export function recordObservation(file: string, cwd: string, text: string, now: 
   if (length > TEXT_LIMIT) throw new Error(`the observation is ${length} characters; the limit is ${TEXT_LIMIT}`);
   const project = projectIdentity(cwd);
   const key = createHash("sha256").update(`${project}\n${normaliseText(trimmed)}`).digest("hex").slice(0, 12);
-  const pending = readLatestRows<Observation>(file, (row) => row.key).filter((row) => row.project === project && isPending(row, now));
+  const pending = pendingRows(file, project, now);
   const latest = pending.find((row) => row.key === key);
   appendRows(file, [{ key, project, text: trimmed, count: latest ? latest.count + 1 : 1, recordedAt: now.toISOString() }]);
   return latest ? pending.length : pending.length + 1;
 }
 
-/** Oldest last recording first. */
+/** The pending observations of the project of `cwd`, least recently recorded first. */
 export function pendingObservations(file: string, cwd: string, now: Date): Observation[] {
-  const project = projectIdentity(cwd);
-  return readLatestRows<Observation>(file, (row) => row.key)
-    .filter((row) => row.project === project && isPending(row, now))
-    .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
+  return pendingRows(file, projectIdentity(cwd), now).sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
 }
 
-/** Marks the listed revisions shown; one recorded again since the list was read stays pending for the next pass. */
+/** Marks the listed revisions shown; a later recording of the same text stays pending, whenever it was appended. */
 export function markObservationsShown(file: string, observations: readonly Observation[], now: Date): void {
-  const latest = new Map(readLatestRows<Observation>(file, (row) => row.key).map((row) => [row.key, row]));
-  const unchanged = observations.filter((row) => {
-    const current = latest.get(row.key);
-    return current !== undefined && current.shownAt === undefined && current.recordedAt === row.recordedAt && current.count === row.count;
-  });
-  if (unchanged.length === 0) return;
-  appendRows(file, unchanged.map((row) => ({ ...row, shownAt: now.toISOString() })));
+  if (observations.length === 0) return;
+  appendRows(file, observations.map((row) => ({ ...row, shownAt: now.toISOString() })));
 }
 
-/** Expiry is decided on read: nothing runs in the background, and the file is never rewritten. */
-const isPending = (row: Observation, now: Date) => row.shownAt === undefined && now.getTime() - Date.parse(row.recordedAt) < PENDING_MS;
+/**
+ * The latest recording per key, unless the latest shown row of that key names
+ * the same revision. Expiry is decided on read: nothing runs in the
+ * background, and the file is never rewritten.
+ */
+function pendingRows(file: string, project: string, now: Date): Observation[] {
+  const rows = readLatestRows<Observation>(file, (row) => (row.shownAt === undefined ? row.key : `shown:${row.key}`));
+  const shown = new Map(rows.filter((row) => row.shownAt !== undefined).map((row) => [row.key, row]));
+  return rows.filter((row) => {
+    const marker = shown.get(row.key);
+    const wasShown = marker !== undefined && marker.recordedAt === row.recordedAt && marker.count === row.count;
+    return row.shownAt === undefined && row.project === project && !wasShown && now.getTime() - Date.parse(row.recordedAt) < PENDING_MS;
+  });
+}
 
 export function renderObservations(observations: readonly Observation[]): string {
   if (observations.length === 0) return "";
@@ -81,7 +85,7 @@ function projectIdentity(cwd: string): string {
   }
 }
 
-/** `dir` through its `.git` directory or `gitdir:` file, or as a bare git directory itself. */
+/** The shared git directory of `dir`, found through its `.git` directory or `gitdir:` file, or of `dir` itself as a bare git directory. */
 function sharedGitDir(dir: string): string | undefined {
   const dotGit = statSync(join(dir, ".git"), { throwIfNoEntry: false });
   if (dotGit?.isDirectory()) return commonDir(join(dir, ".git"));
