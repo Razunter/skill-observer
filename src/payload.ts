@@ -10,6 +10,9 @@ import type { Observation } from "./observations.js";
 import type { SkillRulesInForce } from "./rules-in-force.js";
 
 export const INSTRUCTIONS_PATH = fileURLToPath(new URL("../observer.md", import.meta.url));
+/** The procedure for observer hooks and the companion extension: read by a pass only when it proposes one, so never inlined. */
+export const HOOKS_AND_COMPANION_PATH = fileURLToPath(new URL("../hooks-and-companion.md", import.meta.url));
+export const HOOK_CHECK_PATH = fileURLToPath(new URL("../scripts/check-hook.ts", import.meta.url));
 
 /**
  * Gates name the evidence that makes a fragment relevant; a fragment with no

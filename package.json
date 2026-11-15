@@ -10,6 +10,7 @@
     "scripts/check-hook.ts",
     "docs/",
     "observer.md",
+    "hooks-and-companion.md",
     "observer/",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",

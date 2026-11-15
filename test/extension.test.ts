@@ -25,7 +25,7 @@ import type {
 } from "../src/omp.js";
 import type { PatternDraft } from "../src/replay.js";
 import * as amendments from "../src/amendments.js";
-import { type Gate, INSTRUCTIONS_PATH, parseFragments, type ToolResultCondition, toolResultGuidance } from "../src/payload.js";
+import { type Gate, HOOK_CHECK_PATH, HOOKS_AND_COMPANION_PATH, INSTRUCTIONS_PATH, parseFragments, type ToolResultCondition, toolResultGuidance } from "../src/payload.js";
 import { entries as fx } from "./fixtures.js";
 import { CE_PLUGIN, copySkillEntry, installPlugin, makeSkillHome, uninstallPlugin, writeSkill } from "./skill-home.js";
 
@@ -2505,6 +2505,16 @@ describe("observer hook and companion intents", () => {
     const there = String(host.sent.at(-1)?.message.content);
     expect(there).toContain("Block git commit everywhere");
     expect(there).not.toContain("Block git commit here");
+  });
+
+  it("names the hook and companion procedure file and the hook check script in a pass with only a User note, without the procedure's text", async () => {
+    const host = loadExtension();
+    await host.runCommand("observe", "Review hooks");
+    const payload = String(host.sent.at(-1)?.message.content);
+    expect(payload).toContain(`Hook and companion procedure file: \`${HOOKS_AND_COMPANION_PATH}\`. Hook check script: \`${HOOK_CHECK_PATH}\`.`);
+    expect(payload).toContain("read the procedure file named below");
+    const procedure = readFileSync(HOOKS_AND_COMPANION_PATH, "utf8").split(/\n{2,}/).filter((block) => !block.startsWith("#"));
+    expect(procedure.filter((block) => payload.includes(block.trim()))).toEqual([]);
   });
 
   it("writes no file and records nothing as applied for an intent Apply alone", async () => {

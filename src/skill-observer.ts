@@ -36,7 +36,9 @@ import {
   type ProvenanceResolver,
   type SkillRoots,
 } from "./provenance.js";
-import { activeGates, describePayloadEstimate, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate, type ToolResultCondition, whatToDoNow } from "./payload.js";
+import {
+  activeGates, describePayloadEstimate, HOOK_CHECK_PATH, HOOKS_AND_COMPANION_PATH, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate, type ToolResultCondition, whatToDoNow,
+} from "./payload.js";
 import { CHECK_TOOL_NAME, registerCheckTool } from "./replay.js";
 import { RESOLVE_TOOL_NAME, registerResolveTool } from "./resolve.js";
 import { rankingModelUnavailable, registerReviewTool, REVIEW_TOOL_NAME } from "./review.js";
@@ -142,7 +144,7 @@ async function observationPayload(
       text: [
         instructionText(gates),
         "",
-        `These observer instructions live in \`${INSTRUCTIONS_PATH}\`.`,
+        `These observer instructions live in \`${INSTRUCTIONS_PATH}\`. Hook and companion procedure file: \`${HOOKS_AND_COMPANION_PATH}\`. Hook check script: \`${HOOK_CHECK_PATH}\`.`,
         `Skills directory: \`${roots.skillsDir}\`. Managed-skills directory: \`${roots.managedDir}\`. User rules directory: \`${userRulesDir()}\`. On-read amendments directory: \`${amendmentsDir()}\`. Reference files directory: \`${referencesDir()}\`. ` +
           `Project hooks directory: \`${hookDirs["project-hooks"]}\`. Global hooks directory: \`${hookDirs["global-hooks"]}\`. Companion extension directory: \`${hookDirs.companion}\`.`,
       ].join("\n"),
