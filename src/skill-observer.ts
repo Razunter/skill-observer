@@ -44,7 +44,7 @@ import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
 import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
 import { evidenceReport, isEmptyEvidenceReport, renderEvidenceReport } from "./report.js";
 import { recordHookCall, recordHookResult } from "./session-tool-evidence.js";
-import { type Observation, pendingObservations, recordObservation, renderObservations } from "./observations.js";
+import { markObservationsShown, type Observation, pendingObservations, recordObservation, renderObservations } from "./observations.js";
 import { hasApprovalNote, hasCustomInput, observationPassStart } from "./proposal-approval.js";
 
 const STATUS_KEY = "skill-observer";
@@ -247,6 +247,8 @@ export default function skillObserver(pi: ExtensionAPI): void {
     approval: "read",
     loadMode: "essential",
     async execute(_toolCallId, { text }, _signal, _onUpdate, ctx) {
+      // Only the agent the user talks to adds to the user's review queue.
+      if (ctx.agent?.kind === "sub") return { content: [{ type: "text", text: "Nothing was recorded: only the main agent records observations." }], isError: true };
       try {
         recordObservation(observationsFile(), ctx.cwd, text, new Date());
       } catch (error) {
@@ -268,7 +270,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
       let observations: Observation[];
       let payload: ObservationPayload;
       try {
-        observations = pendingObservations(observationsFile(), ctx.cwd);
+        observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
         if (!note && isEmptyDigest(digest) && stale.length === 0 && observations.length === 0) {
           ctx.ui.notify("Nothing to observe: no skill signals, stale amendments or pending observations, and no note.", "info");
           return;
@@ -284,6 +286,11 @@ export default function skillObserver(pi: ExtensionAPI): void {
         { customType: OBSERVATION_MESSAGE_TYPE, content: payload.content, display: false, attribution: "user" },
         { triggerTurn: true, deliverAs: "followUp" },
       );
+      try {
+        markObservationsShown(observationsFile(), observations, new Date());
+      } catch (error) {
+        ctx.ui.notify(`Observations not marked as shown: ${error instanceof Error ? error.message : String(error)}; the next /observe lists them again.`, "error");
+      }
       ctx.ui.notify(
         `Observation pass started: ${note ? "your note, " : ""}${digest.signals.length} signal(s), ${digest.skills.length} loaded skill(s), ${stale.length} stale amendment(s), ${observations.length} observation(s); payload ${describePayloadEstimate(payloadEstimate(payload.sections))}.`,
         "info",
@@ -302,7 +309,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const report = evidenceReport({ digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale });
       if (!isEmptyEvidenceReport(report)) {
         try {
-          const observations = pendingObservations(observationsFile(), ctx.cwd);
+          const observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
           report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, roots, provenance })).sections);
         } catch (error) {
           ctx.ui.notify(`Evidence report not shown: ${error instanceof Error ? error.message : String(error)}`, "error");

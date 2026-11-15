@@ -57,6 +57,7 @@ const zod: ExtensionAPI["zod"] = {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+  vi.useRealTimers();
 });
 
 /**
@@ -65,7 +66,7 @@ afterEach(() => {
  * available judge role unless `judge` is false. Given another host's
  * `skillHome`, it is a second session of the same agent dir and project.
  */
-function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome> } = {}) {
+function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome> } = {}) {
   const skillHome = options.skillHome ?? makeSkillHome();
   mkdirSync(skillHome.roots.cwd, { recursive: true });
   vi.stubEnv("HOME", skillHome.home);
@@ -114,7 +115,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; j
   const noticeEvents: Array<{ message: string; type?: "info" | "warning" | "error" }> = [];
   const ctx: ExtensionContext = {
     hasUI: options.hasUI ?? true,
-    agent: { kind: options.agentKind ?? "main" },
+    agent: options.agentKind === "unknown" ? undefined : { kind: options.agentKind ?? "main" },
     cwd: skillHome.roots.cwd,
     sessionManager: { getBranch: () => branch, getSessionId: () => "fixture-session" },
     modelRegistry: { getAvailable: () => [{ provider: "fixture", id: "explicit-judge" }] },
@@ -208,6 +209,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub"; j
       return result;
     },
     ledgerFile: join(skillHome.home, ".omp/agent/skill-observer/ledger.jsonl"),
+    observationsFile: join(skillHome.home, ".omp/agent/skill-observer/observations.jsonl"),
     rulesDir: join(skillHome.home, ".omp/agent/rules"),
     amendmentsDir: join(skillHome.home, ".omp/agent/skill-observer/amendments"),
     activeTools: () => activeTools,
@@ -5835,5 +5837,121 @@ describe("observations", () => {
     expect(((tool.parameters as FakeSchema).shape?.text as FakeSchema).description).toBe(
       "One problem, up to 500 characters: what happened, where, and the fix you want.",
     );
+  });
+
+  const resultText = (result: ToolResult<unknown>) => result.content.map(({ text }) => text).join("\n");
+  const DAY = 86_400_000;
+  const T0 = Date.parse("2026-10-01T12:00:00Z");
+
+  it("marks observations shown in /observe, so a second /observe no longer lists them, and never in /observe-report", async () => {
+    const first = loadExtension();
+    await first.callTool("observe", { text: OBSERVATION });
+    const second = loadExtension({ skillHome: first.skillHome });
+    second.setBranch(fx.plainUserMessage);
+    await second.runCommand("observe-report");
+    await second.runCommand("observe");
+    expect(observationLines(second)).toHaveLength(1);
+    await second.runCommand("observe");
+    expect(second.sent).toHaveLength(1);
+    expect(second.notices.at(-1)).toMatch(/^Nothing to observe/);
+  });
+
+  it("gives an error notice and continues the pass when marking observations shown fails", async () => {
+    const first = loadExtension();
+    await first.callTool("observe", { text: OBSERVATION });
+    chmodSync(first.observationsFile, 0o444);
+    const second = loadExtension({ skillHome: first.skillHome });
+    second.setBranch(fx.plainUserMessage);
+    await second.runCommand("observe");
+    expect(observationLines(second)).toHaveLength(1);
+    expect(second.activeTools()).toContain("observer_resolve");
+    expect(second.noticeEvents).toEqual([
+      { message: expect.stringMatching(/^Observations not marked as shown: .+; the next \/observe lists them again\.$/), type: "error" },
+      { message: expect.stringMatching(/^Observation pass started: /), type: "info" },
+    ]);
+  });
+
+  it.each([[31, 0], [29, 1]])("lists an observation last recorded %i days ago %i time(s)", async (days, listed) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(T0);
+    const first = loadExtension();
+    await first.callTool("observe", { text: OBSERVATION });
+    vi.setSystemTime(T0 + days * DAY);
+    const second = loadExtension({ skillHome: first.skillHome });
+    second.setBranch(fx.plainUserMessage);
+    await second.runCommand("observe");
+    expect(observationLines(second)).toHaveLength(listed);
+  });
+
+  it("counts a text recorded again in other case, punctuation or spacing as one, and starts again at count 1 once shown or expired", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(T0);
+    const host = loadExtension();
+    host.setBranch(fx.plainUserMessage);
+    await host.callTool("observe", { text: "Bun test reads the real .env file!" });
+    vi.setSystemTime(T0 + DAY);
+    await host.callTool("observe", { text: "bun TEST reads the real env-file" });
+    await host.runCommand("observe");
+    expect(observationLines(host)).toEqual(["- bun TEST reads the real env-file (count 2, last recorded 2026-10-02)"]);
+
+    // Recorded while that pass runs: it waits for the next one.
+    await host.callTool("observe", { text: "Bun test reads the real .env file!" });
+    await host.runCommand("observe");
+    expect(observationLines(host)).toEqual(["- Bun test reads the real .env file! (count 1, last recorded 2026-10-02)"]);
+
+    await host.callTool("observe", { text: "Bun test reads the real .env file!" });
+    vi.setSystemTime(T0 + 40 * DAY);
+    await host.callTool("observe", { text: "Bun test reads the real .env file!" });
+    await host.runCommand("observe");
+    expect(observationLines(host)).toEqual(["- Bun test reads the real .env file! (count 1, last recorded 2026-11-10)"]);
+  });
+
+  it.each([
+    ["empty", " \n\t ", /the observation is empty/],
+    ["without a letter or digit", "!!! ??? …", /the observation has no letter or digit/],
+    ["over 500 characters", `${"a".repeat(501)}  `, /the observation is 501 characters; the limit is 500/],
+  ])("refuses %s text and records nothing", async (_label, text, rule) => {
+    const host = loadExtension();
+    const result = await host.callTool("observe", { text });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toMatch(/^Nothing was recorded: /);
+    expect(resultText(result)).toMatch(rule);
+    expect(existsSync(host.observationsFile)).toBe(false);
+  });
+
+  it("accepts text of exactly 500 characters after trimming", async () => {
+    const host = loadExtension();
+    expect((await host.callTool("observe", { text: ` ${"a".repeat(500)} ` })).isError).toBeFalsy();
+  });
+
+  it("refuses a subagent's call and records nothing", async () => {
+    const host = loadExtension({ agentKind: "sub" });
+    const result = await host.callTool("observe", { text: OBSERVATION });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toBe("Nothing was recorded: only the main agent records observations.");
+    expect(existsSync(host.observationsFile)).toBe(false);
+  });
+
+  it.each([
+    ["a context without agent information", { agentKind: "unknown" }],
+    ["a main agent without UI", { hasUI: false }],
+  ] as const)("records from %s", async (_label, options) => {
+    const first = loadExtension(options);
+    expect((await first.callTool("observe", { text: OBSERVATION })).isError).toBeFalsy();
+    const second = loadExtension({ skillHome: first.skillHome });
+    second.setBranch(fx.plainUserMessage);
+    await second.runCommand("observe");
+    expect(observationLines(second)).toHaveLength(1);
+  });
+
+  it("returns a tool error saying nothing was recorded when the append fails", async () => {
+    const host = loadExtension();
+    await host.callTool("observe", { text: OBSERVATION });
+    chmodSync(host.observationsFile, 0o444);
+    const before = readFileSync(host.observationsFile, "utf8");
+    const result = await host.callTool("observe", { text: "Another remark." });
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toMatch(/^Nothing was recorded: .+/);
+    expect(readFileSync(host.observationsFile, "utf8")).toBe(before);
   });
 });

@@ -17,20 +17,43 @@ export interface Observation {
   shownAt?: string;
 }
 
-/** Records `text` for the project of `cwd`. Throws when the append fails. */
+const TEXT_LIMIT = 500;
+const PENDING_MS = 30 * 86_400_000;
+
+/**
+ * Records `text` for the project of `cwd`: a text whose key is pending counts
+ * once more, any other starts at count 1. Throws when the text breaks a rule
+ * or the append fails.
+ */
 export function recordObservation(file: string, cwd: string, text: string, now: Date): void {
-  const project = projectIdentity(cwd);
   const trimmed = text.trim();
-  appendRows(file, [{ key: observationKey(project, trimmed), project, text: trimmed, count: 1, recordedAt: now.toISOString() }]);
+  const length = [...trimmed].length;
+  if (length === 0) throw new Error("the observation is empty");
+  if (!/[\p{L}\p{N}]/u.test(trimmed)) throw new Error("the observation has no letter or digit");
+  if (length > TEXT_LIMIT) throw new Error(`the observation is ${length} characters; the limit is ${TEXT_LIMIT}`);
+  const project = projectIdentity(cwd);
+  const key = observationKey(project, trimmed);
+  const latest = readObservations(file).find((row) => row.key === key);
+  const count = latest && isPending(latest, now) ? latest.count + 1 : 1;
+  appendRows(file, [{ key, project, text: trimmed, count, recordedAt: now.toISOString() }]);
 }
 
 /** The project's pending observations, oldest last recording first. */
-export function pendingObservations(file: string, cwd: string): Observation[] {
+export function pendingObservations(file: string, cwd: string, now: Date): Observation[] {
   const project = projectIdentity(cwd);
   return readObservations(file)
-    .filter((row) => row.project === project && row.shownAt === undefined)
+    .filter((row) => row.project === project && isPending(row, now))
     .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
 }
+
+/** Marks `observations` as shown, so no later pass lists them. Throws when the append fails. */
+export function markObservationsShown(file: string, observations: readonly Observation[], now: Date): void {
+  if (observations.length === 0) return;
+  appendRows(file, observations.map((row) => ({ ...row, shownAt: now.toISOString() })));
+}
+
+/** Expiry is decided on read: nothing runs in the background, and the file is never rewritten. */
+const isPending = (row: Observation, now: Date) => row.shownAt === undefined && now.getTime() - Date.parse(row.recordedAt) < PENDING_MS;
 
 /** The observations section of the payload; empty when none is pending. */
 export function renderObservations(observations: readonly Observation[]): string {
