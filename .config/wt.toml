@@ -1,0 +1,4 @@
+# A fresh worktree has no node_modules, and the pre-commit hook links the worktree's own into its staged export.
+# pre-start blocks until done, so the worktree can commit as soon as `wt switch --create` returns.
+[pre-start]
+deps = "bun install --frozen-lockfile"
