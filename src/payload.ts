@@ -6,6 +6,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ObserverRule } from "./amendments.js";
 import type { SessionDigest } from "./digest.js";
+import type { Observation } from "./observations.js";
 import type { SkillRulesInForce } from "./rules-in-force.js";
 
 export const INSTRUCTIONS_PATH = fileURLToPath(new URL("../observer.md", import.meta.url));
@@ -15,9 +16,9 @@ export const INSTRUCTIONS_PATH = fileURLToPath(new URL("../observer.md", import.
  * gate is always on. `tool-result` fragments never enter the payload: they
  * ride in the tool result that reports their condition.
  */
-export type Gate = "stale" | "compaction" | "project" | "withdrawal" | "ranking" | "note" | "tool-result";
+export type Gate = "stale" | "compaction" | "project" | "withdrawal" | "ranking" | "note" | "observations" | "tool-result";
 
-const GATE_NAMES: Record<Gate, true> = { stale: true, compaction: true, project: true, withdrawal: true, ranking: true, note: true, "tool-result": true };
+const GATE_NAMES: Record<Gate, true> = { stale: true, compaction: true, project: true, withdrawal: true, ranking: true, note: true, observations: true, "tool-result": true };
 
 /** A run of whole paragraphs or list items of `observer.md`, in document order; `section` sorts in document order too. */
 export interface Fragment {
@@ -119,6 +120,8 @@ export interface GateInput {
   rulesInForce: readonly SkillRulesInForce[];
   note: string;
   rankingAvailable: boolean;
+  /** The project's pending observations. */
+  observations: readonly Observation[];
   /** Whether the skill has an on-read amendment in the amendments directory. */
   onReadAmendmentFor(skill: string): boolean;
 }
@@ -132,6 +135,7 @@ const GATE_EVIDENCE: Record<Exclude<Gate, "tool-result">, (input: GateInput) => 
     note !== "" || rulesInForce.some(({ rules, edits }) => edits.length > 0 || rules.some(({ fixes }) => fixes.length > 0)),
   ranking: ({ rankingAvailable }) => rankingAvailable,
   note: ({ note }) => note !== "",
+  observations: ({ observations }) => observations.length > 0,
 };
 
 /** The gates whose evidence is present; never `tool-result`. */

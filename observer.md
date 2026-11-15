@@ -42,6 +42,10 @@ A **User note** ahead of the digest, when present, is text the user typed after 
 Each entry under **Stale amendments** is a candidate too: an amendment rule whose upstream or plugin skill's files changed since it was pinned, or whose skill is no longer an upstream or plugin skill. Read its rule file, and the skill file when the entry names one.
 <!-- end -->
 
+<!-- when: observations -->
+Each entry under **Observations** is a remark the main agent recorded while working in this repository, in this session or an earlier one: evidence to check against the session and the checkout before you propose anything. A path in it may belong to another worktree of the repository; look for the same file under the current checkout. A checked observation that a proposal kind available in this pass fits becomes a candidate like any signal. Any other observation becomes a report item: what was observed and a next action for the user. Every observation ends as a candidate or a report item.
+<!-- end -->
+
 Done when every signal and relevant note point is either an evidence-backed candidate with one mechanism, exact target, scope, remedy and verification method, or dismissed with its reason; cross-source duplicates are merged, gaps are disclosed, and every Later entry, stale amendment and marked compaction is accounted for.
 
 ## 2. Draft
@@ -188,6 +192,10 @@ Done when the tool result lists every such answer as recorded, or, after a faile
 ## 6. Summarise
 
 Report in a few lines: applied changes with their paths, rules and reference files included, naming each on-read fix or rule written under your reconciliation, as the result reports it; withdrawn fixes with the rule files deleted, or with the text removed from an on-read amendment as a diff; kept, updated and deleted amendments, naming each one kept without a question; Later and Decline answers; answers `observer_resolve` deferred as `later` at the replay check, and compactions it deferred as `later`, each with its reason; after a failed ledger append, each Unrecorded publication, each Later or Decline left unrecorded and each answer whose recording is unknown, with the error; each deletion whose cleanup failed, with what is left; on-read fixes refused because their skill has two or more on-read amendments; barrier candidates set aside because the check can't run, with the reason it gave; the number of dismissed signals; unknown-target fixes you drafted, with their text; candidates past the cap of 5; and "writing-for-agents unavailable" if step 2 fell back.
+
+<!-- when: observations -->
+Report each observation that became a report item: what it says, what checking it showed, and the next action you suggest.
+<!-- end -->
 
 Done when the summary covers every outcome, project path and observed check result, merged finding and dismissed signal, deferred/failed publication, missing primary evidence or retro reference, and every other item above that occurred. Distinguish checks actually exercised from proposed checks.
 

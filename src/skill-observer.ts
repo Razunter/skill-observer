@@ -124,6 +124,7 @@ async function observationPayload(
     stale,
     rulesInForce: inForce,
     note,
+    observations,
     rankingAvailable: (await rankingModelUnavailable(pi, ctx).catch(() => "unreadable")) === undefined,
     onReadAmendmentFor: (skill) => onReadAmendments.some((rule) => rule.amends === skill),
   });

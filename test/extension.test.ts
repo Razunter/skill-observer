@@ -5431,6 +5431,9 @@ describe("evidence-gated instructions", () => {
       () => ({ branch: [...base, ...fx.skillPromptManaged] })],
     ["note and withdrawal: a User note", ["note", "withdrawal"], () => ({ branch: base, note: "tdd should name the seam first" }), () => ({ branch: base })],
     ["ranking: an explicit, available judge role", ["ranking"], () => ({ branch: base }), () => ({ branch: base }), { judge: false }],
+    ["observations: a pending observation", ["observations"],
+      async (host) => { await host.callTool("observe", { text: "The tdd skill names no seam for HTTP clients." }); return { branch: base }; },
+      () => ({ branch: base })],
   ];
 
   /** The fragments of `observer.md` the payload `/observe` sends with `setup`'s evidence holds. */
@@ -5953,5 +5956,22 @@ describe("observations", () => {
     expect(result.isError).toBe(true);
     expect(resultText(result)).toMatch(/^Nothing was recorded: .+/);
     expect(readFileSync(host.observationsFile, "utf8")).toBe(before);
+  });
+
+  it("gives a pass started on observations alone their instructions, without the project section or the retro reference", async () => {
+    const first = loadExtension();
+    mkdirSync(join(first.skillHome.roots.skillsDir, "retro"), { recursive: true });
+    writeFileSync(join(first.skillHome.roots.skillsDir, "retro", "SKILL.md"), "---\nname: retro\ndescription: Run a retrospective.\n---\n\nRetro body.\n");
+    await first.callTool("observe", { text: OBSERVATION });
+    const second = loadExtension({ skillHome: first.skillHome });
+    second.setBranch(fx.plainUserMessage);
+    await second.runCommand("observe");
+    const content = String(second.sent[0]?.message.content);
+    expect(content).toContain("Each entry under **Observations**");
+    expect(content).toContain("may belong to another worktree of the repository");
+    expect(content).not.toContain("## Project scope");
+    expect(content).not.toContain("## Retrospective reference");
+    expect(content).not.toContain("Retro body.");
+    expect(second.noticeEvents.filter(({ type }) => type !== "info")).toEqual([]);
   });
 });
