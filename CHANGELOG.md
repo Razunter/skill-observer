@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- The main agent records an observation with the new `observe` tool: one remark of up to 500 characters about something a skill, a rule or the project setup got wrong. Observations are stored in `<agent dir>/skill-observer/observations.jsonl` per repository, shared by its worktrees, and survive across sessions. The next `/observe` in that repository lists them in a new `observations` payload section, starts a pass even when they are its only evidence, and then marks them shown; one never shown expires 30 days after it was last recorded. Recording the same text again raises its count. Subagent calls are refused. The status line and `/observe-report` show the pending count, and a new `observations` gate adds pass instructions for checking them.
+
 ### Changed
 
 - `/observe` asks through the HTML-form `ask` of OMP 18.18. `observer_review` Select returns `askHtml`, the complete form with one fieldset per selected proposal (target and gist, remedy, evidence, preview, and Apply / Later / Decline, or Keep / Update / Delete for a stale amendment); the model passes it to `ask` unchanged. Nothing is preselected.

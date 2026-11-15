@@ -43,7 +43,7 @@ Each entry under **Stale amendments** is a candidate too: an amendment rule whos
 <!-- end -->
 
 <!-- when: observations -->
-Each entry under **Observations** is a remark the main agent recorded while working in this repository, in this session or an earlier one: evidence to check against the session and the checkout before you propose anything. A path in it may belong to another worktree of the repository; look for the same file under the current checkout. A checked observation that a proposal kind available in this pass fits becomes a candidate like any signal. Any other observation becomes a report item: what was observed and a next action for the user. Every observation ends as a candidate or a report item.
+Each entry under **Observations** is a remark the main agent recorded while working in this repository, in this session or an earlier one: evidence to check against the session and the checkout before you propose anything. A path in it may belong to another worktree of the repository; look for the same file under the current checkout. Once checked, an observation that fits a proposal kind available in this pass becomes a candidate like any signal. Any other observation becomes a report item: what was observed and a next action for the user. Every observation ends as a candidate or a report item.
 <!-- end -->
 
 Done when every signal and relevant note point is either an evidence-backed candidate with one mechanism, exact target, scope, remedy and verification method, or dismissed with its reason; cross-source duplicates are merged, gaps are disclosed, and every Later entry, stale amendment and marked compaction is accounted for.

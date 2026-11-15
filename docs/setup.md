@@ -99,7 +99,7 @@ Use each source project's installation instructions. OMP must be able to discove
 
 ## State and upgrades
 
-The extension stores its ledger, on-read amendments, and reference files under the active OMP agent directory's `skill-observer/` directory. Pattern amendments and barrier rules live in the agent directory's `rules/`. Skill decisions are shared across projects in that profile; project decisions are scoped to the canonical OMP working directory.
+The extension stores its ledger, observations, on-read amendments, and reference files under the active OMP agent directory's `skill-observer/` directory. Pattern amendments and barrier rules live in the agent directory's `rules/`. Skill decisions are shared across projects in that profile; project decisions are scoped to the canonical OMP working directory, and observations to the repository.
 
 Loading can migrate marked legacy observer rules to the current layout, separately from proposal approval. Upstream updates preserve separately stored amendments; the next `/observe` checks for staleness. On-read delivery requires the extension to stay loaded in later sessions.
 

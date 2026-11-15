@@ -43,7 +43,9 @@ To see what the extension knows about the current branch without starting a revi
 /observe-report
 ```
 
-It lists signal counts, loaded skills, remedy outcomes of applied fixes, stale amendments, the next `/observe` pass's estimated size, and the Later count. It calls no model and writes nothing.
+It lists signal counts, loaded skills, remedy outcomes of applied fixes, stale amendments, pending observations, the next `/observe` pass's estimated size, and the Later count. It calls no model and writes nothing.
+
+While it works, the agent can also record an **observation** with its `observe` tool when a skill, a rule or the project setup gets something wrong. Observations are kept per repository, shared by its worktrees, and survive across sessions. The next `/observe` in that repository lists them, then drops them; an observation that no pass shows expires 30 days after it was last recorded. See [observations](docs/observation.md#observations).
 
 ### Optional remote skills
 

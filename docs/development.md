@@ -208,6 +208,7 @@ Run this from the source checkout's extension root. It creates `skill-observer-0
 | [`src/provenance.ts`](../src/provenance.ts) | Where a skill comes from (local, upstream, managed, plugin, or a byte-identical copy of one) and the skill-folder `skillHash` |
 | [`src/digest.ts`](../src/digest.ts) | Session digest: skill signals, loaded skills and deliveries rebuilt from the branch |
 | [`src/ledger.ts`](../src/ledger.ts) | Proposal ledger: append-only JSONL, latest answer per fingerprint |
+| [`src/observations.ts`](../src/observations.ts) | Observation store: append-only JSONL, latest row per project and text, pending and expiry on read, the project identity from the shared git directory, and the payload section |
 | [`src/resolve.ts`](../src/resolve.ts) | `observer_resolve`: validates and records answers, and replays pattern rules before the call's changes |
 | [`src/on-read-amendment-transitions.ts`](../src/on-read-amendment-transitions.ts) | On-read amendment transitions: one call's stale settlements, withdrawals, additions and rules, and compactions in their phases, with withdrawal checks, compaction coverage and reference release |
 | [`src/publication.ts`](../src/publication.ts) | Builds and validates the rule of an applied fix from its approved section or rule |

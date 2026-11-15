@@ -4,7 +4,7 @@ How `/observe` uses session evidence to review skills and project-environment fi
 
 ## Hints
 
-After each turn, the extension rebuilds the session digest from the current branch of the session. The status line shows `N skill correction(s) · /observe` once the branch has a correction-class skill signal, and `N workflow(s) without a skill · /observe` once it has a workflow outline and no correction. Correction-class signals are:
+After each turn, the extension rebuilds the session digest from the current branch of the session. The status line shows `N skill correction(s) · /observe` once the branch has a correction-class skill signal, and `N workflow(s) without a skill · /observe` once it has a workflow outline and no correction. With neither, it shows `N pending observation(s) · /observe` while the project has [pending observations](#observations). Correction-class signals are:
 
 - a steering message you typed while the agent was working;
 - a rule violation: a TTSR rule firing on the agent's text or a tool call, whether it interrupts or is injected into a tool result. Every TTSR rule this extension writes is a barrier rule or pattern amendment, so each firing is a violation; on-read amendments never reach TTSR (see [Delivering on-read amendments](amendments.md#delivering-on-read-amendments));
@@ -28,7 +28,7 @@ A skill's line also names its on-read amendments delivered in this session, as i
 
 Text after the command, as in `/observe tdd should run the one failing test first`, goes into the pass as a **User note** ahead of the digest: feedback the digest can't show, or a steer such as a skill to focus on. The model weighs each change it names like a correction-class signal. A note starts a pass even in a session without signals.
 
-With no note, no signals, no loaded skills and no stale amendments, `/observe` says so and starts no turn. Otherwise it sends one hidden message, the [observation payload](#observation-payload), that starts a normal turn.
+With no note, no signals, no loaded skills, no stale amendments and no pending observations, `/observe` says so and starts no turn. Otherwise it sends one hidden message, the [observation payload](#observation-payload), that starts a normal turn.
 
 The model asks about at most 5 proposals, stale amendments it would update or delete, and compactions in one main `ask`. The extension renders that Ask as one form, which `observer_review` Select returns and the model passes on unchanged: one fieldset per proposal with its target and gist, remedy, evidence and preview, and the choices Apply / Later / Decline, or Keep / Update / Delete for a stale amendment. Nothing is preselected. Stale amendments come first, then User note points, then correction-class signals and repeats, then compactions. Each proposal fixes one mechanism; a candidate bundling two independent fixes becomes two questions.
 
@@ -40,6 +40,16 @@ The model applies approved edits to local skills directly and to managed or new 
 
 If an answer in the main batch retracts an applied fix, the pass prepares and selects its withdrawal, then asks about it in a separate follow-up `ask` in the same pass. **Decline** on a withdrawal keeps the fix: `observer_resolve` records nothing for it and says the fix stays in force. An answer cites its proposal by the reference of the pass's latest Prepare holding it; an older reference is refused with the latest one named. See [Proposal approval](development.md#proposal-approval) and [Ledger](development.md#ledger) for the approval and recording rules.
 
+## Observations
+
+The main agent records an observation with the `observe` tool: one remark of up to 500 characters about something a skill, a rule or the project setup got wrong, or that cost it a detour. The tool is active as soon as the extension loads and never asks for approval. A subagent's call is refused. Text that is empty, has no letter or digit, or is over 500 characters is refused, and nothing is recorded.
+
+Observations are stored in `<agent dir>/skill-observer/observations.jsonl`, one file shared by every project. Each belongs to the repository it was recorded in, identified by the real path of the repository's shared git directory, so all worktrees of a repository share them. Outside a git repository the working directory's real path is the project. Project-environment fixes keep their own scope, the working directory.
+
+An observation is pending until a pass shows it, or until 30 days after it was last recorded. Recording the same text again, ignoring case, punctuation and spacing, raises its count and restarts its 30 days; recording a text already shown or expired starts again at count 1. A successful call tells the agent how many observations are pending and that `/observe` reviews them; the agent may mention the command, but only the user starts a pass.
+
+`/observe` lists the project's pending observations in the payload's **observations** section and starts a pass even when they are its only evidence. Right after sending the payload it marks the listed ones shown, so the next pass does not list them, even when this one is interrupted. If marking fails, an error notice says so and the pass continues. An observation recorded during a pass, or recorded again while `/observe` assembled the payload, waits for the next one. The pass checks each observation against the session and the checkout, turns it into a proposal when a proposal kind fits, and otherwise reports it with a suggested next action. Pending observations do not turn on the `project` gate.
+
 ## Observation payload
 
 The message that starts a pass holds these sections, in this order, leaving out any without text:
@@ -47,6 +57,7 @@ The message that starts a pass holds these sections, in this order, leaving out 
 - **instructions**: the parts of [`observer.md`](../observer.md) the session's evidence can reach, then the path of `observer.md` and the skills, managed-skills, user rules, on-read amendments and reference files directories;
 - **note**: the User note;
 - **digest**: the [session digest](#digest);
+- **observations**: the project's [pending observations](#observations), one line each with its count and the date it was last recorded;
 - **ledger**: the proposal ledger's Later entries, each with its re-offer condition (`Re-offer when: …`) when its record has one;
 - **outcomes**: the remedy outcomes of applied fixes. Only project-environment fixes and fixes for a skill the digest loaded are listed. One closing line counts the rest, whose skills were not loaded in this session;
 - **rules-in-force**: the [rules in force](#rules-in-force);
@@ -64,6 +75,7 @@ The message that starts a pass holds these sections, in this order, leaving out 
 | `withdrawal` | a fix is in force for a loaded skill, or there is a User note | withdrawal candidates and questions, and retracted fixes |
 | `ranking` | the host has an explicit, available `judge` role assignment | advisory ranking and Select's `rankings`; without it the pass calls Select without rankings |
 | `note` | there is a User note | how to weigh the User note |
+| `observations` | the project has a pending observation | checking observations, and reporting those no proposal kind fits with a next action |
 | `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, with custom input and with an approval note; see below |
 
 Under the `project` gate, the Retrospective reference includes the installed `retro` skill's text inline, without its frontmatter. A preceding line says which parts apply: its candidate categories do; its own steps and Files section describe a standalone retrospective and do not. Without `retro`, the section says the reference is unavailable and the UI warns. Without the gate, neither the section nor the warning appears.
@@ -85,9 +97,10 @@ The pass-start notice estimates the payload's size by section, as in `Observatio
 3. **Remedy outcomes**, one line per applied fix in force for this project, as `fingerprint: status (skill or project target path)`, delivered first, then exercised-clean, recurrence and inconclusive. The report lists every one, including those the payload only counts;
 4. **Stale amendments**, by rule name and skill;
 5. the **payload estimate** of the pass `/observe` would start now, from the same assembly and gates (without a User note);
-6. the number of **Later** proposals for this project.
+6. the number of **Later** proposals for this project;
+7. the number of **pending observations** for this project, without their text. Reporting them marks none shown.
 
-The report names tools, signal kinds, skills, rule names and project target paths only: no tool arguments, error text, evidence file paths or session IDs. A branch with no signals, loaded skills, stale amendments or applied fixes reports `No skill evidence on this branch.` and no estimate.
+The report names tools, signal kinds, skills, rule names and project target paths only: no tool arguments, error text, evidence file paths, session IDs or observation text. A branch with no signals, loaded skills, stale amendments, applied fixes or pending observations reports `No skill evidence on this branch.` and no estimate.
 
 ## Optional references
 
