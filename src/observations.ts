@@ -42,9 +42,15 @@ export function pendingObservations(file: string, cwd: string, now: Date): Obser
     .sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
 }
 
+/** Marks the listed revisions shown; one recorded again since the list was read stays pending for the next pass. */
 export function markObservationsShown(file: string, observations: readonly Observation[], now: Date): void {
-  if (observations.length === 0) return;
-  appendRows(file, observations.map((row) => ({ ...row, shownAt: now.toISOString() })));
+  const latest = new Map(readLatestRows<Observation>(file, (row) => row.key).map((row) => [row.key, row]));
+  const unchanged = observations.filter((row) => {
+    const current = latest.get(row.key);
+    return current !== undefined && current.shownAt === undefined && current.recordedAt === row.recordedAt && current.count === row.count;
+  });
+  if (unchanged.length === 0) return;
+  appendRows(file, unchanged.map((row) => ({ ...row, shownAt: now.toISOString() })));
 }
 
 /** Expiry is decided on read: nothing runs in the background, and the file is never rewritten. */
@@ -75,17 +81,21 @@ function projectIdentity(cwd: string): string {
   }
 }
 
-/** `dir` as a bare git directory itself, or through its `.git` directory or `gitdir:` file. */
+/** `dir` through its `.git` directory or `gitdir:` file, or as a bare git directory itself. */
 function sharedGitDir(dir: string): string | undefined {
-  if (isGitDir(dir)) return commonDir(dir);
-  const dotGit = join(dir, ".git");
-  if (!existsSync(dotGit)) return undefined;
-  if (statSync(dotGit).isDirectory()) return commonDir(dotGit);
-  const pointer = /^gitdir: (.+)$/m.exec(readFileSync(dotGit, "utf8"))?.[1]?.trim();
-  return pointer ? commonDir(resolve(dir, pointer)) : undefined;
+  const dotGit = statSync(join(dir, ".git"), { throwIfNoEntry: false });
+  if (dotGit?.isDirectory()) return commonDir(join(dir, ".git"));
+  if (dotGit?.isFile()) {
+    const pointer = /^gitdir: (.+)$/m.exec(readFileSync(join(dir, ".git"), "utf8"))?.[1]?.trim();
+    return pointer ? commonDir(resolve(dir, pointer)) : undefined;
+  }
+  return isBareGitDir(dir) ? commonDir(dir) : undefined;
 }
 
-const isGitDir = (dir: string) => existsSync(join(dir, "HEAD")) && existsSync(join(dir, "objects"));
+function isBareGitDir(dir: string): boolean {
+  const entry = (name: string) => statSync(join(dir, name), { throwIfNoEntry: false });
+  return Boolean(entry("HEAD")?.isFile() && entry("objects")?.isDirectory() && entry("refs")?.isDirectory());
+}
 
 /** A linked worktree's git directory names the shared one in its `commondir` file. */
 function commonDir(gitDir: string): string {

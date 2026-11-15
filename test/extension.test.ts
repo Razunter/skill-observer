@@ -5820,6 +5820,32 @@ describe("observations", () => {
     expect(observationLines(await recordThenObserve(OBSERVATION, join(root, "bare-linked"), join(root, "bare.git")))).toHaveLength(1);
   });
 
+  it("identifies a checkout holding tracked HEAD and objects paths by its git directory, shared with its linked worktree", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "skill-observer-git-")));
+    const main = join(root, "main");
+    mkdirSync(join(main, "objects"), { recursive: true });
+    writeFileSync(join(main, "HEAD"), "not a ref\n");
+    writeFileSync(join(main, "objects", "keep"), "");
+    git(main, "init", "-q", "-b", "main");
+    git(main, "add", ".");
+    git(main, "commit", "-q", "-m", "init");
+    git(main, "worktree", "add", "-q", join(root, "linked"));
+    expect(observationLines(await recordThenObserve(OBSERVATION, main, join(root, "linked")))).toHaveLength(1);
+  });
+
+  it("keeps a text recorded again while /observe assembles its payload pending for the next pass", async () => {
+    const first = loadExtension();
+    expect((await first.callTool("observe", { text: OBSERVATION })).isError).toBeFalsy();
+    const second = loadExtension({ skillHome: first.skillHome });
+    second.setBranch(fx.plainUserMessage);
+    const pass = second.runCommand("observe");
+    expect((await first.callTool("observe", { text: OBSERVATION })).isError).toBeFalsy();
+    await pass;
+    expect(observationLines(second)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${today()})`]);
+    await second.runCommand("observe");
+    expect(observationLines(second)).toEqual([`- ${OBSERVATION} (count 2, last recorded ${today()})`]);
+  });
+
   it("keeps another project's observations out, and outside git identifies a project by the working directory's real path", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "skill-observer-plain-")));
     for (const dir of ["one", "two"]) mkdirSync(join(root, dir));
