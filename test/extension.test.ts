@@ -2898,6 +2898,21 @@ describe("observer hook and companion intents", () => {
       expect(failures(prepared)).toEqual([expect.stringContaining(reason)]);
     });
 
+    it("refuses recording a removal once a folder above the hook leads out of the hooks directory", async () => {
+      const host = loadExtension();
+      const hooks = join(agentDir(host), "hooks/pre");
+      mkdirSync(join(hooks, "sub"), { recursive: true });
+      writeFileSync(join(hooks, "sub/hook.ts"), handText);
+      const { approval } = await askIntent(host, removal("global-hooks", "sub/hook.ts"));
+      const outside = join(host.skillHome.home, "outside");
+      mkdirSync(outside, { recursive: true });
+      rmSync(join(hooks, "sub"), { recursive: true });
+      symlinkSync(outside, join(hooks, "sub"));
+      const result = await resolve(host, [removed(approval)]);
+      expect(failures(result)).toEqual([expect.stringContaining("escapes its root")]);
+      expect(existsSync(host.ledgerFile)).toBe(false);
+    });
+
     it("records an approved removal only once the file is gone, and a hand-written hook's without a prior applied record", async () => {
       const host = loadExtension();
       const file = handWritten(host, "global-hooks");

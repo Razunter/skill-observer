@@ -96,8 +96,8 @@ export type PreparedChange =
   | { operation: "harness"; stage: "intent" }
   /** Approve the exact code: `root` is the target root's directory; the pass writes the files with normal tools and the resolver only records them. */
   | { operation: "harness"; stage: "code"; root: string; files: HarnessFile[]; check: HarnessCheck }
-  /** Delete the hook `file`: the pass deletes it with its own tools and the resolver records the removal once it is gone. */
-  | { operation: "harness"; stage: "removal"; file: string }
+  /** Delete the hook `file` in its hooks directory `root`: the pass deletes it with its own tools and the resolver records the removal once it is gone. */
+  | { operation: "harness"; stage: "removal"; root: string; file: string }
   /** `record`: the amendment already holds the section verbatim, so publication writes nothing and only the ledger changes. */
   | { operation: "on-read-append"; effect: "create" | "append" | "record"; rule: RuleIdentity; target: FileSnapshot; section: string }
   /** Samples stay in the form the scope sees, as `observer_check` and `observer_resolve` take them. */
@@ -740,18 +740,19 @@ function hookRemoval(target: HarnessTarget, { cwd, agentDir }: PrepareContext): 
   if (target.root === "companion") throw new Error("only a hook file is removed this way, not the companion extension");
   const hook = harnessFingerprint(target);
   const path = hookPath(target, hook);
-  return { target: { ...target, path }, fingerprint: removalFingerprint(hookFileKey(target, hook)!), file: join(harnessRootDirs(cwd, agentDir)[target.root], path) };
+  const root = harnessRootDirs(cwd, agentDir)[target.root];
+  return { target: { ...target, path }, fingerprint: removalFingerprint(hookFileKey(target, hook)!), root, file: join(root, path) };
 }
-interface HookRemoval { target: HarnessTarget; fingerprint: string; file: string }
+interface HookRemoval { target: HarnessTarget; fingerprint: string; root: string; file: string }
 
 /** The removal's preview is the file as it stands; deleting writes nothing, so a carriage return the form hides changes nothing approved. */
-function removalStage({ target, file }: HookRemoval): { change: Extract<PreparedChange, { stage: "removal" }>; preview: string } {
+function removalStage({ target, root, file }: HookRemoval): { change: Extract<PreparedChange, { stage: "removal" }>; preview: string } {
   if (!existsSync(file)) throw new Error(`there is no hook file \`${file}\` to remove`);
   const preview = [
     `Delete the ${HARNESS_ROOT_NAMES[target.root]} \`${file}\`, which holds:`, "", readFileSync(file, "utf8"), "",
     "Apply lets the agent delete this file; the removal is recorded once it is gone. A removed hook stops acting only after omp restarts.",
   ].join("\n");
-  return { change: { operation: "harness", stage: "removal", file }, preview };
+  return { change: { operation: "harness", stage: "removal", root, file }, preview };
 }
 
 const isRemoval = (change: PreparedChange) => change.operation === "harness" && change.stage === "removal";

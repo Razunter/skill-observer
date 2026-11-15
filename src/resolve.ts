@@ -15,6 +15,7 @@
  */
 
 import { existsSync } from "node:fs";
+import { relative } from "node:path";
 import { isPinKind, type RuleDirs } from "./amendments.js";
 import {
   ANSWER_OUTCOMES,
@@ -24,6 +25,7 @@ import {
   type Recording,
   type Evidence,
   type LedgerRecord,
+  canonicalPathIn,
   canonicalProjectTarget,
   projectFingerprint,
   type ProjectTarget,
@@ -178,7 +180,7 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
     }
     const { proposal, change, answeredAt } = approvedHarness(answer.approval, ["code", "removal"], branch);
     const identity = harnessIdentity(proposal);
-    if (change.stage === "removal") return removalRecords(identity, change.file, ledger, timestamp, sessionId);
+    if (change.stage === "removal") return removalRecords(identity, change, ledger, timestamp, sessionId);
     checkHarnessPublication(change, answer.publication, cwd, branch, identity.target.root === "companion", answeredAt);
     return [{ ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId }];
   }
@@ -203,7 +205,10 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
  * it: as a withdrawal of every record that holds a hook at that file in force,
  * or, for a hook no pass recorded, under the removal's own identity.
  */
-function removalRecords(removal: HarnessIdentity, file: string, ledger: readonly LedgerRecord[], timestamp: string, sessionId: string): HarnessLedgerRecord[] {
+function removalRecords(removal: HarnessIdentity, { root, file }: { root: string; file: string }, ledger: readonly LedgerRecord[], timestamp: string, sessionId: string): HarnessLedgerRecord[] {
+  // A folder replaced by a symlink since Prepare would let another file's absence pass for this hook's.
+  const path = relative(root, file);
+  if (canonicalPathIn(root, path, `\`${file}\``) !== path) throw new Error(`\`${file}\` now resolves to another file in its hooks directory than the one the user approved removing`);
   if (existsSync(file)) throw new Error(`\`${file}\` is still there: after the user's Apply, delete it with your own tools, then record its removal; this tool deletes nothing`);
   const at = hookFileKey(removal.target, removal.fingerprint);
   const inForce = ledger.filter((record): record is HarnessLedgerRecord =>
