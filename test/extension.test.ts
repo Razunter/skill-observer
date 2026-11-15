@@ -2591,6 +2591,31 @@ describe("observer hook and companion intents", () => {
     });
 
     it.each([
+      ["its code prepared and asked again", "code", true],
+      ["its code asked again", "code", false],
+      ["its intent prepared and asked again", "intent", true],
+    ] as const)("refuses an Apply the user answered again later in the pass, %s, with Decline", async (_label, stage, reprepared) => {
+      const host = loadExtension();
+      const candidate = intent("global-hooks", "Block git commit everywhere");
+      const { proposal, approval: intentApproval } = await askIntent(host, candidate);
+      const file = `skill-observer-${proposal.fingerprint}.ts`;
+      const codeCandidate = code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]);
+      if (stage === "intent") {
+        await askCode(host, candidate, () => "Decline");
+        const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [codeCandidate] });
+        expect(failures(prepared)).toEqual([expect.stringContaining("superseded")]);
+        return;
+      }
+      const { entry, approval } = await askCode(host, codeCandidate);
+      if (reprepared) await askCode(host, codeCandidate, () => "Decline");
+      else askUser(host, await host.callTool("observer_review", { action: "select", proposals: [entry.reference] }), () => "Decline");
+      const hooks = join(agentDir(host), "hooks/pre");
+      const result = await resolve(host, [applied(approval, { ...publish(host, join(hooks, file), hookText, hooks), files: [{ path: file, afterHash: sha(hookText) }] })]);
+      expect(failures(result)).toEqual([expect.stringContaining("superseded")]);
+      expect(existsSync(host.ledgerFile)).toBe(false);
+    });
+
+    it.each([
       ["no publication", "needs `publication`"], ["no write", "no observed write"], ["a write of another file", "no observed write"],
       ["a check before the write", "after its write"], ["a check in another directory", "in the target root"], ["a failed check", "no successful observed tool call"],
       ["a missing file hash", "afterHash"],

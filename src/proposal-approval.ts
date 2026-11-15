@@ -282,11 +282,14 @@ function approvedProposal<C>(ref: ProposalAnswerRef, evidence: SessionToolEviden
  * The observer hook or companion proposal the user answered Apply at one of
  * `stages` in this pass, established from the saved Ask answer like any approval. An
  * approval note on this scope is custom input: the description or code is
- * revised by it and asked again, so a noted Apply approves nothing.
+ * revised by it and asked again, so a noted Apply approves nothing. A later
+ * Prepare or answer of the same stage and identity supersedes the Apply.
  */
 export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<ProposalAnswerRef> | undefined, stages: readonly S[], branch: readonly SessionEntry[]):
   { proposal: PreparedProposal; change: Extract<HarnessChange, { stage: S }> } {
-  const { proposal, change, note } = approvedProposal(answerRef(ref), sessionToolEvidence(branch), branch, (prepared) => {
+  const approval = answerRef(ref);
+  const evidence = sessionToolEvidence(branch);
+  const { proposal, change, note, answeredAt } = approvedProposal(approval, evidence, branch, (prepared) => {
     const change = "change" in prepared ? prepared.change : undefined;
     if (change?.operation !== "harness" || !(stages as readonly string[]).includes(change.stage)) {
       throw new Error(`the approved proposal is no hook or companion ${stages.join(" or ")}${stages.includes("code" as S) ? ": an intent Apply authorises drafting only" : ""}`);
@@ -296,7 +299,25 @@ export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<P
   if (note !== undefined) {
     throw new Error(`the user chose Apply with the note ${JSON.stringify(note)}, which approves nothing for a hook or companion change: revise it by the note, prepare it and ask again`);
   }
+  const { candidateId, reviewToolCallId } = approval.proposal;
+  const isReprepared = latestPrepared(candidateId, evidence)?.reviewToolCallId !== reviewToolCallId;
+  const isReasked = evidence.completedCalls("ask").some(({ result }) => result.position > answeredAt &&
+    Array.isArray(result.details?.answers) && result.details.answers.some((answer: { name?: unknown } | undefined) => answer?.name === candidateId));
+  if (isReprepared || isReasked) {
+    throw new Error("this Apply is superseded: a later Prepare or Ask of this pass holds the same proposal again; cite the user's latest answer, which must be an unnoted Apply");
+  }
   return { proposal, change };
+}
+
+/** The reference that the branch's last successful Prepare holding `candidateId` returned for it; that Prepare may be native or nested. */
+export function latestPrepared(candidateId: string, evidence: SessionToolEvidence): PreparedProposalRef | undefined {
+  let latest: PreparedProposalRef | undefined;
+  for (const { call, result } of evidence.completedCalls(REVIEW_TOOL_NAME)) {
+    if (call.args.action !== "prepare" || result.isError !== false) continue;
+    const eligible = (result.details as { eligible?: PreparedEntry[] } | undefined)?.eligible ?? [];
+    latest = eligible.find(({ reference }) => reference?.candidateId === candidateId && reference.reviewToolCallId === result.id)?.reference ?? latest;
+  }
+  return latest;
 }
 
 /**

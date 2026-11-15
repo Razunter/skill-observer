@@ -51,9 +51,9 @@ import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
 import { checkHarnessPublication, checkProjectPublication } from "./project-publication.js";
-import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedHarness, laterNote, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
+import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedHarness, laterNote, latestPrepared, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
 import { type ToolResultCondition, whatToDoNow } from "./payload.js";
-import { isProposalRef, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, proposalRefSchema, REVIEW_TOOL_NAME } from "./review.js";
+import { isProposalRef, type PreparedProposal, type PreparedProposalRef, proposalRefSchema } from "./review.js";
 import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 
 export const RESOLVE_TOOL_NAME = "observer_resolve";
@@ -550,15 +550,4 @@ function requireLatestReference(ref: PreparedProposalRef, evidence: SessionToolE
   if (newer !== undefined && newer.reviewToolCallId !== ref.reviewToolCallId) {
     throw new Error(`a later Prepare of this pass holds this proposal again: cite its reference ${JSON.stringify(newer)}`);
   }
-}
-
-/** The reference that the branch's last successful Prepare holding `candidateId` returned for it; that Prepare may be native or nested. */
-function latestPrepared(candidateId: string, evidence: SessionToolEvidence): PreparedProposalRef | undefined {
-  let latest: PreparedProposalRef | undefined;
-  for (const { call, result } of evidence.completedCalls(REVIEW_TOOL_NAME)) {
-    if (call.args.action !== "prepare" || result.isError !== false) continue;
-    const eligible = (result.details as { eligible?: PreparedEntry[] } | undefined)?.eligible ?? [];
-    latest = eligible.find(({ reference }) => reference?.candidateId === candidateId && reference.reviewToolCallId === result.id)?.reference ?? latest;
-  }
-  return latest;
 }
