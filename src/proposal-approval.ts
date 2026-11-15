@@ -293,7 +293,7 @@ export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<P
   const { proposal, change, note, answeredAt } = approvedProposal(approval, evidence, branch, (prepared) => {
     const change = "change" in prepared ? prepared.change : undefined;
     if (change?.operation !== "harness" || !(stages as readonly string[]).includes(change.stage)) {
-      throw new Error(`the approved proposal is no hook or companion ${stages.join(" or ")}${stages.includes("code" as S) ? ": an intent Apply authorises drafting only" : ""}`);
+      throw new Error(`the approved proposal is not a hook or companion ${stages.join(" or ")}${stages.includes("code" as S) ? ": an intent Apply authorises drafting only" : ""}`);
     }
     return new Map([[APPLY, change as Extract<HarnessChange, { stage: S }>]]);
   });

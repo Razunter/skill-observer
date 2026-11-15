@@ -191,9 +191,9 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
     z.object({
       operation: z.enum(["harness"]), stage: z.enum(["intent"]),
       event: z.string().describe("The host event the hook handles, such as `tool_call` for one tool."),
-      predicate: z.string().describe("What in the event marks the mistake."), action: z.string().describe("What the hook does then: block, add context, or change the call."),
+      predicate: z.string().describe("What in the event marks the mistake."), action: z.string().describe("What the hook does then: block the call or add context; only the companion may change a call or its result."),
       mistake: z.string().describe("The session's mistake as a sample event."), legitimate: z.string().describe("Its nearest legitimate counterpart, which the hook leaves untouched."),
-      scope: z.string().describe("Why this project's hooks, or why the global hooks for a mistake that generalises."),
+      scope: z.string().describe("Why this project's hooks, the global hooks for a mistake that generalises, or the companion."),
       lowerRungs: z.string().describe("Why a configuration repair, skill text, barrier rule, pattern amendment, project check or, for the companion, a hook does not fit."),
     }).describe("An observer hook or companion-extension change at its intent stage: the described remedy, previewed and asked before any code is drafted. Apply authorises drafting only."),
     z.object({

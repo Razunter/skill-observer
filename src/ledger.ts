@@ -186,7 +186,7 @@ export function canonicalProjectTarget(cwd: string, target: ProjectTarget): Proj
   return { scope: "project", root, path, mechanism: target.mechanism.trim() };
 }
 
-/** The harness target as identity takes it: its root kind, the current project for a project hook, and a path that stays in its root. */
+/** The harness target in the form its identity hashes: its root kind, the current project for a project hook, and a path that stays in its root. */
 export function canonicalHarnessTarget(cwd: string, agentDir: string, target: HarnessTarget): HarnessTarget {
   if (!target || target.scope !== "harness" || !HARNESS_ROOTS.includes(target.root) || typeof target.mechanism !== "string" || !target.mechanism.trim()) {
     throw new Error(`a harness target needs a root (${HARNESS_ROOTS.join(", ")}) and a mechanism`);
@@ -206,7 +206,7 @@ export function canonicalHarnessTarget(cwd: string, agentDir: string, target: Ha
   return path !== undefined && path === hookFileName(harnessFingerprint({ ...canonical, path: undefined })) ? { scope: "harness", ...named } : canonical;
 }
 
-/** `path` canonical and relative to `root`: a plain root-relative file path, through no symlink out of the root. */
+/** `path` canonical and relative to `root`; throws unless it is a plain root-relative file path that no symlink leads out of the root. */
 export function canonicalPathIn(root: string, path: string, label: string): string {
   if (typeof path !== "string" || !path || isAbsolute(path) || path.includes("\\") || path.includes("\0") ||
       path.split("/").some((part) => !part || part === "." || part === "..")) throw new Error(`${label} must be a plain root-relative file path`);

@@ -14,7 +14,7 @@ Read every signal and correction, including when a skill was loaded. Keep each f
 
 **Remedy ladder.** Rank by cost, not owner: configuration or wiring repair, text or skill edit, amendment, barrier rule, pattern amendment, project check; last resorts: observer hook, then companion extension. Before proposing either, read the procedure file named below. A tool rightly rejecting misuse stays unchanged. A supplier label names a tool's supplier, not the cause; also weigh caller error, configuration, another extension's interception, unknown. Read owners' docs or source only where evidence points.
 
-**Report items.** A finding no proposal kind fits, a capability no rung provides, or a fix in behavioural code of any extension but the companion, even under the project root, is a report item, never an edit. Give owner; request and result; expected behaviour with source or "undocumented"; cause: confirmed, suspected or unknown; a scenario proving the fix, with legitimate counterpart; next action. New-extension ideas: needed surface, state owner, benefit, risks. Missing parts read "unknown". Not stored.
+**Report items.** A finding no proposal kind fits, a capability no rung provides, or a fix in behavioural code of any extension but the companion, even under the project root, is a report item, never an edit. Give owner; request and result; expected behaviour with source or "undocumented"; cause: confirmed, suspected or unknown; a scenario proving the fix, with legitimate counterpart; next action. Missing capability: needed API, state owner, benefit, risks. Missing parts read "unknown". Not stored.
 
 <!-- when: project -->
 For the retrospective branch, use the reference inlined under **Retrospective reference** when available.

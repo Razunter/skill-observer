@@ -11,7 +11,7 @@ This is the procedure for the last two rungs of the remedy ladder. The payload n
 
 ## Scope and target
 
-A candidate of these rungs has `kind: "harness"`, no skill name, and `target: { scope: "harness", root, mechanism }`. Its `mechanism` names the mechanism in words with letters or digits.
+A candidate of these rungs has `kind: "harness"`, no skill name, and `target: { scope: "harness", root, mechanism }`. Its `mechanism` describes the mechanism in words and must contain letters or digits.
 
 - `root: "project-hooks"` fixes a mistake specific to this project. A project candidate whose path lies in the project's hooks directory is refused: propose that file here, as a project hook.
 - `root: "global-hooks"` runs in every project. Use it only when the mistake passes the skill-scope test: it would hold in another project and another task.
@@ -80,7 +80,7 @@ After the code's Apply, write each approved file with the normal `write` tool at
 
 Send one `observer_resolve` outcome per identity, with `kind: "harness"`, in the pass's one resolve call:
 
-- `applied`, for published code: `approval` of the code's Apply (its reference, Select and Ask call IDs) and `publication: { writeToolCallIds, checkToolCallIds, files: [{ path, afterHash }] }`. Cite the actual `observerToolCallId` of each write and check. The resolver refuses the outcome unless each approved file has an observed write after the code's Apply, still holds its approved text, and its stated hash is the hash of that text, and unless each check ran the approved command and succeeded in the foreground in the target root after the writes. It writes no file. An intent's Apply never makes `applied`.
+- `applied`, for published code: `approval` of the code's Apply (its reference, Select and Ask call IDs) and `publication: { writeToolCallIds, checkToolCallIds, files: [{ path, afterHash }] }`. Cite the actual `observerToolCallId` of each write and check. The resolver refuses the outcome unless each approved file has an observed write after the code's Apply, still holds its approved text, and has a stated hash equal to the hash of that text. It also refuses it unless each check ran the approved command and succeeded in the foreground in the target root after the writes. It writes no file. An intent's Apply never makes `applied`.
 - `declined`, when the user declined either stage: `proposal`, the reference of the proposal declined.
 - `later`, when the user answered Later at either stage, when drafting or its check failed, or when the code was never asked: `proposal`, the reference of the latest proposal of this identity, from the pass's latest Prepare that holds it. Give a `reoffer` for each `later` you record yourself. A code Later comes back as an intent question; the resolver notes that a draft existed.
 

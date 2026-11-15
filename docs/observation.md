@@ -121,7 +121,7 @@ For an approved project check repair, the model publishes the exact reviewed dif
 The pass ranks remedies by cost, cheapest first, not by who owns the failing component:
 
 1. A configuration or wiring repair, a text or skill edit, an amendment, a barrier rule, a pattern amendment or a project check: the remedies above and in [Amendments](amendments.md).
-2. An [observer hook](#observer-hooks-and-the-companion-extension): one hook file in the project's hooks directory or in yours.
+2. An [observer hook](#observer-hooks-and-the-companion-extension): one hook file in the project's hooks directory or in your global hooks directory.
 3. The [companion extension](#observer-hooks-and-the-companion-extension): the one user-level extension the pass may edit, for a remedy that needs a registered tool, several modules or a dependency.
 
 Rungs 2 and 3 are last resorts. When the needed capability exists but is off or misconfigured, the pass proposes the configuration repair. A tool that rightly rejected a misuse stays unchanged; the misuse gets the cheapest fitting remedy on the agent's side. The pass reads an owner's documentation or source only for components the evidence touches.
@@ -132,7 +132,7 @@ A report item is a finding the pass tells you about in its summary instead of as
 
 - an evidenced finding no proposal kind fits, a checked observation included;
 - a capability no rung can provide. The item names the event or tool it would need, who would own its state, the benefit and the risks;
-- a fix in the behavioural code of any extension other than the companion extension, wherever that code lives, under the project root included. Configuration and check wiring of such an extension stay ordinary proposals.
+- a fix in the behavioural code of any extension other than the companion extension, wherever that code lives, even under the project root. Configuration and check wiring of such an extension stay ordinary proposals.
 
 Each item gives the supplier or owner, what was requested and what resulted, the expected behaviour with its source or "undocumented", the cause status (confirmed, suspected or unknown), a scenario that would show the fix with its legitimate counterpart, and a next action. A part the evidence does not settle reads "unknown". A failed tool call is not presented as a confirmed extension defect.
 
@@ -161,7 +161,7 @@ A new or changed hook and every companion change take two approvals:
 1. **Intent.** The form shows the target, the event, the predicate, the action, the mistake sample, the legitimate sample, the scope, and why each cheaper remedy does not fit. It is one question of the main batch. Apply authorises drafting only.
 2. **Code.** A subagent drafts the code and a samples file in a temporary directory, never in the target, and runs the check. Without a subagent tool, the main agent drafts the same way. The form shows each file's exact text, the check command and its unedited output. This question gets its own Select and Ask, apart from every other question.
 
-Nothing is written before the code Apply. A note on either Apply is asked again: the main agent revises the description or the code by your note, reruns the check for code, and asks again. Only your latest answer at a stage counts: a later Prepare or Ask of the same proposal supersedes an earlier Apply. A hook's check command names the hook by its path in the hooks directory, so the command the form shows is the one rerun on the written file. After the code Apply, the main agent writes each file with the `write` tool and reruns that command in the foreground, with the target's directory as working directory. `observer_resolve` records the change as applied only when the session holds those write calls after your Apply, runs of the approved command after them, and each file holds its approved text. It never writes these files itself.
+Nothing is written before the code Apply. An Apply with a note, at either stage, approves nothing: the main agent revises the description or the code by your note, reruns the check for code, and asks again. Only your latest answer at a stage counts: a later Prepare or Ask of the same proposal supersedes an earlier Apply. A hook's check command names the hook by its path in the hooks directory, so the command the form shows is the one rerun on the written file. After the code Apply, the main agent writes each file with the `write` tool and reruns that command in the foreground, with the target's directory as working directory. `observer_resolve` records the change as applied only when the session holds those write calls after your Apply, runs of the approved command after them, and each file holds its approved text. It never writes these files itself.
 
 The ledger gets one record per hook or companion identity, at the end of the pass. It is `applied` when the code was approved and published, `declined` when either stage was declined, and `later` when either stage was answered Later, drafting or its check failed, or the code was never asked. A Later comes back as an intent question, and its re-offer condition says a draft existed. A record holds no file text, description or draft. A project hook's records show only in its project; global hook and companion records show in every project. Remedy outcomes count exercises after a record's timestamp, as for a project fix.
 
@@ -169,7 +169,7 @@ A project proposal whose file lies in either hooks directory or the companion di
 
 ### Removal
 
-Removing a hook takes one approval. The form shows the file as it stands, with Apply and Decline. On Apply the agent deletes the file with its own tools. `observer_resolve` records the removal only once the file is gone and its path still leads to the same place inside the hooks directory, as a withdrawal of the hook's applied record when the ledger holds one. The companion extension is not removed this way.
+Removing a hook takes one approval. The form shows the file as it stands, with Apply and Decline. On Apply the agent deletes the file with its own tools. `observer_resolve` records the removal only once the file is gone and its path still resolves to the same file inside the hooks directory. When the ledger holds an applied record of the hook, the removal is recorded as its withdrawal. The companion extension is not removed this way.
 
 ### The check
 
@@ -189,7 +189,7 @@ A written, changed or deleted hook or companion file takes effect only after you
 
 ### Risks and manual removal
 
-Hook and companion code runs inside the omp process, with your permissions, without a sandbox, permission model or automatic disable. A `tool_call` handler that throws or times out blocks the call. A faulty observer hook can therefore block the tools a pass needs to remove it. Then delete the file by hand and restart omp:
+Hook and companion code runs inside the omp process, with your permissions, without a sandbox, permission model or automatic disable. A `tool_call` handler that throws or times out blocks the call. A faulty observer hook can therefore block the tools a pass needs to remove it. If that happens, delete the file by hand and restart omp:
 
 - a project hook: `<project>/.omp/hooks/pre/skill-observer-<fingerprint>.ts`;
 - a global hook: `<agent dir>/hooks/pre/skill-observer-<fingerprint>.ts`;
