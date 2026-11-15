@@ -1,6 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -2932,6 +2932,21 @@ describe("observer hook and companion intents", () => {
       symlinkSync(outside, join(hooks, "sub"));
       const result = await resolve(host, [removed(approval)]);
       expect(failures(result)).toEqual([expect.stringContaining("escapes its root")]);
+      expect(existsSync(host.ledgerFile)).toBe(false);
+    });
+
+    it("refuses recording a removal once its hooks directory leads somewhere other than where Prepare found it", async () => {
+      const host = loadExtension();
+      const hooks = join(agentDir(host), "hooks/pre");
+      mkdirSync(hooks, { recursive: true });
+      writeFileSync(join(hooks, "hook.ts"), handText);
+      const { approval } = await askIntent(host, removal("global-hooks", "hook.ts"));
+      const outside = join(host.skillHome.home, "outside");
+      mkdirSync(outside, { recursive: true });
+      renameSync(hooks, join(host.skillHome.home, "moved-pre"));
+      symlinkSync(outside, hooks);
+      const result = await resolve(host, [removed(approval)]);
+      expect(failures(result)).toEqual([expect.stringContaining("no longer resolves")]);
       expect(existsSync(host.ledgerFile)).toBe(false);
     });
 

@@ -218,7 +218,8 @@ export function canonicalPathIn(root: string, path: string, label: string): stri
   return canonical;
 }
 
-function canonicalMissingPath(path: string): string {
+/** `path` through its symlinks, its missing tail kept as written. */
+export function canonicalMissingPath(path: string): string {
   try {
     lstatSync(path);
     return realpathSync(path);

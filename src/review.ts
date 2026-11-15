@@ -17,7 +17,7 @@ import {
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
-  canonicalHarnessTarget, canonicalPathIn, canonicalProjectTarget, type Evidence, HARNESS_ROOT_NAMES, type HarnessFile, harnessFingerprint, harnessRootDirs, hookFileKey, hookPath,
+  canonicalHarnessTarget, canonicalMissingPath, canonicalPathIn, canonicalProjectTarget, type Evidence, HARNESS_ROOT_NAMES, type HarnessFile, harnessFingerprint, harnessRootDirs, hookFileKey, hookPath,
   ledgerForProject, type LedgerRecord, projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind, removalFingerprint,
   proposalFingerprint, readLedger, targetLabel, type TargetScope,
 } from "./ledger.js";
@@ -741,7 +741,8 @@ function hookRemoval(target: HarnessTarget, { cwd, agentDir }: PrepareContext): 
   if (target.root === "companion") throw new Error("only a hook file is removed this way, not the companion extension");
   const hook = harnessFingerprint(target);
   const path = hookPath(target, hook);
-  const root = harnessRootDirs(cwd, agentDir)[target.root];
+  // Saved canonical, so the resolver can tell the hooks directory was swapped for a symlink elsewhere.
+  const root = canonicalMissingPath(harnessRootDirs(cwd, agentDir)[target.root]);
   return { target: { ...target, path }, fingerprint: removalFingerprint(hookFileKey(target, hook)!), root, file: join(root, path) };
 }
 interface HookRemoval { target: HarnessTarget; fingerprint: string; root: string; file: string }
