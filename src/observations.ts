@@ -22,10 +22,11 @@ const PENDING_MS = 30 * 86_400_000;
 
 /**
  * Records `text` for the project of `cwd`: a text whose key is pending counts
- * once more, any other starts at count 1. Throws when the text breaks a rule
- * or the append fails.
+ * once more, any other starts at count 1. Returns how many observations are
+ * now pending for the project. Throws when the text breaks a rule or the
+ * append fails.
  */
-export function recordObservation(file: string, cwd: string, text: string, now: Date): void {
+export function recordObservation(file: string, cwd: string, text: string, now: Date): number {
   const trimmed = text.trim();
   const length = [...trimmed].length;
   if (length === 0) throw new Error("the observation is empty");
@@ -33,9 +34,10 @@ export function recordObservation(file: string, cwd: string, text: string, now: 
   if (length > TEXT_LIMIT) throw new Error(`the observation is ${length} characters; the limit is ${TEXT_LIMIT}`);
   const project = projectIdentity(cwd);
   const key = observationKey(project, trimmed);
-  const latest = readObservations(file).find((row) => row.key === key);
-  const count = latest && isPending(latest, now) ? latest.count + 1 : 1;
-  appendRows(file, [{ key, project, text: trimmed, count, recordedAt: now.toISOString() }]);
+  const pending = readObservations(file).filter((row) => row.project === project && isPending(row, now));
+  const latest = pending.find((row) => row.key === key);
+  appendRows(file, [{ key, project, text: trimmed, count: latest ? latest.count + 1 : 1, recordedAt: now.toISOString() }]);
+  return latest ? pending.length : pending.length + 1;
 }
 
 /** The project's pending observations, oldest last recording first. */

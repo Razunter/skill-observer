@@ -65,7 +65,8 @@ const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ?
 
 /**
  * Shows a status-line hint while the current branch has correction-class skill
- * signals or a workflow outline; tool errors and skill loads alone stay quiet.
+ * signals or a workflow outline, or else while the project has pending
+ * observations; tool errors and skill loads alone stay quiet.
  */
 function refreshHint(_event: unknown, ctx: ExtensionContext): void {
   if (!isObservable(ctx)) return;
@@ -74,13 +75,23 @@ function refreshHint(_event: unknown, ctx: ExtensionContext): void {
     signals.filter(keep).reduce((total, signal) => total + signal.count, 0);
   const corrections = occurrences((signal) => signal.correction);
   const workflows = occurrences((signal) => signal.kind === "workflow");
+  let observations = 0;
+  if (corrections === 0 && workflows === 0) {
+    try {
+      observations = pendingObservations(observationsFile(), ctx.cwd, new Date()).length;
+    } catch (error) {
+      console.error("skill-observer: reading observations for the status hint failed:", error);
+    }
+  }
   ctx.ui.setStatus(
     STATUS_KEY,
     corrections > 0
       ? `${plural(corrections, "skill correction")} · /observe`
       : workflows > 0
         ? `${plural(workflows, "workflow")} without a skill · /observe`
-        : undefined,
+        : observations > 0
+          ? `${plural(observations, "pending observation")} · /observe`
+          : undefined,
   );
 }
 
@@ -250,12 +261,15 @@ export default function skillObserver(pi: ExtensionAPI): void {
     async execute(_toolCallId, { text }, _signal, _onUpdate, ctx) {
       // Only the agent the user talks to adds to the user's review queue.
       if (ctx.agent?.kind === "sub") return { content: [{ type: "text", text: "Nothing was recorded: only the main agent records observations." }], isError: true };
+      let pending: number;
       try {
-        recordObservation(observationsFile(), ctx.cwd, text, new Date());
+        pending = recordObservation(observationsFile(), ctx.cwd, text, new Date());
       } catch (error) {
         return { content: [{ type: "text", text: `Nothing was recorded: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
       }
-      return { content: [{ type: "text", text: "Observation recorded." }] };
+      return {
+        content: [{ type: "text", text: `Observation recorded. ${plural(pending, "observation")} ${pending === 1 ? "is" : "are"} pending for this project; the user's \`/observe\` reviews them.` }],
+      };
     },
   });
 
@@ -292,6 +306,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
       } catch (error) {
         ctx.ui.notify(`Observations not marked as shown: ${error instanceof Error ? error.message : String(error)}; the next /observe lists them again.`, "error");
       }
+      refreshHint(undefined, ctx);
       ctx.ui.notify(
         `Observation pass started: ${note ? "your note, " : ""}${digest.signals.length} signal(s), ${digest.skills.length} loaded skill(s), ${stale.length} stale amendment(s), ${observations.length} observation(s); payload ${describePayloadEstimate(payloadEstimate(payload.sections))}.`,
         "info",
@@ -307,17 +322,16 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const provenance = createProvenanceResolver(roots);
       const digest = buildDigest(ctx.sessionManager.getBranch(), { provenance });
       const stale = findStaleAmendments(ruleDirs(), provenance);
-      const report = evidenceReport({ digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale });
-      if (!isEmptyEvidenceReport(report)) {
-        try {
-          const observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
+      try {
+        const observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
+        const report = evidenceReport({ digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale, observations: observations.length });
+        if (!isEmptyEvidenceReport(report)) {
           report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, roots, provenance })).sections);
-        } catch (error) {
-          ctx.ui.notify(`Evidence report not shown: ${error instanceof Error ? error.message : String(error)}`, "error");
-          return;
         }
+        ctx.ui.notify(renderEvidenceReport(report), "info");
+      } catch (error) {
+        ctx.ui.notify(`Evidence report not shown: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
-      ctx.ui.notify(renderEvidenceReport(report), "info");
     },
   });
 }

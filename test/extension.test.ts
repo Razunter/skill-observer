@@ -5700,6 +5700,7 @@ describe("/observe-report", () => {
       "Stale amendments: dm-terms (domain-modeling)",
       expect.stringMatching(/^Payload estimate for \/observe now: ≈ \d+ tokens \(instructions \d+, digest \d+, .*stale \d+; chars\/4 estimate\)$/),
       "Later proposals: 1",
+      "Pending observations: 0",
     ]);
   });
 
@@ -5973,5 +5974,50 @@ describe("observations", () => {
     expect(content).not.toContain("## Retrospective reference");
     expect(content).not.toContain("Retro body.");
     expect(second.noticeEvents.filter(({ type }) => type !== "info")).toEqual([]);
+  });
+
+  it("hints at pending observations with /observe on a branch without corrections or workflows, and refreshes once /observe marks them shown", async () => {
+    const first = loadExtension();
+    first.setBranch(fx.plainUserMessage);
+    await first.callTool("observe", { text: OBSERVATION });
+    await first.callTool("observe", { text: "The pre-commit hook runs the native suite." });
+    await first.endTurn();
+    expect(first.statusTexts()).toEqual(["2 pending observations · /observe"]);
+    const second = loadExtension({ skillHome: first.skillHome });
+    second.setBranch(fx.plainUserMessage);
+    await second.emit("session_start");
+    expect(second.statusTexts()).toEqual(["2 pending observations · /observe"]);
+    await second.runCommand("observe");
+    expect(second.statusTexts()).toEqual([]);
+  });
+
+  it("keeps the correction hint ahead of pending observations", async () => {
+    const host = loadExtension();
+    host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
+    await host.callTool("observe", { text: OBSERVATION });
+    await host.endTurn();
+    expect(host.statusTexts()).toEqual(["1 skill correction · /observe"]);
+  });
+
+  it("counts pending observations in /observe-report, never their text, and marks none shown", async () => {
+    const first = loadExtension();
+    await first.callTool("observe", { text: OBSERVATION });
+    const second = loadExtension({ skillHome: first.skillHome });
+    second.setBranch(fx.plainUserMessage);
+    await second.runCommand("observe-report");
+    expect(second.noticeEvents).toEqual([{ message: expect.any(String), type: "info" }]);
+    const report = second.notices[0]!;
+    expect(report).toContain("\nPending observations: 1");
+    expect(report).toMatch(/\nPayload estimate for \/observe now: ≈ \d+ tokens \(.*observations \d+/);
+    expect(report).not.toContain("twelve entries");
+    await second.runCommand("observe");
+    expect(observationLines(second)).toHaveLength(1);
+  });
+
+  it("tells the agent the observation was recorded, the project's pending count and that /observe reviews them", async () => {
+    const host = loadExtension();
+    await host.callTool("observe", { text: OBSERVATION });
+    const result = await host.callTool("observe", { text: "The pre-commit hook runs the native suite." });
+    expect(resultText(result)).toBe("Observation recorded. 2 observations are pending for this project; the user's `/observe` reviews them.");
   });
 });

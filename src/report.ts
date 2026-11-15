@@ -25,17 +25,20 @@ export interface EvidenceReport {
   outcomes: Array<{ fingerprint: string; status: RemedyOutcome["status"]; target: string }>;
   stale: Array<{ rule: string; skill: string }>;
   later: number;
+  /** The project's pending observations, counted; their text stays out of the report. */
+  observations: number;
   /** The payload `/observe` would send now; absent on an empty report. */
   payload?: PayloadEstimate;
 }
 
 const STATUS_ORDER: readonly RemedyOutcome["status"][] = ["delivered", "exercised-clean", "recurrence", "inconclusive"];
 
-/** The report of `digest` with `ledger`, the proposal ledger already scoped to this project. */
-export function evidenceReport({ digest, ledger, stale }: {
+/** The report of `digest` with `ledger`, the proposal ledger already scoped to this project, and the project's pending observation count. */
+export function evidenceReport({ digest, ledger, stale, observations }: {
   digest: SessionDigest;
   ledger: readonly LedgerRecord[];
   stale: readonly ObserverRule[];
+  observations: number;
 }): EvidenceReport {
   const signals: Record<SignalKind, number> = {
     steering: 0, "rule-violation": 0, "ask-custom-input": 0, "ask-off-recommendation": 0, "tool-error": 0, workflow: 0,
@@ -55,13 +58,14 @@ export function evidenceReport({ digest, ledger, stale }: {
       .sort((a, b) => STATUS_ORDER.indexOf(a.status) - STATUS_ORDER.indexOf(b.status)),
     stale: stale.map((rule) => ({ rule: rule.name, skill: rule.amends })),
     later: ledger.filter((record) => record.outcome === "later" && !record.compaction).length,
+    observations,
   };
 }
 
-/** No signals, loaded skills, stale amendments or applied fixes: nothing `/observe` could review. */
+/** No signals, loaded skills, stale amendments, applied fixes or pending observations: nothing `/observe` could review. */
 export function isEmptyEvidenceReport(report: EvidenceReport): boolean {
   return Object.values(report.signals).every((count) => count === 0) &&
-    report.skills.length === 0 && report.stale.length === 0 && report.outcomes.length === 0;
+    report.skills.length === 0 && report.stale.length === 0 && report.outcomes.length === 0 && report.observations === 0;
 }
 
 export function renderEvidenceReport(report: EvidenceReport): string {
@@ -82,5 +86,6 @@ export function renderEvidenceReport(report: EvidenceReport): string {
     `Stale amendments: ${list(report.stale.map(({ rule, skill }) => `${rule} (${skill})`))}`,
     ...(report.payload ? [`Payload estimate for /observe now: ${describePayloadEstimate(report.payload)}`] : []),
     `Later proposals: ${report.later}`,
+    `Pending observations: ${report.observations}`,
   ].join("\n");
 }
