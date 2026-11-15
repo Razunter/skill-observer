@@ -10,14 +10,14 @@
  * form that shows the proposals it selected.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { basename, join, sep } from "node:path";
 import {
   compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, parseFrontmatter, readObserverRule, readOnReadAmendments,
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
-  canonicalHarnessTarget, canonicalProjectTarget, type Evidence, harnessFingerprint, harnessRootDirs, hookFileKey, hookFileName, ledgerForProject, type LedgerRecord,
+  canonicalHarnessTarget, canonicalPathIn, canonicalProjectTarget, type Evidence, harnessFingerprint, harnessRootDirs, hookFileKey, hookFileName, ledgerForProject, type LedgerRecord,
   projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind, removalFingerprint,
   proposalFingerprint, readLedger, targetLabel, type TargetScope,
 } from "./ledger.js";
@@ -25,6 +25,7 @@ import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from
 import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver } from "./provenance.js";
+import { BUN_TEST } from "./project-publication.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
 import { type PatternDraft, type Sample, sampleSchemas } from "./replay.js";
@@ -199,8 +200,8 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
     z.object({
       operation: z.enum(["harness"]), stage: z.enum(["code"]),
       intent: z.object(approvalShape(z)).describe("The user's Apply of this identity's intent in this pass, as observer_resolve would cite an approval."),
-      files: z.array(z.object({ path: z.string().describe("Relative to the target root: for a hook, its one file."), text: z.string().describe("The file's exact text, as written.") })),
-      check: z.object({ command: z.string(), output: z.string().describe("The check's observed output, unedited.") }),
+      files: z.array(z.object({ path: z.string().describe("Relative to the target root: for a hook, its one file; for the companion, every file the change writes, including `package.json` declaring `omp.extensions` when the companion is new."), text: z.string().describe("The file's exact text, as written.") })),
+      check: z.object({ command: z.string().describe("For the companion, `bun test`, run in the companion directory against its test file."), output: z.string().describe("The check's observed output, unedited.") }),
     }).describe("The drafted code of an approved intent, with the check it passed: shown and asked in a Select and Ask of its own; Apply approves writing exactly these files."),
     z.object({ operation: z.enum(["harness"]), stage: z.enum(["removal"]) })
       .describe("Deletes the hook file the target names, in either hooks directory, hand-written ones included: asked once, showing the file as it stands, with Apply and Decline. After Apply the pass deletes the file itself; observer_resolve records the removal once it is gone."),
@@ -656,30 +657,69 @@ function intentPreview(target: HarnessTarget, fingerprint: string, intent: Harne
 }
 
 /**
- * A hook's code stage, accepted only while the user's Apply of the intent with
- * the same identity holds in this pass: its one file's exact text, the check
- * the draft passed and its observed output, all shown in the preview.
+ * A hook's or companion change's code stage, accepted only while the user's
+ * Apply of the intent with the same identity holds in this pass: each file's
+ * exact text, the check the draft passed and its observed output, all shown
+ * in the preview.
  */
 function codeStage(target: HarnessTarget, fingerprint: string, draft: Extract<ChangeDraft, { stage: "code" }>, { cwd, agentDir, branch }: PrepareContext):
   { change: Extract<PreparedChange, { stage: "code" }>; preview: string } {
-  if (target.root === "companion") throw new Error("companion code is not prepared at the code stage: a companion change needs a test the code stage does not yet run");
   const { proposal: intent } = approvedHarness(draft.intent, ["intent"], branch);
   if (intent.fingerprint !== fingerprint) throw new Error(`the cited intent Apply approved another hook or companion change, \`${intent.fingerprint}\`, not \`${fingerprint}\``);
-  const file = target.path ?? hookFileName(fingerprint);
-  const [only, ...rest] = Array.isArray(draft.files) ? draft.files : [];
-  if (!only || rest.length > 0 || only.path !== file || typeof only.text !== "string" || !only.text.trim()) throw new Error(`a hook's code is its one file \`${file}\` with its exact text`);
+  const root = harnessRootDirs(cwd, agentDir)[target.root];
+  const isCompanion = target.root === "companion";
+  const files = isCompanion ? companionFiles(root, draft.files) : [hookFile(target.path ?? hookFileName(fingerprint), draft.files)];
   const { command, output } = draft.check ?? {};
   if (typeof command !== "string" || !command.trim() || typeof output !== "string") throw new Error("the code needs the check command it passed and that check's observed output");
-  const root = harnessRootDirs(cwd, agentDir)[target.root];
-  const files = [{ path: only.path, text: only.text }];
+  if (isCompanion && !BUN_TEST.test(command.trim())) throw new Error(`\`${command}\` is not the companion's check: run \`bun test\` in the companion directory`);
   const preview = [
     ...files.flatMap(({ path, text }) => [`${existsSync(join(root, path)) ? "Replace" : "Create"} \`${join(root, path)}\` with:`, "", text, ""]),
     `Check command: ${command}`, "Check result:", output, "",
-    `Apply writes this code and reruns the check in the foreground in \`${root}\`. A written hook acts only after omp restarts.`,
+    `Apply writes this code and reruns the check in the foreground in \`${root}\`. A written ${isCompanion ? "companion file" : "hook"} acts only after omp restarts.`,
   ].join("\n");
   // The Ask form collapses whitespace, so a carriage return would be written without ever being shown.
   if (preview.includes("\r")) throw new Error("the code or its check output holds a carriage return, which the Ask preview would not show; send it with `\\n` line ends only");
   return { change: { operation: "harness", stage: "code", root, files, check: { command, output } }, preview };
+}
+
+function hookFile(file: string, drafted: readonly HarnessFile[] | undefined): HarnessFile {
+  const [only, ...rest] = Array.isArray(drafted) ? drafted : [];
+  if (!only || rest.length > 0 || only.path !== file || typeof only.text !== "string" || !only.text.trim()) throw new Error(`a hook's code is its one file \`${file}\` with its exact text`);
+  return { path: only.path, text: only.text };
+}
+
+/**
+ * A companion change's files, each at a plain path inside the companion
+ * directory. Its manifest, written now or already there, declares the entries
+ * host discovery loads, and the change adds or keeps a test file outside
+ * `node_modules` for `bun test` to run.
+ */
+function companionFiles(root: string, drafted: readonly HarnessFile[] | undefined): HarnessFile[] {
+  if (!Array.isArray(drafted) || drafted.length === 0) throw new Error("a companion change's code is every file it writes, each with its path in the companion directory and its exact text");
+  const files = drafted.map(({ path, text }) => {
+    if (typeof text !== "string") throw new Error(`companion file \`${path}\` needs its exact text`);
+    return { path: canonicalPathIn(root, path, `companion file \`${path}\``), text };
+  });
+  if (new Set(files.map(({ path }) => path)).size < files.length) throw new Error("a companion change names each file once");
+  const manifestFile = join(root, "package.json");
+  const manifest = files.find(({ path }) => path === "package.json")?.text ?? (existsSync(manifestFile) ? readFileSync(manifestFile, "utf8") : undefined);
+  if (manifest === undefined) throw new Error("a new companion extension needs its `package.json`, declaring its entry files under `omp.extensions`");
+  if (!declaresEntries(manifest)) throw new Error("the companion's `package.json` must declare its entry files under `omp.extensions`: host discovery loads nothing else in the directory");
+  const kept = existsSync(root) ? readdirSync(root, { recursive: true, encoding: "utf8" }) : [];
+  const isTestFile = (path: string) => !path.split(sep).includes("node_modules") && /[._](test|spec)\.[cm]?[jt]sx?$/.test(path);
+  if (![...files.map(({ path }) => path), ...kept].some(isTestFile)) {
+    throw new Error("a companion change adds or keeps a test file, such as `index.test.ts`, outside `node_modules` for `bun test` to run");
+  }
+  return files;
+}
+
+function declaresEntries(manifest: string): boolean {
+  try {
+    const entries = JSON.parse(manifest)?.omp?.extensions;
+    return Array.isArray(entries) && entries.length > 0 && entries.every((entry) => typeof entry === "string");
+  } catch {
+    return false;
+  }
 }
 
 /**

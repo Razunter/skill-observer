@@ -188,12 +188,13 @@ export function canonicalHarnessTarget(cwd: string, agentDir: string, target: Ha
 }
 
 /** `path` canonical and relative to `root`: a plain root-relative file path, through no symlink out of the root. */
-function canonicalPathIn(root: string, path: string, label: string): string {
-  if (!path || isAbsolute(path) || path.includes("\\") || path.includes("\0") ||
+export function canonicalPathIn(root: string, path: string, label: string): string {
+  if (typeof path !== "string" || !path || isAbsolute(path) || path.includes("\\") || path.includes("\0") ||
       path.split("/").some((part) => !part || part === "." || part === "..")) throw new Error(`${label} must be a plain root-relative file path`);
-  const canonical = relative(root, canonicalMissingPath(join(root, path)));
+  const base = canonicalMissingPath(root);
+  const canonical = relative(base, canonicalMissingPath(join(base, path)));
   if (!canonical || canonical === ".." || canonical.startsWith(`..${sep}`) || isAbsolute(canonical)) throw new Error(`${label} escapes its root`);
-  const file = join(root, canonical);
+  const file = join(base, canonical);
   if (existsSync(file) && !statSync(file).isFile()) throw new Error(`${label} must name a file`);
   return canonical;
 }

@@ -50,7 +50,7 @@ import { createProvenanceResolver, defaultSkillRoots } from "./provenance.js";
 import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
-import { checkHarnessPublication, checkProjectPublication } from "./project-publication.js";
+import { BUN_TEST, checkHarnessPublication, checkProjectPublication } from "./project-publication.js";
 import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedHarness, laterNote, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
 import { type ToolResultCondition, whatToDoNow } from "./payload.js";
 import { isProposalRef, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, proposalRefSchema, REVIEW_TOOL_NAME } from "./review.js";
@@ -177,9 +177,10 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
       throw new Error("an applied hook or companion change cites the user's Apply of its code stage or removal through `approval`; an intent Apply authorises drafting only: record it as `later` until its code is approved");
     }
     const { proposal, change } = approvedHarness(answer.approval, ["code", "removal"], branch);
-    if (change.stage === "removal") return removalRecords(harnessIdentity(proposal), change.file, ledger, timestamp, sessionId);
-    checkHarnessPublication(change, answer.publication, cwd, branch);
-    return [{ ...harnessIdentity(proposal), outcome: "applied", publication: answer.publication!, timestamp, sessionId }];
+    const identity = harnessIdentity(proposal);
+    if (change.stage === "removal") return removalRecords(identity, change.file, ledger, timestamp, sessionId);
+    checkHarnessPublication(change, answer.publication, cwd, branch, identity.target.root === "companion" ? BUN_TEST : undefined);
+    return [{ ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId }];
   }
   if (!isProposalRef(answer.proposal) || answer.approval !== undefined) {
     throw new Error("a Later or Decline of a hook or companion change cites its prepared proposal through `proposal`, its `reference` exactly as Prepare returned it");

@@ -2678,6 +2678,131 @@ describe("observer hook and companion intents", () => {
     });
   });
 
+  describe("companion changes", () => {
+    const companionDir = (host: ReturnType<typeof loadExtension>) => join(agentDir(host), "extensions/skill-observer-companion");
+    const manifest = '{ "name": "skill-observer-companion", "omp": { "extensions": ["./index.ts"] } }\n';
+    const entry = "export default function (pi) {\n  pi.registerTool({ name: \"jj_status\" });\n}\n";
+    const testFile = "import { expect, it } from \"bun:test\";\nit(\"registers jj_status\", () => expect(1).toBe(1));\n";
+    const companionFiles = [{ path: "package.json", text: manifest }, { path: "index.ts", text: entry }, { path: "index.test.ts", text: testFile }];
+    const bunTest = { command: "bun test", output: "index.test.ts:\n(pass) registers jj_status\n\n 1 pass\n 0 fail" };
+    const companionCode = (approval: unknown, files: unknown[], checked = bunTest) => ({ ...code("companion", "Register a jj tool", approval, files), change: { operation: "harness", stage: "code", intent: approval, files, check: checked } });
+    /** Saves a native write of each file and then one check, as the pass publishes an approved companion change; writes the files too. */
+    const publishAll = (host: ReturnType<typeof loadExtension>, root: string, files: ReadonlyArray<{ path: string; text: string }>,
+      { command = "bun test", cwd = root, checkFirst = false, checkFails = false, async = false } = {}) => {
+      const n = host.getBranch().length;
+      const writes = files.flatMap(({ path, text }, i) => {
+        mkdirSync(dirname(join(root, path)), { recursive: true });
+        writeFileSync(join(root, path), text);
+        return [
+          { type: "message", id: `call-write-${n}-${i}`, message: { role: "assistant", content: [{ type: "toolCall", id: `write-${n}-${i}`, name: "write", arguments: { path: join(root, path), content: text } }] } },
+          { type: "message", id: `result-write-${n}-${i}`, message: { role: "toolResult", toolName: "write", toolCallId: `write-${n}-${i}`, isError: false, content: [{ type: "text", text: "Written" }] } },
+        ];
+      });
+      const run = [
+        { type: "message", id: `call-check-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `check-${n}`, name: "bash", arguments: { command, cwd, ...(async && { async: true }) } }] } },
+        { type: "message", id: `result-check-${n}`, message: { role: "toolResult", toolName: "bash", toolCallId: `check-${n}`, isError: checkFails, details: { exitCode: checkFails ? 1 : 0 }, content: [{ type: "text", text: bunTest.output }] } },
+      ];
+      host.getBranch().push(...(checkFirst ? [...run, ...writes] : [...writes, ...run]) as SessionEntry[]);
+      return { writeToolCallIds: files.map((_, i) => `write-${n}-${i}`), checkToolCallIds: [`check-${n}`], files: files.map(({ path, text }) => ({ path, afterHash: sha(text) })) };
+    };
+
+    it("shows every file and the bun test result in an Ask of its own, and the first applied change creates the directory and its manifest", async () => {
+      const host = loadExtension();
+      const { proposal, approval: intentApproval } = await askIntent(host, intent("companion", "Register a jj tool"));
+      const { selection, approval } = await askCode(host, companionCode(intentApproval, companionFiles));
+      const { askHtml } = JSON.parse(resultText(selection));
+      expect(askHtml).toContain("<legend>`skill-observer-companion` (companion extension): Register a jj tool</legend>");
+      for (const { path } of companionFiles) expect(askHtml).toContain(`Create \`${join(companionDir(host), path)}\` with:`);
+      expect(askHtml).toContain("pi.registerTool({ name: \"jj_status\" });");
+      expect(askHtml).toContain("it(\"registers jj_status\"");
+      expect(askHtml).toContain('"omp": { "extensions": ["./index.ts"] }');
+      expect(askHtml).toContain("Check command: bun test");
+      expect(askHtml).toContain("(pass) registers jj_status");
+      expect(existsSync(companionDir(host))).toBe(false);
+
+      const publication = publishAll(host, companionDir(host), companionFiles);
+      const result = await resolve(host, [applied(approval, publication)]);
+      expect(failures(result)).toEqual([]);
+      expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ kind: "harness", fingerprint: proposal.fingerprint, outcome: "applied", publication })]);
+      expect(readFileSync(host.ledgerFile, "utf8")).not.toContain("registerTool");
+    });
+
+    it("accepts a later change of one file that keeps the companion's manifest and test file", async () => {
+      const host = loadExtension();
+      for (const { path, text } of companionFiles) {
+        mkdirSync(companionDir(host), { recursive: true });
+        writeFileSync(join(companionDir(host), path), text);
+      }
+      const changed = [{ path: "index.ts", text: entry.replace("jj_status", "jj_log") }];
+      const { approval: intentApproval } = await askIntent(host, intent("companion", "Register a jj tool"));
+      const { selection, approval } = await askCode(host, companionCode(intentApproval, changed));
+      expect(JSON.parse(resultText(selection)).askHtml).toContain(`Replace \`${join(companionDir(host), "index.ts")}\` with:`);
+      expect(failures(await resolve(host, [applied(approval, publishAll(host, companionDir(host), changed))]))).toEqual([]);
+    });
+
+    it.each<[string, Array<{ path: string; text: string }>, typeof bunTest, string]>([
+      ["a file escaping the companion directory", [...companionFiles, { path: "../other/index.ts", text: entry }], bunTest, "plain root-relative"],
+      ["a file through a symlink out of the companion directory", [...companionFiles, { path: "out/index.ts", text: entry }], bunTest, "escapes its root"],
+      ["no test file, kept or added", companionFiles.filter(({ path }) => path !== "index.test.ts"), bunTest, "test file"],
+      ["a test file only under node_modules", [...companionFiles.filter(({ path }) => path !== "index.test.ts"), { path: "node_modules/dep/a.test.ts", text: testFile }], bunTest, "test file"],
+      ["no manifest in a new companion", companionFiles.filter(({ path }) => path !== "package.json"), bunTest, "package.json"],
+      ["a manifest declaring no entry", [{ path: "package.json", text: '{ "name": "skill-observer-companion" }' }, ...companionFiles.slice(1)], bunTest, "omp.extensions"],
+      ["a check other than bun test", companionFiles, { command: "bunx vitest run", output: "1 passed" }, "bun test"],
+    ])("refuses companion code with %s", async (_label, files, checked, reason) => {
+      const host = loadExtension();
+      mkdirSync(agentDir(host), { recursive: true });
+      if (files.some(({ path }) => path.startsWith("out/"))) {
+        mkdirSync(companionDir(host), { recursive: true });
+        symlinkSync(host.skillHome.home, join(companionDir(host), "out"));
+      }
+      const { approval } = await askIntent(host, intent("companion", "Register a jj tool"));
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [companionCode(approval, files, checked)] });
+      expect(prepared.isError).toBe(true);
+      expect(failures(prepared)).toEqual([expect.stringContaining(reason)]);
+    });
+
+    it.each([
+      ["a check other than bun test", { command: "bun run lint" }, "bun test"],
+      ["a check in another directory", { cwd: "elsewhere" }, "in the target root"],
+      ["a check before the writes", { checkFirst: true }, "after its write"],
+      ["a background check", { async: true }, "foreground"],
+      ["a failed check", { checkFails: true }, "no successful observed tool call"],
+      ["a written file differing from its approved text", { differs: true }, "index.test.ts"],
+      ["a file now lying outside the companion directory", { escapes: true }, "escapes its root"],
+    ] as const)("refuses an applied companion change with %s", async (_label, scenario, reason) => {
+      const host = loadExtension();
+      const files = [...companionFiles, { path: "lib/util.ts", text: "export const x = 1;\n" }];
+      const { approval: intentApproval } = await askIntent(host, intent("companion", "Register a jj tool"));
+      const { approval } = await askCode(host, companionCode(intentApproval, files));
+      const root = companionDir(host);
+      if ("escapes" in scenario) {
+        mkdirSync(root, { recursive: true });
+        mkdirSync(join(host.skillHome.home, "outside"), { recursive: true });
+        symlinkSync(join(host.skillHome.home, "outside"), join(root, "lib"));
+      }
+      const options = { ...scenario, ...("cwd" in scenario && { cwd: host.skillHome.roots.cwd }) };
+      const publication = publishAll(host, root, files, options);
+      if ("differs" in scenario) writeFileSync(join(root, "index.test.ts"), testFile.replace("toBe(1)", "toBe(2)"));
+      const result = await resolve(host, [applied(approval, publication)]);
+      expect(result.isError).toBe(true);
+      expect(failures(result)).toEqual([expect.stringContaining(reason)]);
+      expect(existsSync(host.ledgerFile)).toBe(false);
+    });
+
+    it("keeps declined and Later companion records in view in every project", async () => {
+      const host = loadExtension();
+      const declined = await asked(host, [intent("companion", "Register a jj tool")], () => "Decline");
+      expect(failures(await resolve(host, answered(declined, "declined")))).toEqual([]);
+      const later = await asked(host, [intent("companion", "Register a jj log tool")], () => ({ option: "Later", note: "After the jj migration." }));
+      expect(failures(await resolve(host, answered(later, "later")))).toEqual([]);
+      otherProject(host);
+      await host.runCommand("observe", "Review the companion");
+      expect(String(host.sent.at(-1)?.message.content)).toContain("Register a jj log tool Re-offer when: After the jj migration.");
+      const there = await host.callTool("observer_review", { action: "prepare", candidates: [intent("companion", "Register a jj tool"), intent("companion", "Register a jj log tool")] });
+      expect(reviewEntries(there).map(({ proposal }) => proposal.gist)).toEqual(["Register a jj log tool"]);
+    });
+  });
+
   describe("removing a hook", () => {
     const handText = "export default function (pi) {\n\tpi.on(\"tool_call\", () => ({ block: true }));\n}\n";
     const removal = (root: string, path: string | undefined, gist = "Remove the misfiring hook") => ({
