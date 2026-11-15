@@ -34,10 +34,10 @@ export function checkProjectPublication(target: ProjectTarget, publication: Proj
   }
 }
 
-/** Throws unless `command` is the companion's check, its own tests: `bun test` in the companion directory, with plain arguments only. */
+/** Throws unless `command` is the companion's check, its own tests: exactly `bun test` in the companion directory, since an argument could skip them (`--help`) or run code outside the approved files (`--preload`). */
 export function checkCompanionCommand(command: string): void {
-  const [bun, test] = plainWords(command);
-  if (bun !== "bun" || test !== "test") throw new Error(`\`${command}\` is not the companion's check: run \`bun test\` in the companion directory`);
+  const words = plainWords(command);
+  if (words.length !== 2 || words[0] !== "bun" || words[1] !== "test") throw new Error(`\`${command}\` is not the companion's check: run \`bun test\` in the companion directory`);
 }
 
 /** `command`'s words when each is plain or single-quoted and split by spaces or tabs, so the shell passes them on as they read: no expansion, redirection, line break or second command. */
