@@ -78,6 +78,7 @@ type ApprovedAnswer =
 
 /** The prepared changes an approval lets `observer_resolve` carry out. */
 export type ApprovedChange = Exclude<PreparedChange, { operation: "direct-edit" | "harness" }>;
+type HarnessChange = Extract<PreparedChange, { operation: "harness" }>;
 /** The approved changes a reconciliation may revise. */
 type ReconcilableChange = Extract<PreparedChange, { operation: "on-read-append" | "rule" }>;
 
@@ -164,7 +165,7 @@ export function approvalShape(z: SchemaBuilder): Record<keyof ProposalAnswerRef,
 export function approvedChange(answer: ApprovedAnswer, branch: readonly SessionEntry[]): { change: ApprovedChange; evidence: ApprovalEvidence } {
   const approval = answerRef(answer.approval);
   const evidence = sessionToolEvidence(branch);
-  const { proposal, change, selected, note, answeredAt } = approvedProposal(approval, evidence, branch);
+  const { proposal, change, selected, note, answeredAt } = approvedProposal(approval, evidence, branch, approvingOptions);
   checkCarriedOut(answer, proposal, change, selected);
   const { fingerprint } = proposal;
   if (note !== undefined && !isReconcilable(change)) {
@@ -232,7 +233,7 @@ export function checkReconciliation(
     throw new Error("a reconciliation states `reason` and `preserved`: why the revision, and why it keeps the approved intent and the target's unrelated content");
   }
   const approval = answerRef(claim?.approval);
-  const { proposal, change, note } = approvedProposal(approval, sessionToolEvidence(branch), branch);
+  const { proposal, change, note } = approvedProposal(approval, sessionToolEvidence(branch), branch, approvingOptions);
   if (!isReconcilable(change)) throw new Error("only an approved on-read append or rule can be reconciled: a changed stale answer or withdrawal needs a new prepared proposal and Ask");
   revisedChange(proposal, change, revision);
   const targetChanged = revision.change.target.sha256 !== change.target.sha256;
@@ -251,10 +252,10 @@ export function checkReconciliation(
  * if any, and the branch position where the user's answer was saved. Throws
  * with the precise reason when the branch holds no such approval in the current pass.
  */
-function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]):
-  { proposal: PreparedProposal; change: ApprovedChange; selected: string; note?: string; answeredAt: number } {
+function approvedProposal<C>(ref: ProposalAnswerRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[], optionsOf: (proposal: PreparedProposal) => ReadonlyMap<string, C>):
+  { proposal: PreparedProposal; change: C; selected: string; note?: string; answeredAt: number } {
   const { proposal } = preparedInPass(ref.proposal, evidence, branch);
-  const options = approvingOptions(proposal);
+  const options = optionsOf(proposal);
 
   const prepare = evidence.completedCall(ref.proposal.reviewToolCallId);
   const selection = completed(evidence, ref.selectionToolCallId, "selection");
@@ -278,6 +279,27 @@ function approvedProposal(ref: ProposalAnswerRef, evidence: SessionToolEvidence,
 }
 
 /**
+ * The observer hook or companion proposal the user answered Apply at `stage`
+ * in this pass, established from the saved Ask answer like any approval. An
+ * approval note on this scope is custom input: the description or code is
+ * revised by it and asked again, so a noted Apply approves nothing.
+ */
+export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<ProposalAnswerRef> | undefined, stage: S, branch: readonly SessionEntry[]):
+  { proposal: PreparedProposal; change: Extract<HarnessChange, { stage: S }> } {
+  const { proposal, change, note } = approvedProposal(answerRef(ref), sessionToolEvidence(branch), branch, (prepared) => {
+    const change = "change" in prepared ? prepared.change : undefined;
+    if (change?.operation !== "harness" || change.stage !== stage) {
+      throw new Error(`the approved proposal is no hook or companion ${stage}${stage === "code" ? ": an intent Apply authorises drafting only" : ""}`);
+    }
+    return new Map([[APPLY, change as Extract<HarnessChange, { stage: S }>]]);
+  });
+  if (note !== undefined) {
+    throw new Error(`the user chose Apply with the note ${JSON.stringify(note)}, which approves nothing for a hook or companion change: revise it by the note, prepare it and ask again`);
+  }
+  return { proposal, change };
+}
+
+/**
  * The entry `ref` locates, prepared in the current observation pass: a form
  * of this pass, and an answer to it, cite only a proposal of this pass.
  * Throws with the precise reason otherwise.
@@ -297,7 +319,7 @@ function approvingOptions(proposal: PreparedProposal): Map<string, ApprovedChang
   if ("alternatives" in proposal) return new Map(proposal.alternatives.map(({ change }) => [STALE_OPTIONS[change.operation], change]));
   const { change } = proposal;
   if (change.operation === "direct-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself");
-  if (change.operation === "harness") throw new Error("the approved proposal is a hook or companion intent, whose Apply authorises drafting only");
+  if (change.operation === "harness") throw new Error("the approved proposal is a hook or companion change, answered as a `harness` outcome");
   return new Map([[APPLY, change]]);
 }
 

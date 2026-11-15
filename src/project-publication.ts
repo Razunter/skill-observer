@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { readFileSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve as resolvePath } from "node:path";
-import { canonicalProjectTarget, type ProjectPublication, type ProjectTarget } from "./ledger.js";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
+import { canonicalProjectTarget, type HarnessPublication, type ProjectPublication, type ProjectTarget } from "./ledger.js";
+import type { HarnessFile } from "./review.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 import type { SessionEntry } from "./omp.js";
 
@@ -25,22 +26,63 @@ export function checkProjectPublication(target: ProjectTarget, publication: Proj
     return canonicalProjectTarget(target.root, { ...target, path: relative(target.root, absolute) });
   });
   if (!targets.some((candidate) => candidate.path === target.path)) throw new Error("observed write does not target this project file");
-  for (const id of publication.checkToolCallIds) {
+  checkForegroundChecks(evidence, publication.checkToolCallIds, write.result.position, target.root);
+  const file = resolvePath(target.root, target.path);
+  if (!statSync(file).isFile() || sha256(readFileSync(file)) !== publication.afterHash) {
+    throw new Error("project target no longer matches the observed publication hash");
+  }
+}
+
+/**
+ * An applied hook or companion change's receipts: a successful normal write of
+ * each approved file, foreground checks in the target root after every write,
+ * and each file's stated hash equal to the hash of its approved text and of
+ * the file as it is now.
+ */
+export function checkHarnessPublication(change: { root: string; files: readonly HarnessFile[] }, publication: HarnessPublication | undefined, cwd: string, branch: readonly SessionEntry[]): void {
+  if (!publication || !Array.isArray(publication.writeToolCallIds) || !Array.isArray(publication.checkToolCallIds) || !Array.isArray(publication.files) ||
+      publication.checkToolCallIds.length === 0 || [...publication.writeToolCallIds, ...publication.checkToolCallIds].some((id) => typeof id !== "string" || !id)) {
+    throw new Error("an applied hook or companion change needs `publication`: its observed write calls, foreground check calls and each written file's afterHash");
+  }
+  const evidence = sessionToolEvidence(branch);
+  const writes = publication.writeToolCallIds.map((id) => successfulCall(evidence, id));
+  if (writes.some(({ call }) => call.name !== "write")) throw new Error("hook and companion files are published with the normal write tool");
+  const written = new Set(writes.map(({ call }) => typeof call.args.path === "string" ? canonical(resolvePath(cwd, writeTargetPath(call.args.path))) : ""));
+  for (const { path, text } of change.files) {
+    const file = join(change.root, path);
+    if (!written.has(canonical(file))) throw new Error(`\`${file}\`: no observed write of it`);
+    const approved = sha256(text);
+    if (publication.files.find((stated) => stated?.path === path)?.afterHash !== approved) throw new Error(`\`${file}\`: the stated afterHash is not the hash of its approved text`);
+    if (!existsSync(file) || sha256(readFileSync(file)) !== approved) throw new Error(`\`${file}\` does not hold its approved text`);
+  }
+  checkForegroundChecks(evidence, publication.checkToolCallIds, Math.max(...writes.map(({ result }) => result.position)), change.root);
+}
+
+/** Each check is a completed, successful foreground bash call with `root` as working directory, made after branch position `after`. */
+function checkForegroundChecks(evidence: SessionToolEvidence, ids: readonly string[], after: number, root: string): void {
+  for (const id of ids) {
     const check = successfulCall(evidence, id);
     const checkArgs = check.call.args;
-    if (check.call.name !== "bash" || check.call.position <= write.result.position || typeof checkArgs.cwd !== "string" ||
-        realpathSync(checkArgs.cwd) !== target.root || typeof checkArgs.command !== "string" || !checkArgs.command.trim() ||
-        checkArgs.async === true || checkArgs.name != null) throw new Error("project verification must be a completed foreground check in this project after its write");
+    if (check.call.name !== "bash" || check.call.position <= after || typeof checkArgs.cwd !== "string" ||
+        canonical(checkArgs.cwd) !== canonical(root) || typeof checkArgs.command !== "string" || !checkArgs.command.trim() ||
+        checkArgs.async === true || checkArgs.name != null) throw new Error("verification must be a completed foreground check in the target root after its write");
     const details = check.result.details;
     if (!details || typeof details !== "object" ||
         !(details.exitCode === 0 || typeof details.wallTimeMs === "number" && Number.isFinite(details.wallTimeMs) && details.wallTimeMs >= 0) ||
         ("exitCode" in details && details.exitCode !== 0) ||
         ("timedOut" in details && details.timedOut) || "async" in details || "service" in details ||
-        ("terminalId" in details && !("wallTimeMs" in details))) throw new Error("project check did not complete successfully");
+        ("terminalId" in details && !("wallTimeMs" in details))) throw new Error("the check did not complete successfully");
   }
-  const file = resolvePath(target.root, target.path);
-  if (!statSync(file).isFile() || createHash("sha256").update(readFileSync(file)).digest("hex") !== publication.afterHash) {
-    throw new Error("project target no longer matches the observed publication hash");
+}
+
+const sha256 = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+/** `path` through its symlinks, or as given when it does not exist. */
+function canonical(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
   }
 }
 

@@ -99,13 +99,20 @@ export type HarnessTarget =
 export type HarnessRoot = HarnessTarget["root"];
 export const HARNESS_ROOTS = ["project-hooks", "global-hooks", "companion"] as const satisfies readonly HarnessRoot[];
 
+/** What an applied hook or companion change rests on: the pass's write and check calls, and each written file's hash, root-relative. */
+export interface HarnessPublication {
+  writeToolCallIds: string[];
+  checkToolCallIds: string[];
+  files: Array<{ path: string; afterHash: string }>;
+}
+
 export interface HarnessLedgerRecord extends LedgerEntry {
   kind: "harness";
   target: HarnessTarget;
+  publication?: HarnessPublication;
   skill?: never;
   rule?: never;
   compaction?: never;
-  publication?: never;
 }
 
 export type LedgerRecord = SkillLedgerRecord | ProjectLedgerRecord | HarnessLedgerRecord;

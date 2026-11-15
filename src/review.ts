@@ -23,7 +23,7 @@ import {
 } from "./ledger.js";
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
-import { APPLY, approvalShape, checkReconciliation, isReconcilable, preparedInPass, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
+import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver } from "./provenance.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
@@ -49,7 +49,9 @@ type ChangeDraft =
   | { operation: "withdrawal"; body?: string; references?: ReferenceFile[] }
   | { operation: "compaction"; includes: string[]; body: string; references: ReferenceFile[] }
   /** An observer hook or companion change, at the stage the user approves now: the described remedy, before any code is drafted. */
-  | ({ operation: "harness"; stage: "intent" } & HarnessIntent);
+  | ({ operation: "harness"; stage: "intent" } & HarnessIntent)
+  /** The drafted code, after the user's Apply of the same identity's intent in this pass, which `intent` cites. */
+  | { operation: "harness"; stage: "code"; intent: ProposalAnswerRef; files: HarnessFile[]; check: HarnessCheck };
 
 /** The described remedy of an observer hook or companion change: the intent-stage preview, field by field. */
 interface HarnessIntent { event: string; predicate: string; action: string; mistake: string; legitimate: string; scope: string; lowerRungs: string }
@@ -57,6 +59,10 @@ const INTENT_LINES: ReadonlyArray<[keyof HarnessIntent, string]> = [
   ["event", "Event"], ["predicate", "Predicate"], ["action", "Action"], ["mistake", "Mistake sample"], ["legitimate", "Legitimate sample"],
   ["scope", "Scope"], ["lowerRungs", "Why each lower rung fails"],
 ];
+/** One file of drafted hook or companion code: its path relative to the target root and its exact text. */
+export interface HarnessFile { path: string; text: string }
+/** The check the drafting ran on the code, and its observed output. */
+interface HarnessCheck { command: string; output: string }
 
 interface CandidateDraft {
   gist: string;
@@ -86,6 +92,8 @@ export type PreparedChange =
   | { operation: "direct-edit" }
   /** Apply of an intent authorises drafting only: nothing is written or recorded as applied from it. */
   | { operation: "harness"; stage: "intent" }
+  /** Approve the exact code: `root` is the target root's directory; the pass writes the files with normal tools and the resolver only records them. */
+  | { operation: "harness"; stage: "code"; root: string; files: HarnessFile[]; check: HarnessCheck }
   /** `record`: the amendment already holds the section verbatim, so publication writes nothing and only the ledger changes. */
   | { operation: "on-read-append"; effect: "create" | "append" | "record"; rule: RuleIdentity; target: FileSnapshot; section: string }
   /** Samples stay in the form the scope sees, as `observer_check` and `observer_resolve` take them. */
@@ -184,6 +192,12 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
       scope: z.string().describe("Why this project's hooks, or why the global hooks for a mistake that generalises."),
       lowerRungs: z.string().describe("Why a configuration repair, skill text, barrier rule, pattern amendment, project check or, for the companion, a hook does not fit."),
     }).describe("An observer hook or companion-extension change at its intent stage: the described remedy, previewed and asked before any code is drafted. Apply authorises drafting only."),
+    z.object({
+      operation: z.enum(["harness"]), stage: z.enum(["code"]),
+      intent: z.object(approvalShape(z)).describe("The user's Apply of this identity's intent in this pass, as observer_resolve would cite an approval."),
+      files: z.array(z.object({ path: z.string().describe("Relative to the target root: for a hook, its one file."), text: z.string().describe("The file's exact text, as written.") })),
+      check: z.object({ command: z.string(), output: z.string().describe("The check's observed output, unedited.") }),
+    }).describe("The drafted code of an approved intent, with the check it passed: shown and asked in a Select and Ask of its own; Apply approves writing exactly these files."),
   ]);
   const draft = {
     gist: z.string(), priority: z.enum(PRIORITIES), remedy: z.string(), change,
@@ -238,6 +252,9 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
           const declined = declinedFingerprints(ledgerForProject(ledger, ctx.cwd));
           details.eligible = preparedEntries(params.proposals, ctx.sessionManager.getBranch())
             .filter((entry) => !declined.has(entry.proposal.fingerprint));
+          if (details.eligible.length > 1 && details.eligible.some(({ proposal }) => "change" in proposal && proposal.change.operation === "harness" && proposal.change.stage === "code")) {
+            throw new Error("the code of a hook or companion change is asked in its own Select and Ask, apart from every other question");
+          }
         } else {
           throw new Error("review needs prepare/select");
         }
@@ -451,11 +468,13 @@ function preparedProposal(
   const base = { priority: candidate.priority, ...scope, gist: candidate.gist, remedy: candidate.remedy, evidence: candidate.evidence };
   if (candidate.kind === "harness") {
     if (draft.operation !== "harness") throw new Error("an observer hook or companion change is a harness change, asked first as its intent");
-    if (draft.stage !== "intent") throw new Error("a harness change is prepared at its `intent` stage");
-    const missing = INTENT_LINES.find(([field]) => typeof draft[field] !== "string" || !draft[field].trim());
+    const isCode = draft.stage === "code";
+    if (!isCode && draft.stage !== "intent") throw new Error("a harness change is prepared at its `intent` stage, then at its `code` stage");
+    const missing = isCode ? undefined : INTENT_LINES.find(([field]) => typeof draft[field] !== "string" || !draft[field].trim());
     if (missing) throw new Error(`a harness intent needs its ${missing[1].toLowerCase()}`);
     const fingerprint = proposalIdentity(candidate, scoped);
     if (declined.has(fingerprint)) return undefined;
+    if (isCode) return { candidateId: `code:${fingerprint}`, fingerprint, ...base, ...codeStage(candidate.target, fingerprint, draft, context) };
     return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, change: { operation: "harness", stage: "intent" }, preview: intentPreview(candidate.target, fingerprint, draft, context) };
   }
   if (draft.operation === "harness") throw new Error("a harness change needs a harness target: the project or global hooks directory, or the companion extension");
@@ -621,6 +640,33 @@ function intentPreview(target: HarnessTarget, fingerprint: string, intent: Harne
     `${where}:`, "", ...INTENT_LINES.map(([field, label]) => `${label}: ${intent[field].trim()}`), "",
     "Apply authorises drafting only: the drafted code and its check result are shown and asked again before any file is written.",
   ].join("\n");
+}
+
+/**
+ * A hook's code stage, accepted only while the user's Apply of the intent with
+ * the same identity holds in this pass: its one file's exact text, the check
+ * the draft passed and its observed output, all shown in the preview.
+ */
+function codeStage(target: HarnessTarget, fingerprint: string, draft: Extract<ChangeDraft, { stage: "code" }>, { cwd, agentDir, branch }: PrepareContext):
+  { change: Extract<PreparedChange, { stage: "code" }>; preview: string } {
+  if (target.root === "companion") throw new Error("companion code is not prepared at the code stage: a companion change needs a test the code stage does not yet run");
+  const { proposal: intent } = approvedHarness(draft.intent, "intent", branch);
+  if (intent.fingerprint !== fingerprint) throw new Error(`the cited intent Apply approved another hook or companion change, \`${intent.fingerprint}\`, not \`${fingerprint}\``);
+  const file = target.path ?? hookFileName(fingerprint);
+  const [only, ...rest] = Array.isArray(draft.files) ? draft.files : [];
+  if (!only || rest.length > 0 || only.path !== file || typeof only.text !== "string" || !only.text.trim()) throw new Error(`a hook's code is its one file \`${file}\` with its exact text`);
+  const { command, output } = draft.check ?? {};
+  if (typeof command !== "string" || !command.trim() || typeof output !== "string") throw new Error("the code needs the check command it passed and that check's observed output");
+  const root = harnessRootDirs(cwd, agentDir)[target.root];
+  const files = [{ path: only.path, text: only.text }];
+  const preview = [
+    ...files.flatMap(({ path, text }) => [`${existsSync(join(root, path)) ? "Replace" : "Create"} \`${join(root, path)}\` with:`, "", text, ""]),
+    `Check command: ${command}`, "Check result:", output, "",
+    `Apply writes this code and reruns the check in the foreground in \`${root}\`. A written hook acts only after omp restarts.`,
+  ].join("\n");
+  // The Ask form collapses whitespace, so a carriage return would be written without ever being shown.
+  if (preview.includes("\r")) throw new Error("the code or its check output holds a carriage return, which the Ask preview would not show; send it with `\\n` line ends only");
+  return { change: { operation: "harness", stage: "code", root, files, check: { command, output } }, preview };
 }
 
 function checkCurrentFingerprint(candidate: ReviewCandidate, fingerprint: string): void {

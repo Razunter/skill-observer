@@ -6,7 +6,7 @@
  */
 import type { ObserverRule } from "./amendments.js";
 import { droppedSignalCount, type LoadedSkill, type SessionDigest, type SkillSignal } from "./digest.js";
-import type { LedgerRecord } from "./ledger.js";
+import { type LedgerRecord, targetLabel } from "./ledger.js";
 import { type RemedyOutcome, remedyOutcomes } from "./outcomes.js";
 import { describePayloadEstimate, type PayloadEstimate } from "./payload.js";
 
@@ -46,7 +46,8 @@ export function evidenceReport({ digest, ledger, stale, observations }: {
   for (const signal of digest.signals) signals[signal.kind] += signal.count;
   const loaded = new Set(digest.skills.map((skill) => skill.name));
   // Later records win, as in remedyOutcomes, so each outcome names its own record's target.
-  const targets = new Map(ledger.map((record) => [record.fingerprint, record.kind === "project" ? record.target.path : record.skill]));
+  const targets = new Map(ledger.map((record) => [record.fingerprint,
+    record.kind === "project" ? record.target.path : record.kind === "harness" ? targetLabel(record) : record.skill]));
   return {
     signals,
     dropped: droppedSignalCount(digest),
