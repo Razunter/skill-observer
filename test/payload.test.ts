@@ -122,6 +122,31 @@ describe("rules adopted from upstream task-observer v3.9.0", () => {
   });
 });
 
+describe("remedy ladder and report items", () => {
+  const notePass = instructionText(new Set<Gate>(["note"]));
+  const paragraph = (label: string) => notePass.split("\n\n").find((block) => block.startsWith(`**${label}.**`)) ?? "";
+
+  it.each([
+    ["the ladder", "Remedy ladder", ["configuration or wiring repair", "last resorts: observer hook, then companion extension"]],
+    ["owner discovery", "Remedy ladder", ["names a tool's supplier, not the cause", "caller error", "another extension's interception", "only where evidence points"]],
+    ["the report-item rule", "Report items", ["behavioural code of any extension but the companion, even under the project root", "confirmed, suspected or unknown", "not stored"]],
+  ])("gives a pass with only a User note %s", (_label, label, phrases) => {
+    for (const phrase of phrases) expect(paragraph(label as string)).toContain(phrase);
+  });
+
+  it("keeps the always-on addition within 150 words", () => {
+    const words = [paragraph("Remedy ladder"), paragraph("Report items")].join(" ").split(/\s+/).filter(Boolean);
+    expect(words.length).toBeGreaterThan(0);
+    expect(words.length).toBeLessThanOrEqual(150);
+  });
+
+  it("turns an unknown target into a report item the summary lists without pending observations", () => {
+    expect(observerMd).not.toMatch(/unknown[- ]target/i);
+    const summary = instructionText(new Set()).split("## 6. Summarise")[1] ?? "";
+    expect(summary).toContain("each report item");
+  });
+});
+
 describe("observer.md saved with CRLF line ends", () => {
   it("parses into the same fragments as its LF copy", () => {
     expect(parseFragments(observerMd.replace(/\n/g, "\r\n"))).toEqual(fragments);

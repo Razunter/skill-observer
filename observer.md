@@ -12,6 +12,10 @@ Read every signal and correction, including when a skill was loaded. Keep each f
 
 **Choose the remedy before its scope.** Inspect only session-relevant project context and checks through normal discovery. First read the existing check command, script and its hook/CI wiring: a missing wire or broken existing check gets a repair proposal, not a replacement check plus a skill reminder. A mechanical mistake gets the cheapest fitting deterministic check; missing information gets a navigation/reference fix; a judgment problem gets review guidance. Review oversized or ineffective steering and tool economy only where this session supplies evidence. An information-access remedy is an explicit permission request, not an automatic service/credential read.
 
+**Remedy ladder.** Rank remedies by cost, not owner: configuration or wiring repair, text or skill edit, amendment, barrier rule, pattern amendment, project check; last resorts: observer hook, then companion extension. A tool rightly rejecting a misuse stays unchanged. A supplier label names a tool's supplier, not the cause, which may also be caller error, configuration, another extension's interception or unknown. Read owners' docs or source only where evidence points.
+
+**Report items.** A finding no proposal kind fits, a capability no rung provides, or a fix in behavioural code of any extension but the companion, even under the project root, is a report item, never an edit. Give supplier or owner; request and result; expected behaviour with source or "undocumented"; cause: confirmed, suspected or unknown; a scenario proving the fix, with legitimate counterpart; next action. New-extension ideas: needed surface, state owner, benefit, risks. Missing parts read "unknown". Summary only; not stored.
+
 <!-- when: project -->
 For the retrospective branch, use the reference inlined under **Retrospective reference** when available.
 <!-- end -->
@@ -43,10 +47,10 @@ Each entry under **Stale amendments** is a candidate too: an amendment rule whos
 <!-- end -->
 
 <!-- when: observations -->
-Each entry under **Observations** is a remark the main agent recorded while working in this repository, in this session or an earlier one: evidence to check against the session and the checkout before you propose anything. A path in it may belong to another worktree of the repository; look for the same file under the current checkout. Once checked, an observation that fits a proposal kind available in this pass becomes a candidate like any signal. Any other observation becomes a report item: what was observed and a next action for the user. Every observation ends as a candidate or a report item.
+Each entry under **Observations** is a remark the main agent recorded while working in this repository, in this session or an earlier one: evidence to check against the session and the checkout before you propose anything. A path in it may belong to another worktree of the repository; look for the same file under the current checkout. Once checked, an observation that fits a proposal kind available in this pass becomes a candidate like any signal; any other becomes a report item, which also says what checking it showed.
 <!-- end -->
 
-Done when every signal and relevant note point is either an evidence-backed candidate with one mechanism, exact target, scope, remedy and verification method, or dismissed with its reason; cross-source duplicates are merged, gaps are disclosed, and every Later entry, stale amendment and marked compaction is accounted for.
+Done when every signal and relevant note point is either an evidence-backed candidate with one mechanism, exact target, scope, remedy and verification method, a report item, or dismissed with its reason; cross-source duplicates are merged, gaps are disclosed, and every Later entry, stale amendment and marked compaction is accounted for.
 
 ## 2. Draft
 
@@ -66,13 +70,12 @@ Skill, rule and agent-guidance drafts follow `skill://writing-for-agents`: read 
 <!-- when: compaction -->
 - **Compaction**: read the amendment file, `<on-read amendments directory>/<name>.md`, and its reference files. Draft the new body from the amendment's body with this pass's on-read fixes for the skill appended; the draft includes every one of them. Keep every instruction, state each once, and group them under short `## ` headings. While the body is still over 4,000 characters, move a topical section into a reference file, `<reference files directory>/<skill>/<name>.md`, and replace the section, heading included, with the one pointer line `When <condition>, read <the file's absolute path>.` The draft's reference files are the amendment's complete set, the existing ones included, each named by its absolute path in a pointer line of the body.
 <!-- end -->
-- **Unknown target**: draft the fix for the summary, outside the `ask` batch.
 
 Done when every proposal has an exact preview, supporting evidence and target-specific verification, skill/guidance drafts pass the writing tests, every barrier has passed replay (or is set aside as Later), every stale amendment has a verdict, and every compaction holds all prior instructions within its existing size/reference contract.
 
 ## 3. Ask
 
-First call `observer_review` with `action: "prepare"` and the exact eligible candidates: `priority` is `stale` for stale Update/Delete questions, `note` for explicit User note proposals and withdrawals the user asked for, `evidence` for other evidence-backed findings, or `compaction`. Keep stale Keep verdicts and unknown-target summaries outside review. Each candidate includes its global skill/kind/gist or project kind/target/gist, `remedy`, cited `evidence` (`quote`, `count`, and optional source locator) and its exact `change`:
+First call `observer_review` with `action: "prepare"` and the exact eligible candidates: `priority` is `stale` for stale Update/Delete questions, `note` for explicit User note proposals and withdrawals the user asked for, `evidence` for other evidence-backed findings, or `compaction`. Keep stale Keep verdicts and report items outside review. Each candidate includes its global skill/kind/gist or project kind/target/gist, `remedy`, cited `evidence` (`quote`, `count`, and optional source locator) and its exact `change`:
 
 - `direct-edit` with the exact `preview` for a local or managed skill edit, a new skill or a project repair;
 - `on-read-append` with the `section` of an upstream or plugin on-read fix;
@@ -191,11 +194,7 @@ Done when the tool result lists every such answer as recorded, or, after a faile
 
 ## 6. Summarise
 
-Report in a few lines: applied changes with their paths, rules and reference files included, naming each on-read fix or rule written under your reconciliation, as the result reports it; withdrawn fixes with the rule files deleted, or with the text removed from an on-read amendment as a diff; kept, updated and deleted amendments, naming each one kept without a question; Later and Decline answers; answers `observer_resolve` deferred as `later` at the replay check, and compactions it deferred as `later`, each with its reason; after a failed ledger append, each Unrecorded publication, each Later or Decline left unrecorded and each answer whose recording is unknown, with the error; each deletion whose cleanup failed, with what is left; on-read fixes refused because their skill has two or more on-read amendments; barrier candidates set aside because the check can't run, with the reason it gave; the number of dismissed signals; unknown-target fixes you drafted, with their text; candidates past the cap of 5; and "writing-for-agents unavailable" if step 2 fell back.
-
-<!-- when: observations -->
-Report each observation that became a report item: what it says, what checking it showed, and the next action you suggest.
-<!-- end -->
+Report in a few lines: applied changes with their paths, rules and reference files included, naming each on-read fix or rule written under your reconciliation, as the result reports it; withdrawn fixes with the rule files deleted, or with the text removed from an on-read amendment as a diff; kept, updated and deleted amendments, naming each one kept without a question; Later and Decline answers; answers `observer_resolve` deferred as `later` at the replay check, and compactions it deferred as `later`, each with its reason; after a failed ledger append, each Unrecorded publication, each Later or Decline left unrecorded and each answer whose recording is unknown, with the error; each deletion whose cleanup failed, with what is left; on-read fixes refused because their skill has two or more on-read amendments; barrier candidates set aside because the check can't run, with the reason it gave; the number of dismissed signals; each report item with its parts; candidates past the cap of 5; and "writing-for-agents unavailable" if step 2 fell back.
 
 Done when the summary covers every outcome, project path and observed check result, merged finding and dismissed signal, deferred/failed publication, missing primary evidence or retro reference, and every other item above that occurred. Distinguish checks actually exercised from proposed checks.
 
