@@ -152,7 +152,7 @@ An **observer hook** is a hook file a pass wrote after your approval. The **comp
 
 A hook is one self-contained file. It may register event handlers and commands and keep state. A project hook fixes a mistake specific to this project. A global hook must generalise the way global skill guidance must. A new hook's file is named `skill-observer-<fingerprint>.ts`, so a project hook and a global hook never share a name. OMP loads only the first hook file of a given name. A pass may also change or remove any hook file in the two hooks directories, ones you wrote by hand included.
 
-The companion extension is for a remedy that needs a registered tool, several modules or a dependency. The first approved change creates it. Its `package.json` declares its entry files under `omp.extensions`, because OMP loads nothing else in that directory. Every change keeps a test file there, and `bun test` in the directory is its check.
+The companion extension is for a remedy that needs a registered tool, several modules or a dependency, or that rewrites a call or its result. The first approved change creates it. Its `package.json` declares its entry files under `omp.extensions`, because OMP loads nothing else in that directory. Every change keeps a test file there, and `bun test` in the directory is its check.
 
 ### Two approvals
 
@@ -179,7 +179,7 @@ Removing a hook takes one approval. The form shows the file as it stands, with A
 bun --no-env-file scripts/check-hook.ts <hook-file> <samples-file>
 ```
 
-It loads the hook's default-exported factory against a stand-in host with no UI, feeds the samples' events in file order and prints one `PASS` or `FAIL` line per sample, then a verdict. It exits 0 only when every sample got its expected outcome: `blocked`, `context` (added context only) or `untouched`. The samples file is a JSON array that holds at least one `mistake` sample and one `legitimate` sample. A hook that keeps state gets the sequence its state needs. Run the script without arguments for the full sample format.
+It loads the hook's default-exported factory against a stand-in host with no UI, feeds the samples' events in file order and prints one `PASS` or `FAIL` line per sample, then a verdict. It exits 0 only when every sample got its expected outcome: `blocked`, `context` (added context only) or `untouched`. A hook that changes a call or its result fails the check, so a hook's action is to block or add context. The samples file is a JSON array that holds at least one `mistake` sample and one `legitimate` sample. A hook that keeps state gets the sequence its state needs; a `tool_call` sample and its `tool_result` share a call ID through `toolCallId`. Run the script without arguments for the full sample format.
 
 The check shows that the hook's predicate separates the samples. It does not show that the hook loads and behaves in a real session.
 

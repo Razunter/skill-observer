@@ -5,7 +5,7 @@ This is the procedure for the last two rungs of the remedy ladder. The payload n
 ## When each rung fits
 
 - An **observer hook** fixes a mechanical mistake that a barrier rule, pattern amendment or project check cannot catch. It is one self-contained file. It may register event handlers and commands and keep state.
-- The **companion extension** is for a remedy a hook cannot carry: one that needs a registered tool, several modules or a dependency. It is the one extension a pass may edit.
+- The **companion extension** is for a remedy a hook cannot carry: one that needs a registered tool, several modules or a dependency, or one that rewrites a call or its result. It is the one extension a pass may edit.
 - The intent says why each lower rung fails: configuration repair, skill text, barrier rule, pattern amendment, project check, and for the companion, a hook.
 - A fix in any other extension's code stays a report item.
 
@@ -26,7 +26,7 @@ Prepare the described remedy with `change: { operation: "harness", stage: "inten
 
 - `event`: the host event the hook handles, such as `tool_call` for one tool.
 - `predicate`: what in the event marks the mistake.
-- `action`: block, add context or change the call.
+- `action`: block the call, or add context. A hook that changes a call or its result fails the hook check; a remedy that must rewrite either goes to the companion extension, whose `bun test` can verify it.
 - `mistake`: the session's mistake as a sample event.
 - `legitimate`: its nearest legitimate counterpart, which the hook leaves untouched.
 - `scope`: why this project's hooks, the global hooks or the companion.
@@ -38,7 +38,7 @@ The intent goes through Prepare, Select and Ask in the main batch like any propo
 
 After the intent's Apply, give one subagent the intent text, both samples, the target file's root-relative path or the companion directory, and the hook check script's path. The subagent works in a new temporary directory, never in the target. It writes the draft there at the target's root-relative path, writes the samples file there, runs the check, and returns each file's exact text, the check command and the check's unedited output. When the session has no subagent tool, draft the same way yourself.
 
-A hook file default-exports a factory: `export default function (pi) { pi.on("tool_call", (event, ctx) => …) }`. A `tool_call` event carries `toolCallId`, `toolName` and `input`; a `tool_result` event adds `content` and `isError`. A handler blocks with `{ block: true, reason }` and adds context with `{ additionalContext }`.
+A hook file default-exports a factory: `export default function (pi) { pi.on("tool_call", (event, ctx) => …) }`. A `tool_call` event carries `toolCallId`, `toolName` and `input`; a `tool_result` event adds `content` and `isError`. A handler blocks with `{ block: true, reason }` and adds context with `{ additionalContext }`. The hook check reports any other returned field, such as a changed `input` or `content`, as a failure.
 
 The hook samples file is a JSON array. Each sample is `{ name, role, event, toolName, input, toolCallId?, content?, isError?, expect }`:
 
