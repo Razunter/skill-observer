@@ -83,16 +83,11 @@ function refreshHint(_event: unknown, ctx: ExtensionContext): void {
       console.error("skill-observer: reading observations for the status hint failed:", error);
     }
   }
-  ctx.ui.setStatus(
-    STATUS_KEY,
-    corrections > 0
-      ? `${plural(corrections, "skill correction")} · /observe`
-      : workflows > 0
-        ? `${plural(workflows, "workflow")} without a skill · /observe`
-        : observations > 0
-          ? `${plural(observations, "pending observation")} · /observe`
-          : undefined,
-  );
+  const status = corrections > 0 ? `${plural(corrections, "skill correction")} · /observe`
+    : workflows > 0 ? `${plural(workflows, "workflow")} without a skill · /observe`
+    : observations > 0 ? `${plural(observations, "pending observation")} · /observe`
+    : undefined;
+  ctx.ui.setStatus(STATUS_KEY, status);
 }
 
 /** The evidence `/observe` gathered before it decided to start a pass. */

@@ -121,7 +121,7 @@ function canonicalMissingPath(path: string): string {
 }
 
 export function projectFingerprint(target: ProjectTarget): string {
-  const mechanism = target.mechanism.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const mechanism = normaliseText(target.mechanism);
   if (!mechanism) throw new Error("project mechanism must contain letters or digits");
   return createHash("sha256").update(JSON.stringify(["project", target.root, target.path, mechanism])).digest("hex").slice(0, 12);
 }
@@ -139,13 +139,16 @@ export function ledgerForProject(records: readonly LedgerRecord[], cwd: string):
 }
 
 /**
- * A proposal's identity across sessions: the target skill plus the gist with
- * case, punctuation and spacing normalised away, hashed to a short token.
- * Separators are dropped, not collapsed, so "re-run" and "rerun" match.
+ * `text` with case, punctuation and spacing normalised away. Separators are
+ * dropped, not collapsed, so "re-run" and "rerun" match.
  */
+export function normaliseText(text: string): string {
+  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+/** A proposal's identity across sessions: the target skill plus the normalised gist, hashed to a short token. */
 export function proposalFingerprint(skill: string, gist: string): string {
-  const normalisedGist = gist.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-  return createHash("sha256").update(`${skill.trim()}\n${normalisedGist}`).digest("hex").slice(0, 12);
+  return createHash("sha256").update(`${skill.trim()}\n${normaliseText(gist)}`).digest("hex").slice(0, 12);
 }
 
 /** Whether a record reached the ledger, as the file's bytes show; `unknown` when a failed append left bytes that can't settle it. */
@@ -163,7 +166,7 @@ export interface LedgerAppend {
  * of them it wrote whole: an exception does not prove that nothing was
  * written. Nothing is retried.
  */
-export function appendLedger(file: string, records: readonly LedgerRecord[]): LedgerAppend {
+export function appendLedger(file: string, records: readonly object[]): LedgerAppend {
   const lines = records.map((record) => Buffer.from(`${JSON.stringify(record)}\n`));
   let existing: Buffer;
   try {
@@ -211,20 +214,25 @@ function writtenRows(file: string, existing: Buffer, separator: Buffer, lines: r
 
 /** The latest record per fingerprint, oldest answer first. */
 export function readLedger(file: string): LedgerRecord[] {
+  return readLatestRows<LedgerRecord>(file, (record) => record.fingerprint);
+}
+
+/** The latest row per key of an append-only JSONL file, in file order of those rows. */
+export function readLatestRows<T extends object>(file: string, keyOf: (row: T) => string): T[] {
   if (!existsSync(file)) return [];
-  const latest = new Map<string, LedgerRecord>();
+  const latest = new Map<string, T>();
   for (const line of readFileSync(file, "utf8").split("\n")) {
     if (!line.trim()) continue;
-    let record: LedgerRecord;
+    let row: T;
     try {
-      record = JSON.parse(line);
+      row = JSON.parse(line);
     } catch {
-      // A line cut short by an interrupted append carries no answer; the rest of the ledger still holds.
+      // A line cut short by an interrupted append carries no row; the rest of the file still holds.
       continue;
     }
-    if (!record || typeof record !== "object") continue;
-    latest.delete(record.fingerprint);
-    latest.set(record.fingerprint, record);
+    if (!row || typeof row !== "object") continue;
+    latest.delete(keyOf(row));
+    latest.set(keyOf(row), row);
   }
   return [...latest.values()];
 }
