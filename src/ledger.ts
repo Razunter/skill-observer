@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { ompAgentDir } from "./provenance.js";
 
 export const PROPOSAL_KINDS = ["local", "managed", "upstream", "plugin", "new"] as const;
 export const PROPOSAL_OUTCOMES = ["applied", "later", "declined"] as const;
@@ -170,14 +171,20 @@ export function canonicalProjectTarget(cwd: string, target: ProjectTarget): Proj
   const root = realpathSync(cwd);
   if (!statSync(root).isDirectory() || realpathSync(target.root) !== root) throw new Error("project root must be the current working project");
   const path = canonicalPathIn(root, target.path, "project target");
-  // A hook written as a project fix would run after one approval; the harness scope asks for the description and then the code.
-  if (path === PROJECT_HOOKS_DIR || path.startsWith(`${PROJECT_HOOKS_DIR}${sep}`)) {
-    throw new Error(`\`${path}\` lies in the project's hooks directory: propose it with the \`harness\` target scope, as a project hook`);
-  }
+  // A hook or companion file written as a project fix would run after one approval; the harness scope asks for the description and then the code.
+  const harness = harnessRootDirs(root, ompAgentDir());
+  const destination = join(root, path);
+  const inside = ([
+    [dirname(harness["project-hooks"]), "the project's hooks directory", "as a project hook"],
+    [dirname(harness["global-hooks"]), "the global hooks directory", "as a global hook"],
+    [harness.companion, "the companion extension directory", "as a companion change"],
+  ] as const).find(([dir]) => {
+    const within = relative(canonicalMissingPath(dir), destination);
+    return within !== ".." && !within.startsWith(`..${sep}`) && !isAbsolute(within);
+  });
+  if (inside) throw new Error(`\`${path}\` lies in ${inside[1]}: propose it with the \`harness\` target scope, ${inside[2]}`);
   return { scope: "project", root, path, mechanism: target.mechanism.trim() };
 }
-
-const PROJECT_HOOKS_DIR = join(".omp", "hooks");
 
 /** The harness target as identity takes it: its root kind, the current project for a project hook, and a path that stays in its root. */
 export function canonicalHarnessTarget(cwd: string, agentDir: string, target: HarnessTarget): HarnessTarget {

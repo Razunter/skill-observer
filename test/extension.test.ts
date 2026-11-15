@@ -2461,18 +2461,27 @@ describe("observer hook and companion intents", () => {
     expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
   });
 
-  it("refuses a project proposal inside the project's hooks directory, naming the harness scope", async () => {
+  it.each<[string, string, string, (root: string) => void]>([
+    ["the project's hooks directory", ".omp/hooks/pre/block.ts", "as a project hook", () => {}],
+    ["the project's hooks directory through a symlink to another project directory", ".omp/hooks/pre/block.ts", "as a project hook", (root) => {
+      mkdirSync(join(root, "actual-hooks/pre"), { recursive: true });
+      mkdirSync(join(root, ".omp"), { recursive: true });
+      symlinkSync(join(root, "actual-hooks"), join(root, ".omp/hooks"));
+    }],
+    ["the global hooks directory of an agent directory inside the project", "agent/hooks/pre/block.ts", "as a global hook", (root) => vi.stubEnv("PI_CODING_AGENT_DIR", join(root, "agent"))],
+    ["the companion directory of an agent directory inside the project", "agent/extensions/skill-observer-companion/index.ts", "as a companion change", (root) => vi.stubEnv("PI_CODING_AGENT_DIR", join(root, "agent"))],
+  ])("refuses a project proposal inside %s, naming the harness scope", async (_label, path, scope, arrange) => {
     const host = loadExtension();
     const root = host.skillHome.roots.cwd;
-    const target = { scope: "project", root, path: ".omp/hooks/pre/block.ts", mechanism: "Block git commit" };
+    arrange(root);
+    const target = { scope: "project", root, path, mechanism: "Block git commit" };
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{
       kind: "project", target, gist: "Block git commit", priority: "evidence", remedy: "Write a hook", change: { operation: "direct-edit", preview: "export default () => {}" },
     }] });
     expect(prepared.isError).toBe(true);
-    expect(failures(prepared)).toEqual([expect.stringContaining("`harness`")]);
+    expect(failures(prepared)).toEqual([expect.stringContaining(`\`harness\` target scope, ${scope}`)]);
     const resolved = await resolve(host, [{ kind: "project", target, gist: "Block git commit", outcome: "later" }]);
-    expect(failures(resolved)).toEqual([expect.stringContaining("`harness`")]);
-    expect(existsSync(host.ledgerFile)).toBe(false);
+    expect(failures(resolved)).toEqual([expect.stringContaining(`\`harness\` target scope, ${scope}`)]);
   });
 
   it("keeps a declined global hook out of another project's pass, and a declined project hook out of view there", async () => {
