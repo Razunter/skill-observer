@@ -17,8 +17,8 @@ export default function (pi) {
 }
 `;
 
-const forcePush = { name: "force push", event: "tool_call", toolName: "bash", input: { command: "git push --force" } };
-const plainPush = { name: "plain push", event: "tool_call", toolName: "bash", input: { command: "git push" } };
+const forcePush = { name: "force push", role: "mistake", event: "tool_call", toolName: "bash", input: { command: "git push --force" } };
+const plainPush = { name: "plain push", role: "legitimate", event: "tool_call", toolName: "bash", input: { command: "git push" } };
 
 function run(...args: string[]): Promise<{ code: number | null; out: string }> {
   return bun(script, ...args);
@@ -83,8 +83,8 @@ export default function (pi) {
 }
 `;
     const { hookFile, samplesFile } = fixture(hook, [
-      { name: "lockfile error", event: "tool_result", toolName: "bash", input: { command: "bun test" }, content: "stale lockfile", isError: true, expect: "context" },
-      { name: "passing run", event: "tool_result", toolName: "bash", input: { command: "bun test" }, content: "stale lockfile", expect: "untouched" },
+      { name: "lockfile error", role: "mistake", event: "tool_result", toolName: "bash", input: { command: "bun test" }, content: "stale lockfile", isError: true, expect: "context" },
+      { name: "passing run", role: "legitimate", event: "tool_result", toolName: "bash", input: { command: "bun test" }, content: "stale lockfile", expect: "untouched" },
     ]);
 
     const { code, out } = await run(hookFile, samplesFile);
@@ -105,16 +105,16 @@ export default function (pi) {
 }
 `;
     const editA = { event: "tool_call", toolName: "edit", input: { path: "a.ts" } };
-    const readA = { name: "read a.ts", event: "tool_call", toolName: "read", input: { path: "a.ts" }, expect: "untouched" };
+    const readA = { name: "read a.ts", role: "legitimate", event: "tool_call", toolName: "read", input: { path: "a.ts" }, expect: "untouched" };
     const inOrder = fixture(hook, [
-      { ...editA, name: "edit before read", expect: "blocked" },
+      { ...editA, name: "edit before read", role: "mistake", expect: "blocked" },
       readA,
-      { ...editA, name: "edit after read", expect: "untouched" },
+      { ...editA, name: "edit after read", role: "legitimate", expect: "untouched" },
     ]);
     const outOfOrder = fixture(hook, [
       readA,
-      { ...editA, name: "edit before read", expect: "blocked" },
-      { ...editA, name: "edit after read", expect: "untouched" },
+      { ...editA, name: "edit before read", role: "mistake", expect: "blocked" },
+      { ...editA, name: "edit after read", role: "legitimate", expect: "untouched" },
     ]);
 
     const [passing, failing] = await Promise.all([run(inOrder.hookFile, inOrder.samplesFile), run(outOfOrder.hookFile, outOfOrder.samplesFile)]);
@@ -141,6 +141,29 @@ export default function (pi) {
     expect(out).toContain(message);
     expect(out).toContain(hookFile);
     expect(out).not.toContain("PASS");
+    expect(code).not.toBe(0);
+  });
+
+  it.each([
+    ["only mistakes", [{ ...forcePush, expect: "blocked" }, { ...plainPush, role: "mistake", expect: "untouched" }]],
+    ["only legitimate samples", [{ ...forcePush, role: "legitimate", expect: "blocked" }, { ...plainPush, expect: "untouched" }]],
+  ])("refuses a samples file with %s", async (_case, samples) => {
+    const { hookFile, samplesFile } = fixture(FORCE_PUSH_HOOK, samples);
+
+    const { code, out } = await run(hookFile, samplesFile);
+
+    expect(out).toContain(`samples file ${samplesFile} needs at least one sample of role "mistake" and one of role "legitimate"`);
+    expect(out).not.toContain("PASS");
+    expect(code).not.toBe(0);
+  });
+
+  it("refuses a sample without a role", async () => {
+    const { role: _role, ...noRole } = plainPush;
+    const { hookFile, samplesFile } = fixture(FORCE_PUSH_HOOK, [{ ...forcePush, expect: "blocked" }, { ...noRole, expect: "untouched" }]);
+
+    const { code, out } = await run(hookFile, samplesFile);
+
+    expect(out).toContain(`sample 2 in ${samplesFile}: role must be "mistake" or "legitimate"`);
     expect(code).not.toBe(0);
   });
 

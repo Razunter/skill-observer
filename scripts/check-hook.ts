@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 type Expectation = "blocked" | "context" | "untouched";
 interface Sample {
   name: string;
+  role: "mistake" | "legitimate";
   event: "tool_call" | "tool_result";
   toolName: string;
   input: Record<string, unknown>;
@@ -26,6 +27,7 @@ The samples file is a JSON array of samples:
 
   {
     "name": "force push",                       // shown in the output
+    "role": "mistake" | "legitimate",           // the session's mistake or its legitimate counterpart
     "event": "tool_call" | "tool_result",
     "toolName": "bash",
     "input": { "command": "git push --force" }, // the tool call's arguments
@@ -39,9 +41,10 @@ returned non-blank additionalContext and nothing else. "untouched": no handler
 returned anything. A returned input, content, details or isError, or a thrown
 handler, is reported as such and matches no expectation.
 
-The samples hold at least the mistake (blocked or context) and its legitimate
-counterpart (untouched). A hook that keeps state gets the sequence its state
-needs, in order: every sample runs against the same loaded hook.`;
+"role" says what the sample stands for, independent of "expect". The file holds
+at least one "mistake" sample and one "legitimate" sample, or it is refused. A
+hook that keeps state gets the sequence its state needs, in order: every sample
+runs against the same loaded hook.`;
 const EXPECTATIONS: readonly string[] = ["blocked", "context", "untouched"];
 
 const [hookFile, samplesFile] = process.argv.slice(2);
@@ -79,13 +82,17 @@ function readSamples(file: string): Sample[] {
     const problem = sampleProblem(sample);
     if (problem) fail(`sample ${index + 1} in ${file}: ${problem}. ${USAGE}`);
   }
-  return parsed as Sample[];
+  const samples = parsed as Sample[];
+  const hasBothRoles = samples.some((sample) => sample.role === "mistake") && samples.some((sample) => sample.role === "legitimate");
+  if (!hasBothRoles) fail(`samples file ${file} needs at least one sample of role "mistake" and one of role "legitimate"`);
+  return samples;
 }
 
 function sampleProblem(sample: unknown): string | undefined {
   if (typeof sample !== "object" || sample === null) return "not an object";
-  const { name, event, toolName, input, content, isError, expect } = sample as Record<string, unknown>;
+  const { name, role, event, toolName, input, content, isError, expect } = sample as Record<string, unknown>;
   if (typeof name !== "string" || !name) return "name must be a non-empty string";
+  if (role !== "mistake" && role !== "legitimate") return 'role must be "mistake" or "legitimate"';
   if (event !== "tool_call" && event !== "tool_result") return 'event must be "tool_call" or "tool_result"';
   if (typeof toolName !== "string" || !toolName) return "toolName must be a non-empty string";
   if (typeof input !== "object" || input === null || Array.isArray(input)) return "input must be an object";
