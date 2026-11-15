@@ -181,7 +181,7 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
     const { proposal, change, answeredAt } = approvedHarness(answer.approval, ["code", "removal"], branch);
     const identity = harnessIdentity(proposal);
     if (change.stage === "removal") return removalRecords(identity, change, ledger, timestamp, sessionId);
-    checkHarnessPublication(change, answer.publication, cwd, branch, identity.target.root === "companion", answeredAt);
+    checkHarnessPublication(change, answer.publication, cwd, branch, answeredAt);
     return [{ ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId }];
   }
   if (!isProposalRef(answer.proposal) || answer.approval !== undefined) {

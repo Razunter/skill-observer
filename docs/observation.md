@@ -161,15 +161,15 @@ A new or changed hook and every companion change take two approvals:
 1. **Intent.** The form shows the target, the event, the predicate, the action, the mistake sample, the legitimate sample, the scope, and why each cheaper remedy does not fit. It is one question of the main batch. Apply authorises drafting only.
 2. **Code.** A subagent drafts the code and a samples file in a temporary directory, never in the target, and runs the check. Without a subagent tool, the main agent drafts the same way. The form shows each file's exact text, the check command and its unedited output. This question gets its own Select and Ask, apart from every other question.
 
-Nothing is written before the code Apply. A note on either Apply is asked again: the main agent revises the description or the code by your note, reruns the check for code, and asks again. After the code Apply, the main agent writes each file with the `write` tool and reruns the check in the foreground, with the target's directory as working directory. `observer_resolve` records the change as applied only when the session holds those write and check calls and each file holds its approved text. It never writes these files itself.
+Nothing is written before the code Apply. A note on either Apply is asked again: the main agent revises the description or the code by your note, reruns the check for code, and asks again. Only your latest answer at a stage counts: a later Prepare or Ask of the same proposal supersedes an earlier Apply. A hook's check command names the hook by its path in the hooks directory, so the command the form shows is the one rerun on the written file. After the code Apply, the main agent writes each file with the `write` tool and reruns that command in the foreground, with the target's directory as working directory. `observer_resolve` records the change as applied only when the session holds those write calls after your Apply, runs of the approved command after them, and each file holds its approved text. It never writes these files itself.
 
 The ledger gets one record per hook or companion identity, at the end of the pass. It is `applied` when the code was approved and published, `declined` when either stage was declined, and `later` when either stage was answered Later, drafting or its check failed, or the code was never asked. A Later comes back as an intent question, and its re-offer condition says a draft existed. A record holds no file text, description or draft. A project hook's records show only in its project; global hook and companion records show in every project. Remedy outcomes count exercises after a record's timestamp, as for a project fix.
 
-A project proposal whose path lies in the project's hooks directory is refused, so no hook is written with one approval.
+A project proposal whose file lies in either hooks directory or the companion directory, followed through symlinks, is refused, so no hook or companion file is written with one approval.
 
 ### Removal
 
-Removing a hook takes one approval. The form shows the file as it stands, with Apply and Decline. On Apply the agent deletes the file with its own tools. `observer_resolve` records the removal only once the file is gone, as a withdrawal of the hook's applied record when the ledger holds one. The companion extension is not removed this way.
+Removing a hook takes one approval. The form shows the file as it stands, with Apply and Decline. On Apply the agent deletes the file with its own tools. `observer_resolve` records the removal only once the file is gone and its path still leads to the same place inside the hooks directory, as a withdrawal of the hook's applied record when the ledger holds one. The companion extension is not removed this way.
 
 ### The check
 

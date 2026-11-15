@@ -4,6 +4,8 @@ import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { canonicalPathIn, canonicalProjectTarget, type HarnessFile, type HarnessPublication, type ProjectPublication, type ProjectTarget } from "./ledger.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 import type { SessionEntry } from "./omp.js";
+import { HOOK_CHECK_PATH } from "./payload.js";
+import type { HarnessCheck } from "./review.js";
 
 export function checkProjectPublication(target: ProjectTarget, publication: ProjectPublication | undefined, branch: SessionEntry[]): void {
   if (!publication || typeof publication.afterHash !== "string" || !/^[a-f0-9]{64}$/.test(publication.afterHash) ||
@@ -40,14 +42,32 @@ export function checkCompanionCommand(command: string): void {
   if (!BUN_TEST.test(command.trim())) throw new Error(`\`${command}\` is not the companion's check: run \`bun test\` in the companion directory`);
 }
 
+/** Plain or single-quoted words, which the shell passes on as they read: no expansion, redirection or second command. */
+const PLAIN_WORDS = /^(?:(?:'[^']*'|[\w@%+=:,./-]+)(?:\s+|$))+$/;
+
+/**
+ * Throws unless `command` is the hook check on the hook at `file` in `root`:
+ * `bun --no-env-file <hook check script> <hook> <samples file>`, with the
+ * hook named so that the command, rerun in `root` after the write, checks the written hook.
+ */
+export function checkHookCommand(command: string, root: string, file: string): void {
+  const words = PLAIN_WORDS.test(command.trim()) ? [...command.trim().matchAll(/'([^']*)'|(\S+)/g)].map(([, quoted, plain]) => quoted ?? plain!) : [];
+  const [bun, flag, script, hook, samples, ...rest] = words;
+  const isHookCheck = bun === "bun" && flag === "--no-env-file" && script !== undefined && resolvePath(root, script) === HOOK_CHECK_PATH &&
+    hook !== undefined && resolvePath(root, hook) === join(root, file) && samples !== undefined && rest.length === 0;
+  if (!isHookCheck) {
+    throw new Error(`\`${command}\` is not the hook check on the hook it publishes: run \`bun --no-env-file ${HOOK_CHECK_PATH} ${file} <samples file>\` on the draft at that path in its temporary directory, so the same command reruns in \`${root}\` on the written hook`);
+  }
+}
+
 /**
  * An applied hook or companion change's receipts: a successful normal write of
  * each approved file after the user's Apply saved at `approvedAt`, still
- * inside the target root, foreground checks in the target root after every
- * write, each the companion's check for a companion change, and each file's
- * stated hash equal to the hash of its approved text and of the file as it is now.
+ * inside the target root, foreground runs of the approved check in the target
+ * root after every write, and each file's stated hash equal to the hash of
+ * its approved text and of the file as it is now.
  */
-export function checkHarnessPublication(change: { root: string; files: readonly HarnessFile[] }, publication: HarnessPublication | undefined, cwd: string, branch: readonly SessionEntry[], isCompanion: boolean, approvedAt: number): void {
+export function checkHarnessPublication(change: { root: string; files: readonly HarnessFile[]; check: HarnessCheck }, publication: HarnessPublication | undefined, cwd: string, branch: readonly SessionEntry[], approvedAt: number): void {
   if (!publication || !Array.isArray(publication.writeToolCallIds) || !Array.isArray(publication.checkToolCallIds) || !Array.isArray(publication.files) ||
       publication.checkToolCallIds.length === 0 || [...publication.writeToolCallIds, ...publication.checkToolCallIds].some((id) => typeof id !== "string" || !id)) {
     throw new Error("an applied hook or companion change needs `publication`: its observed write calls, foreground check calls and each written file's afterHash");
@@ -66,18 +86,18 @@ export function checkHarnessPublication(change: { root: string; files: readonly 
     if (publication.files.find((stated) => stated?.path === path)?.afterHash !== approved) throw new Error(`\`${file}\`: the stated afterHash is not the hash of its approved text`);
     if (!existsSync(file) || sha256(readFileSync(file)) !== approved) throw new Error(`\`${file}\` does not hold its approved text`);
   }
-  checkForegroundChecks(evidence, publication.checkToolCallIds, Math.max(...writes.map(({ result }) => result.position)), change.root, isCompanion);
+  checkForegroundChecks(evidence, publication.checkToolCallIds, Math.max(...writes.map(({ result }) => result.position)), change.root, change.check.command);
 }
 
-/** Each check is a completed, successful foreground bash call with `root` as working directory, made after branch position `after`, the companion's check when `isCompanion`. */
-function checkForegroundChecks(evidence: SessionToolEvidence, ids: readonly string[], after: number, root: string, isCompanion = false): void {
+/** Each check is a completed, successful foreground bash call with `root` as working directory, made after branch position `after`, running the `approved` command when one is given. */
+function checkForegroundChecks(evidence: SessionToolEvidence, ids: readonly string[], after: number, root: string, approved?: string): void {
   for (const id of ids) {
     const check = successfulCall(evidence, id);
     const checkArgs = check.call.args;
     if (check.call.name !== "bash" || check.call.position <= after || typeof checkArgs.cwd !== "string" ||
         canonical(checkArgs.cwd) !== canonical(root) || typeof checkArgs.command !== "string" || !checkArgs.command.trim() ||
         checkArgs.async === true || checkArgs.name != null) throw new Error("verification must be a completed foreground check in the target root after its write");
-    if (isCompanion) checkCompanionCommand(checkArgs.command);
+    if (approved !== undefined && checkArgs.command.trim() !== approved.trim()) throw new Error(`\`${checkArgs.command}\` is not the approved check \`${approved}\`: rerun it exactly`);
     const details = check.result.details;
     if (!details || typeof details !== "object" ||
         !(details.exitCode === 0 || typeof details.wallTimeMs === "number" && Number.isFinite(details.wallTimeMs) && details.wallTimeMs >= 0) ||

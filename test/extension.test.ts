@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { appendLedger, canonicalProjectTarget, harnessFingerprint, type LedgerRecord, projectFingerprint, proposalFingerprint, readLedger } from "../src/ledger.js";
 import skillObserver from "../src/skill-observer.js";
@@ -2376,10 +2376,12 @@ describe("observer hook and companion intents", () => {
     return other;
   };
   const hookText = "export default function (pi) {\n  pi.on(\"tool_call\", (event) => event.input.command?.startsWith(\"git commit\") ? { block: true, reason: \"use jj commit\" } : undefined);\n}\n";
-  const check = { command: "bun scripts/check-hook.ts hook.ts samples.json", output: "mistake git commit -m fix: blocked\nlegitimate jj commit -m fix: untouched" };
+  const checkOutput = "mistake git commit -m fix: blocked\nlegitimate jj commit -m fix: untouched";
+  /** The hook check the draft passed, run on the hook at its root-relative `file` so the same command reruns in the root after the write. */
+  const hookCheck = (file: string) => ({ command: `bun --no-env-file ${HOOK_CHECK_PATH} ${file} /tmp/draft/samples.json`, output: checkOutput });
   const sha = (text: string) => createHash("sha256").update(text).digest("hex");
   const evidence = [{ quote: 'Tool error in `bash` "git commit -m fix": "fatal: not a git repository"', count: 2 }];
-  const code = (root: string, mechanism: string, approval: unknown, files: unknown[], target: Record<string, unknown> = {}) => ({
+  const code = (root: string, mechanism: string, approval: unknown, files: Array<{ path: string; text: string }>, target: Record<string, unknown> = {}, check = hookCheck(files[0]?.path ?? "")) => ({
     ...intent(root, mechanism, target), evidence, change: { operation: "harness", stage: "code", intent: approval, files, check },
   });
   /** Starts a pass in which the user answers `candidate` alone with `answer`; returns its form, proposal and where the answer is saved. */
@@ -2401,7 +2403,8 @@ describe("observer hook and companion intents", () => {
     return { selection, entry: entry!, approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } };
   };
   /** Saves a native write of `text` to `file` and a foreground check in `cwd` after it, as the pass publishes an approved hook; writes the file too. */
-  const publish = (host: ReturnType<typeof loadExtension>, file: string, text: string, cwd: string, { checkFirst = false, checkFails = false } = {}) => {
+  const publish = (host: ReturnType<typeof loadExtension>, file: string, text: string, cwd: string,
+    { checkFirst = false, checkFails = false, command = hookCheck(basename(file)).command } = {}) => {
     mkdirSync(dirname(file), { recursive: true });
     writeFileSync(file, text);
     const n = host.getBranch().length;
@@ -2410,8 +2413,8 @@ describe("observer hook and companion intents", () => {
       { type: "message", id: `result-write-${n}`, message: { role: "toolResult", toolName: "write", toolCallId: `write-${n}`, isError: false, content: [{ type: "text", text: "Written" }] } },
     ];
     const run = [
-      { type: "message", id: `call-check-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `check-${n}`, name: "bash", arguments: { command: check.command, cwd } }] } },
-      { type: "message", id: `result-check-${n}`, message: { role: "toolResult", toolName: "bash", toolCallId: `check-${n}`, isError: checkFails, details: { exitCode: checkFails ? 1 : 0 }, content: [{ type: "text", text: check.output }] } },
+      { type: "message", id: `call-check-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `check-${n}`, name: "bash", arguments: { command, cwd } }] } },
+      { type: "message", id: `result-check-${n}`, message: { role: "toolResult", toolName: "bash", toolCallId: `check-${n}`, isError: checkFails, details: { exitCode: checkFails ? 1 : 0 }, content: [{ type: "text", text: checkOutput }] } },
     ];
     host.getBranch().push(...(checkFirst ? [...run, ...write] : [...write, ...run]) as SessionEntry[]);
     return { writeToolCallIds: [`write-${n}`], checkToolCallIds: [`check-${n}`] };
@@ -2568,7 +2571,7 @@ describe("observer hook and companion intents", () => {
       expect(askHtml).toContain(`<legend>\`${file}\` (project hook): Block git commit here</legend>`);
       expect(askHtml).toContain(join(projectHooks(host), file));
       expect(askHtml).toContain('export default function (pi) {<br>··pi.on("tool_call", (event) =&gt; event.input.command?.startsWith("git commit")');
-      expect(askHtml).toContain(`Check command: ${check.command}`);
+      expect(askHtml).toContain(`Check command: ${hookCheck(file).command}`);
       expect(askHtml).toContain("mistake git commit -m fix: blocked<br>legitimate jj commit -m fix: untouched");
       expect(askHtml).toContain("An Apply with a note is asked again.");
       expect(entry.proposal.fingerprint).toBe(proposal.fingerprint);
@@ -2592,7 +2595,7 @@ describe("observer hook and companion intents", () => {
       expect(failures(result)).toEqual([]);
       expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ kind: "harness", fingerprint: proposal.fingerprint, outcome: "applied", publication })]);
       const ledger = readFileSync(host.ledgerFile, "utf8");
-      for (const text of ["export default", check.output.split("\n")[0]!, "Predicate"]) expect(ledger).not.toContain(text);
+      for (const text of ["export default", checkOutput.split("\n")[0]!, "Predicate"]) expect(ledger).not.toContain(text);
 
       const noted = await askCode(host, code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]), () => ({ option: "Apply", note: "Also block git push." }));
       const refused = await resolve(host, [applied(noted.approval, { ...publish(host, join(hooks, file), hookText, hooks), files: [{ path: file, afterHash: sha(hookText) }] })]);
@@ -2637,9 +2640,24 @@ describe("observer hook and companion intents", () => {
     });
 
     it.each([
+      ["an unrelated command", () => "true"],
+      ["the hook check on the draft outside the target", () => `bun --no-env-file ${HOOK_CHECK_PATH} /tmp/draft/hook.ts /tmp/draft/samples.json`],
+      ["the hook check followed by another command", (file: string) => `bun --no-env-file ${HOOK_CHECK_PATH} ${file} /tmp/draft/samples.json; true`],
+      ["another script on the hook", (file: string) => `bun --no-env-file /tmp/draft/check.ts ${file} /tmp/draft/samples.json`],
+    ] as const)("refuses hook code whose check is %s, since the check rerun after the write must test the written hook", async (_label, command) => {
+      const host = loadExtension();
+      const { proposal, approval } = await askIntent(host, intent("global-hooks", "Block git commit everywhere"));
+      const file = `skill-observer-${proposal.fingerprint}.ts`;
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
+        code("global-hooks", "Block git commit everywhere", approval, [{ path: file, text: hookText }], {}, { command: command(file), output: checkOutput }),
+      ] });
+      expect(failures(prepared)).toEqual([expect.stringContaining(HOOK_CHECK_PATH)]);
+    });
+
+    it.each([
       ["no publication", "needs `publication`"], ["no write", "no observed write"], ["a write of another file", "no observed write"],
       ["a check before the write", "after its write"], ["a check in another directory", "in the target root"], ["a failed check", "no successful observed tool call"],
-      ["a missing file hash", "afterHash"],
+      ["a missing file hash", "afterHash"], ["an unrelated successful command as its check", "not the approved check"],
     ] as const)(
       "refuses an applied hook with %s", async (scenario, reason) => {
         const host = loadExtension();
@@ -2652,8 +2670,10 @@ describe("observer hook and companion intents", () => {
           mkdirSync(hooks, { recursive: true });
           writeFileSync(join(hooks, file), hookText);
         }
-        const receipts = publish(host, target, hookText, scenario === "a check in another directory" ? host.skillHome.roots.cwd : hooks,
-          { checkFirst: scenario === "a check before the write", checkFails: scenario === "a failed check" });
+        const receipts = publish(host, target, hookText, scenario === "a check in another directory" ? host.skillHome.roots.cwd : hooks, {
+          checkFirst: scenario === "a check before the write", checkFails: scenario === "a failed check",
+          ...(scenario === "an unrelated successful command as its check" && { command: "true" }),
+        });
         const publication = scenario === "no publication" ? undefined : {
           ...receipts, ...(scenario === "no write" && { writeToolCallIds: [] }),
           files: scenario === "a missing file hash" ? [] : [{ path: file, afterHash: sha(hookText) }],
@@ -2741,7 +2761,7 @@ describe("observer hook and companion intents", () => {
     const testFile = "import { expect, it } from \"bun:test\";\nit(\"registers jj_status\", () => expect(1).toBe(1));\n";
     const companionFiles = [{ path: "package.json", text: manifest }, { path: "index.ts", text: entry }, { path: "index.test.ts", text: testFile }];
     const bunTest = { command: "bun test", output: "index.test.ts:\n(pass) registers jj_status\n\n 1 pass\n 0 fail" };
-    const companionCode = (approval: unknown, files: unknown[], checked = bunTest) => ({ ...code("companion", "Register a jj tool", approval, files), change: { operation: "harness", stage: "code", intent: approval, files, check: checked } });
+    const companionCode = (approval: unknown, files: Array<{ path: string; text: string }>, checked = bunTest) => ({ ...code("companion", "Register a jj tool", approval, files), change: { operation: "harness", stage: "code", intent: approval, files, check: checked } });
     /** Saves a native write of each file and then one check, as the pass publishes an approved companion change; writes the files too. */
     const publishAll = (host: ReturnType<typeof loadExtension>, root: string, files: ReadonlyArray<{ path: string; text: string }>,
       { command = "bun test", cwd = root, checkFirst = false, checkFails = false, async = false } = {}) => {

@@ -25,7 +25,7 @@ import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from
 import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver } from "./provenance.js";
-import { checkCompanionCommand } from "./project-publication.js";
+import { checkCompanionCommand, checkHookCommand } from "./project-publication.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
 import { type PatternDraft, type Sample, sampleSchemas } from "./replay.js";
@@ -64,7 +64,7 @@ const INTENT_LINES: ReadonlyArray<[keyof HarnessIntent, string]> = [
 ];
 
 /** The check the drafting ran on the code, and its observed output. */
-interface HarnessCheck { command: string; output: string }
+export interface HarnessCheck { command: string; output: string }
 
 interface CandidateDraft {
   gist: string;
@@ -671,6 +671,7 @@ function codeStage(target: HarnessTarget, fingerprint: string, draft: Extract<Ch
   const { command, output } = draft.check ?? {};
   if (typeof command !== "string" || !command.trim() || typeof output !== "string") throw new Error("the code needs the check command it passed and that check's observed output");
   if (isCompanion) checkCompanionCommand(command);
+  else checkHookCommand(command, root, files[0]!.path);
   const preview = [
     ...files.flatMap(({ path, text }) => [`${existsSync(join(root, path)) ? "Replace" : "Create"} \`${join(root, path)}\` with:`, "", text, ""]),
     `Check command: ${command}`, "Check result:", output, "",
