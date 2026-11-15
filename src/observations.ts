@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { appendLedger, normaliseText, readLatestRows } from "./ledger.js";
@@ -6,6 +6,8 @@ import { appendLedger, normaliseText, readLatestRows } from "./ledger.js";
 export interface Observation {
   /** Project identity plus normalised text, hashed. */
   key: string;
+  /** One recording; a shown row names the recording it marks. */
+  revision: string;
   project: string;
   text: string;
   count: number;
@@ -30,7 +32,7 @@ export function recordObservation(file: string, cwd: string, text: string, now: 
   const key = createHash("sha256").update(`${project}\n${normaliseText(trimmed)}`).digest("hex").slice(0, 12);
   const pending = pendingRows(file, project, now);
   const latest = pending.find((row) => row.key === key);
-  appendRows(file, [{ key, project, text: trimmed, count: latest ? latest.count + 1 : 1, recordedAt: now.toISOString() }]);
+  appendRows(file, [{ key, revision: randomUUID(), project, text: trimmed, count: latest ? latest.count + 1 : 1, recordedAt: now.toISOString() }]);
   return latest ? pending.length : pending.length + 1;
 }
 
@@ -39,25 +41,21 @@ export function pendingObservations(file: string, cwd: string, now: Date): Obser
   return pendingRows(file, projectIdentity(cwd), now).sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
 }
 
-/** Marks the listed revisions shown; a later recording of the same text stays pending, whenever it was appended. */
+/** Marks the listed recordings shown; a later recording of the same text stays pending, whenever it was appended. */
 export function markObservationsShown(file: string, observations: readonly Observation[], now: Date): void {
   if (observations.length === 0) return;
   appendRows(file, observations.map((row) => ({ ...row, shownAt: now.toISOString() })));
 }
 
 /**
- * The latest recording per key, unless the latest shown row of that key names
- * the same revision. Expiry is decided on read: nothing runs in the
- * background, and the file is never rewritten.
+ * The latest recording per key, unless a shown row names it. Expiry is
+ * decided on read: nothing runs in the background, and the file is never rewritten.
  */
 function pendingRows(file: string, project: string, now: Date): Observation[] {
-  const rows = readLatestRows<Observation>(file, (row) => (row.shownAt === undefined ? row.key : `shown:${row.key}`));
-  const shown = new Map(rows.filter((row) => row.shownAt !== undefined).map((row) => [row.key, row]));
-  return rows.filter((row) => {
-    const marker = shown.get(row.key);
-    const wasShown = marker !== undefined && marker.recordedAt === row.recordedAt && marker.count === row.count;
-    return row.shownAt === undefined && row.project === project && !wasShown && now.getTime() - Date.parse(row.recordedAt) < PENDING_MS;
-  });
+  const rows = readLatestRows<Observation>(file, (row) => (row.shownAt === undefined ? row.key : `shown:${row.revision}`));
+  const shown = new Set(rows.filter((row) => row.shownAt !== undefined).map((row) => row.revision));
+  return rows.filter((row) =>
+    row.shownAt === undefined && row.project === project && !shown.has(row.revision) && now.getTime() - Date.parse(row.recordedAt) < PENDING_MS);
 }
 
 export function renderObservations(observations: readonly Observation[]): string {

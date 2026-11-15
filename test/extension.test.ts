@@ -5857,6 +5857,31 @@ describe("observations", () => {
     expect(observationLines(host)).toEqual([`- ${OBSERVATION} (count 2, last recorded ${today()})`]);
   });
 
+  it("keeps both recordings shown when their shown rows land in reverse order", async () => {
+    const host = loadExtension();
+    await host.callTool("observe", { text: OBSERVATION });
+    await host.callTool("observe", { text: OBSERVATION });
+    const recordings = readFileSync(host.observationsFile, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const shownAt = new Date().toISOString();
+    for (const row of [...recordings].reverse()) appendFileSync(host.observationsFile, `${JSON.stringify({ ...row, shownAt })}\n`);
+    host.setBranch(fx.plainUserMessage);
+    await host.runCommand("observe");
+    expect(host.sent).toEqual([]);
+  });
+
+  it("keeps a text recorded again in the same millisecond as its shown recording pending", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(T0);
+    const host = loadExtension();
+    host.setBranch(fx.plainUserMessage);
+    await host.callTool("observe", { text: OBSERVATION });
+    await host.runCommand("observe");
+    await host.callTool("observe", { text: OBSERVATION });
+    await host.runCommand("observe");
+    expect(host.sent).toHaveLength(2);
+    expect(observationLines(host)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${new Date(T0).toISOString().slice(0, 10)})`]);
+  });
+
   it("keeps another project's observations out, and outside git identifies a project by the working directory's real path", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "skill-observer-plain-")));
     for (const dir of ["one", "two"]) mkdirSync(join(root, dir));
