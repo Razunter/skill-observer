@@ -151,6 +151,24 @@ The extension's tool hooks save a copy of every call they see, native or not: th
 
 Project receipts validate ledger scope and observed tool evidence; they do not attest that a successful command proves the remedy correct. These checks are trusted-host checks, not an OS sandbox or an atomic filesystem transaction. Reconcile unknown outcomes rather than inventing applied receipts.
 
+### Observer hooks and the companion extension
+
+Review candidates, prepared proposals and ledger records have a third target scope beside the skill kinds and `project`: `kind: "harness"` with `target: { scope: "harness", root, path?, mechanism }`. `root` is `project-hooks` (`<project>/.omp/hooks/pre`, with the canonical project root as `project`), `global-hooks` (`<agent dir>/hooks/pre`) or `companion` (`<agent dir>/extensions/skill-observer-companion`). `harnessRootDirs` in [`src/ledger.ts`](../src/ledger.ts) names the three directories, and the payload's directory line prints them.
+
+A hook's identity hashes the root kind, the project for a project hook, the root-relative path and the normalised mechanism. A new hook has no `path` and is written as `skill-observer-<fingerprint>.ts`. An existing hook, hand-written ones included, is named by its path. A companion change is identified by the root and its mechanism alone and may touch several files. Every file must stay inside its root, with the containment checks project targets have. A `project` candidate whose path lies in the project's hooks directory is refused with a message naming the `harness` scope.
+
+A harness candidate's change carries a `stage`:
+
+- `intent`: the event, predicate, action, mistake and legitimate samples, scope and `lowerRungs`, why each cheaper remedy does not fit. The preview is that description. Apply authorises drafting only.
+- `code`: cites the intent's Apply as `intent`, carries every file's exact text and the check's `command` and `output`. Prepare accepts it only when that Apply holds in the current pass for the same identity. Select refuses to put it in a form with any other proposal. A new companion needs a `package.json` declaring `omp.extensions`. Every companion change keeps a test file outside `node_modules` and uses `bun test` as its check.
+- `removal`: names an existing hook file. The preview is the file as it stands, with Apply and Decline. The identity is the file alone, so the resolver finds the applied records of any hook at that path.
+
+An Apply with a note approves nothing at any stage: the main agent revises by the note, prepares and asks again. A harness answer is `applied`, `later` or `declined`, one per identity in a call. An applied code answer cites its code-stage Apply through `approval` and carries `publication: { writeToolCallIds, checkToolCallIds, files: [{ path, afterHash }] }`. `checkHarnessPublication` in [`src/project-publication.ts`](../src/project-publication.ts) requires a successful `write` of each approved file, completed foreground `bash` checks after the writes with the target root as `cwd`, each stated `afterHash` equal to the hash of the approved text, and each file on disk holding that text. An intent Apply never records `applied`. A Later after a shown draft records `later` with a re-offer saying a draft existed, and it comes back as an intent question. An applied removal is recorded only once the file is absent, as `withdrawn` for every record that holds a hook at that file in force. The resolver writes and deletes none of these files.
+
+[`ledgerForProject`](../src/ledger.ts) keeps a project hook's records only in their project and keeps global hook and companion records everywhere. Remedy outcomes treat harness records like project fixes: they have no amendment to deliver, and exercises after the record's timestamp count. The payload and `/observe-report` label them by file name and root.
+
+[`scripts/check-hook.ts`](../scripts/check-hook.ts) is the hook check. It loads a hook's default-exported factory against a stand-in host with no UI, with `ctx.cwd` set to the working directory, and feeds a samples file's events to the handlers it registered. See [The check](observation.md#the-check) for usage. [`test/hook-check.test.ts`](../test/hook-check.test.ts) covers it.
+
 ## Extension entry
 
 OMP loads [`src/skill-observer.ts`](../src/skill-observer.ts) through the `omp.extensions` entry in [`package.json`](../package.json). The extension has no runtime dependencies. OMP names an extension after its entry file, or after the entry's folder when the file is `index.ts`. The `skill-observer.ts` entry gives this module the name `skill-observer` and the settings ID `extension-module:skill-observer`; an entry at `src/index.ts` would instead be named `src`. Configured module paths are deduplicated by real file path, so a symlink and its target load once.
@@ -177,7 +195,7 @@ This runs ordinary tests without launching the native OMP checks. See [Testing](
 <!-- end -->
 ```
 
-A marker sits alone on its line and wraps whole paragraphs or list items, never part of a sentence or item. Gates are `stale`, `compaction`, `project`, `withdrawal`, `ranking`, `note` and `tool-result`; blocks don't nest. One parser, `parseFragments` in [`src/payload.ts`](../src/payload.ts), splits the file at its `##` headings and markers. It throws on an unknown gate, an unbalanced or nested marker, or a block that splits a paragraph or list item. `/observe` runs it on every pass, so a malformed marker stops the pass with an error notice.
+A marker sits alone on its line and wraps whole paragraphs or list items, never part of a sentence or item. Gates are `stale`, `compaction`, `project`, `withdrawal`, `ranking`, `note`, `observations` and `tool-result`; blocks don't nest. One parser, `parseFragments` in [`src/payload.ts`](../src/payload.ts), splits the file at its `##` headings and markers. It throws on an unknown gate, an unbalanced or nested marker, or a block that splits a paragraph or list item. `/observe` runs it on every pass, so a malformed marker stops the pass with an error notice.
 
 After editing `observer.md`, regenerate the committed fragment files:
 
@@ -193,7 +211,7 @@ It writes `observer/<section>-<gate|core>-<n>.md`, one file per fragment, where 
 bun pm pack
 ```
 
-Run this from the source checkout's extension root. It creates `skill-observer-0.2.0.tgz` using the `files` allowlist in `package.json`: runtime source, `observer.md` and its generated `observer/` fragments, reader documentation, the licence and third-party notices, the README, and changelog. It excludes tests, development configuration, and installed dependencies. Packing creates a local archive for distribution checks; it does not publish the package. Normal setup uses `omp install` with the repository URL.
+Run this from the source checkout's extension root. It creates `skill-observer-0.2.0.tgz` using the `files` allowlist in `package.json`: runtime source, the hook check script, `observer.md` and its generated `observer/` fragments, reader documentation, the licence and third-party notices, the README, and changelog. It excludes tests, development configuration, and installed dependencies. Packing creates a local archive for distribution checks; it does not publish the package. Normal setup uses `omp install` with the repository URL.
 
 ### Modules
 
@@ -202,17 +220,18 @@ Run this from the source checkout's extension root. It creates `skill-observer-0
 | [`src/skill-observer.ts`](../src/skill-observer.ts) | Entry: wires hooks, the status hint, `/observe` with its observation payload assembly, `/observe-report` and the startup migration |
 | [`src/payload.ts`](../src/payload.ts) | Observation payload: the `observer.md` fragment parser, gates from pass evidence, gated instruction text, `tool-result` guidance and the chars/4 payload estimate |
 | [`scripts/generate-fragments.ts`](../scripts/generate-fragments.ts) | `bun run generate`: writes `observer/` from `observer.md` |
+| [`scripts/check-hook.ts`](../scripts/check-hook.ts) | The hook check: runs an observer hook against sample events on a stand-in host |
 | [`src/delivery.ts`](../src/delivery.ts) | On-read amendment delivery on both routes (`/skill:` reminder, `read` of the entry file) and the once-per-context-window rule |
 | [`src/reminder.ts`](../src/reminder.ts) | Delivery records: reminder markup, reminder message type, delivery entry type and their parsers |
 | [`src/amendments.ts`](../src/amendments.ts) | Observer rule files in both directories: reading, writing, pins, staleness and the load-time migration |
 | [`src/provenance.ts`](../src/provenance.ts) | Where a skill comes from (local, upstream, managed, plugin, or a byte-identical copy of one) and the skill-folder `skillHash` |
 | [`src/digest.ts`](../src/digest.ts) | Session digest: skill signals, loaded skills and deliveries rebuilt from the branch |
-| [`src/ledger.ts`](../src/ledger.ts) | Proposal ledger: append-only JSONL, latest answer per fingerprint |
+| [`src/ledger.ts`](../src/ledger.ts) | Proposal ledger: append-only JSONL, latest answer per fingerprint, project and harness target identities, and the three harness directories |
 | [`src/observations.ts`](../src/observations.ts) | Observation store: append-only JSONL, latest row per project and text, pending and expiry on read, the project identity from the shared git directory, and the payload section |
 | [`src/resolve.ts`](../src/resolve.ts) | `observer_resolve`: validates and records answers, and replays pattern rules before the call's changes |
 | [`src/on-read-amendment-transitions.ts`](../src/on-read-amendment-transitions.ts) | On-read amendment transitions: one call's stale settlements, withdrawals, additions and rules, and compactions in their phases, with withdrawal checks, compaction coverage and reference release |
 | [`src/publication.ts`](../src/publication.ts) | Builds and validates the rule of an applied fix from its approved section or rule |
-| [`src/project-publication.ts`](../src/project-publication.ts) | Project-fix publication receipts checked against the session branch |
+| [`src/project-publication.ts`](../src/project-publication.ts) | Project-fix and harness publication receipts checked against the session branch |
 | [`src/session-tool-evidence.ts`](../src/session-tool-evidence.ts) | Session tool evidence: writes the hook records and indexes them with native tool records by call ID for the lossy digest view, the strict completed-call pairing receipts use and native placement for delivery |
 | [`src/review.ts`](../src/review.ts) | `observer_review`: canonical prepared proposals with previews and target snapshots, reference-verified selection with the rendered Ask form, and advisory judge ranking |
 | [`src/proposal-approval.ts`](../src/proposal-approval.ts) | Proposal approval: the current observation pass, the user's branch-backed Prepare → Select → native Ask approval of an on-read append, pattern amendment, barrier rule, stale Update or Delete, withdrawal or compaction, read from the form's answers and option notes, and the proposal reconciliation of an append or rule by an approval note, a changed target or both |
@@ -244,6 +263,8 @@ SKILL_OBSERVER_NATIVE_TESTS=1 bun run test
 The installed OMP host loads `test/native-schema.ts` without a model prompt to verify actual tool-schema registration. It uses a temp agent dir so the extension's startup migration never touches your rules. The amendment/replay suites use `omp ttsr test` for native trigger checks. These OMP-backed checks are skipped when OMP is unavailable or `SKILL_OBSERVER_NATIVE_TESTS` is not `1`; requesting them with `1` does not turn a missing prerequisite into a passing check.
 
 The `/skill:` reminder finds the skill by the first line of OMP's user-invocation template. One test renders `src/prompts/skills/user-invocation.md` from the package of the first `omp` on `PATH` (an npm or Bun global install), so a reworded template in the installed OMP fails the suite. It is skipped, independently of the native-test flag, when `omp` is missing or is a compiled binary that ships no template. Native checks still require their OMP or Bun prerequisites.
+
+One check stays manual and outside the suite: that OMP loads a hook file from the global hooks directory and the hook acts. Copy your agent dir's auth and config to a temp dir, write a hook into its `hooks/pre/` that blocks one `bash` command, confirm it with `scripts/check-hook.ts` and a samples file, then start a new `omp` with `PI_CODING_AGENT_DIR` set to the temp dir and ask it to run the blocked command and a legitimate one. Do not pass `--no-extensions`: it also turns off hook discovery. It covers loading once, not each hook a pass writes.
 
 ### Git hooks
 

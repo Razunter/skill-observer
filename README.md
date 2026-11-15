@@ -4,7 +4,7 @@ An [OMP](https://github.com/can1357/oh-my-pi) extension for adjusting upstream s
 
 Your adjustments live in separate **amendments** that survive skill updates. The extension delivers them when you invoke `/skill:<name>` or the agent reads the skill's `SKILL.md`.
 
-Run `/observe` to review session corrections and proposed fixes. After an upstream skill changes, the next `/observe` checks whether its amendments still apply. It can also propose local skill improvements and project checks.
+Run `/observe` to review session corrections and proposed fixes. After an upstream skill changes, the next `/observe` checks whether its amendments still apply. It can also propose local skill improvements and project checks. As a last resort, it writes a hook or changes one companion extension after two approvals, and it reports problems in other extensions instead of editing them.
 
 **Status:** vibe-coded experiment.
 
@@ -64,7 +64,7 @@ Install these skills separately. Ordinary observation works without them. See [o
 ## Documentation
 
 - [Setup](docs/setup.md) covers first use, persistent loading, optional skills, and state locations.
-- [Observation workflow](docs/observation.md) explains signals, proposals, project scope, and the session digest.
+- [Observation workflow](docs/observation.md) explains signals, proposals, project scope, report items, observer hooks and the session digest.
 - [Amendments and replay](docs/amendments.md) covers storage, delivery, upstream updates, reference files, and pattern checks.
 - [Development and tool contracts](docs/development.md) covers proposal approval, the ledger, module responsibilities, and development checks.
 - [Changelog](CHANGELOG.md) records package changes.

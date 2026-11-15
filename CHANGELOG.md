@@ -5,6 +5,11 @@
 ### Added
 
 - The main agent records an observation with the new `observe` tool: one remark of up to 500 characters about something a skill, a rule or the project setup got wrong. Observations are stored in `<agent dir>/skill-observer/observations.jsonl` per repository, shared by its worktrees, and survive across sessions. The next `/observe` in that repository lists them in a new `observations` payload section, starts a pass even when they are its only evidence, and then marks them shown; one never shown expires 30 days after it was last recorded. Recording the same text again raises its count. Subagent calls are refused. The status line and `/observe-report` show the pending count, and a new `observations` gate adds pass instructions for checking them.
+- Each tool error in the session digest names the tool's supplier: the extension file that registered it, or the MCP server. A built-in tool shows none, and a result copied without one shows `Supplier not recorded.` The label names who supplied the tool, not who caused the failure.
+- Every pass gets the remedy ladder: configuration or wiring repair, text or skill edit, amendment, barrier rule, pattern amendment and project check first, then an observer hook, then the companion extension as last resorts.
+- Report items: a finding no proposal fits, a capability nothing can provide, or a fix in another extension's code goes into the pass summary with supplier, request and result, expected behaviour, cause status, a scenario and a next action. Report items are not asked about or stored. This replaces the "Unknown target" summary drafts.
+- Observer hooks and the companion extension, under the new `harness` target scope. A pass may write or change a hook in `<project>/.omp/hooks/pre/` or `<agent dir>/hooks/pre/`, or change `<agent dir>/extensions/skill-observer-companion/`, after two approvals: the described remedy, then the exact code with its check result. A hook is removed after one approval that shows the file. Each identity gets one ledger record per pass. A `project` proposal inside the project's hooks directory is refused. Changes take effect only after omp restarts.
+- `scripts/check-hook.ts` runs a hook against a samples file of mistake and legitimate events on a stand-in host and reports each outcome. It ships in the package.
 
 ### Changed
 

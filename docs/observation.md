@@ -48,13 +48,13 @@ Observations are stored in `<agent dir>/skill-observer/observations.jsonl`, one 
 
 An observation is pending until a pass shows it, or until 30 days after it was last recorded. Recording the same text again, ignoring case, punctuation and spacing, raises its count and restarts its 30 days; recording a text already shown or expired starts again at count 1. A successful call tells the agent how many observations are pending and that `/observe` reviews them; the agent may mention the command, but only the user starts a pass.
 
-`/observe` lists the project's pending observations in the payload's **observations** section and starts a pass even when they are its only evidence. Right after sending the payload it marks the listed ones shown, so the next pass does not list them, even when this one is interrupted. If marking fails, an error notice says so and the pass continues. An observation recorded during a pass, or recorded again while `/observe` assembled the payload, waits for the next one. The pass checks each observation against the session and the checkout, turns it into a proposal when a proposal kind fits, and otherwise reports it with a suggested next action. Pending observations do not turn on the `project` gate.
+`/observe` lists the project's pending observations in the payload's **observations** section and starts a pass even when they are its only evidence. Right after sending the payload it marks the listed ones shown, so the next pass does not list them, even when this one is interrupted. If marking fails, an error notice says so and the pass continues. An observation recorded during a pass, or recorded again while `/observe` assembled the payload, waits for the next one. The pass checks each observation against the session and the checkout, turns it into a proposal when a proposal kind fits, and otherwise reports it as a [report item](#report-items). Pending observations do not turn on the `project` gate.
 
 ## Observation payload
 
 The message that starts a pass holds these sections, in this order, leaving out any without text:
 
-- **instructions**: the parts of [`observer.md`](../observer.md) the session's evidence can reach, then the path of `observer.md` and the skills, managed-skills, user rules, on-read amendments and reference files directories;
+- **instructions**: the parts of [`observer.md`](../observer.md) the session's evidence can reach, then the path of `observer.md` and the skills, managed-skills, user rules, on-read amendments and reference files directories, then the project hooks, global hooks and companion extension directories (see [Observer hooks and the companion extension](#observer-hooks-and-the-companion-extension));
 - **note**: the User note;
 - **digest**: the [session digest](#digest);
 - **observations**: the project's [pending observations](#observations), one line each with its count and the date it was last recorded;
@@ -75,7 +75,7 @@ The message that starts a pass holds these sections, in this order, leaving out 
 | `withdrawal` | a fix is in force for a loaded skill, or there is a User note | withdrawal candidates and questions, and retracted fixes |
 | `ranking` | the host has an explicit, available `judge` role assignment | advisory ranking and Select's `rankings`; without it the pass calls Select without rankings |
 | `note` | there is a User note | how to weigh the User note |
-| `observations` | the project has a pending observation | checking observations, and reporting those no proposal kind fits with a next action |
+| `observations` | the project has a pending observation | checking observations; those no proposal kind fits become report items |
 | `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, with custom input and with an approval note; see below |
 
 Under the `project` gate, the Retrospective reference includes the installed `retro` skill's text inline, without its frontmatter. A preceding line says which parts apply: its candidate categories do; its own steps and Files section describe a standalone retrospective and do not. Without `retro`, the section says the reference is unavailable and the UI warns. Without the gate, neither the section nor the warning appears.
@@ -116,6 +116,87 @@ Findings about the same scoped mechanism merge their observer, retrospective and
 
 For an approved project check repair, the model publishes the exact reviewed diff with normal tools and exercises the known mistake plus a legitimate counterpart using temporary inputs. Expected rejection is asserted by a successful verification command; temporary inputs are restored. Only then can actual write/check tool-call IDs and the current target SHA-256 support an applied project record. A failed or unknown write/check remains deferred and is reported truthfully.
 
+## Remedy ladder
+
+The pass ranks remedies by cost, cheapest first, not by who owns the failing component:
+
+1. A configuration or wiring repair, a text or skill edit, an amendment, a barrier rule, a pattern amendment or a project check: the remedies above and in [Amendments](amendments.md).
+2. An [observer hook](#observer-hooks-and-the-companion-extension): one hook file in the project's hooks directory or in yours.
+3. The [companion extension](#observer-hooks-and-the-companion-extension): the one user-level extension the pass may edit, for a remedy that needs a registered tool, several modules or a dependency.
+
+Rungs 2 and 3 are last resorts. When the needed capability exists but is off or misconfigured, the pass proposes the configuration repair. A tool that rightly rejected a misuse stays unchanged; the misuse gets the cheapest fitting remedy on the agent's side. The pass reads an owner's documentation or source only for components the evidence touches.
+
+## Report items
+
+A report item is a finding the pass tells you about in its summary instead of asking about it. Three kinds of finding become report items:
+
+- an evidenced finding no proposal kind fits, a checked observation included;
+- a capability no rung can provide. The item names the event or tool it would need, who would own its state, the benefit and the risks;
+- a fix in the behavioural code of any extension other than the companion extension, wherever that code lives, under the project root included. Configuration and check wiring of such an extension stay ordinary proposals.
+
+Each item gives the supplier or owner, what was requested and what resulted, the expected behaviour with its source or "undocumented", the cause status (confirmed, suspected or unknown), a scenario that would show the fix with its legitimate counterpart, and a next action. A part the evidence does not settle reads "unknown". A failed tool call is not presented as a confirmed extension defect.
+
+Report items are not asked about, not stored in the ledger and not offered again. You act on the summary. The rule against editing another extension's code is an instruction, not a check: Prepare cannot tell extension code from other project files by path.
+
+## Observer hooks and the companion extension
+
+An **observer hook** is a hook file a pass wrote after your approval. The **companion extension** is the one user-level extension a pass may edit. Both live in fixed directories, which the payload's directory line names:
+
+| Target | Directory |
+|---|---|
+| Project hook | `<project>/.omp/hooks/pre/` |
+| Global hook | `<agent dir>/hooks/pre/` |
+| Companion extension | `<agent dir>/extensions/skill-observer-companion/` |
+
+`<project>` is the real path of OMP's working directory. `<agent dir>` is `~/.omp/agent` unless `PI_CODING_AGENT_DIR` or a profile names another. OMP discovers hooks only in a `pre` or `post` subfolder, and observer hooks go in `pre`.
+
+A hook is one self-contained file. It may register event handlers and commands and keep state. A project hook fixes a mistake specific to this project. A global hook must generalise the way global skill guidance must. A new hook's file is named `skill-observer-<fingerprint>.ts`, so a project hook and a global hook never share a name. OMP loads only the first hook file of a given name. A pass may also change or remove any hook file in the two hooks directories, ones you wrote by hand included.
+
+The companion extension is for a remedy that needs a registered tool, several modules or a dependency. The first approved change creates it. Its `package.json` declares its entry files under `omp.extensions`, because OMP loads nothing else in that directory. Every change keeps a test file there, and `bun test` in the directory is its check.
+
+### Two approvals
+
+A new or changed hook and every companion change take two approvals:
+
+1. **Intent.** The form shows the target, the event, the predicate, the action, the mistake sample, the legitimate sample, the scope, and why each cheaper remedy does not fit. It is one question of the main batch. Apply authorises drafting only.
+2. **Code.** A subagent drafts the code and a samples file in a temporary directory, never in the target, and runs the check. Without a subagent tool, the main agent drafts the same way. The form shows each file's exact text, the check command and its unedited output. This question gets its own Select and Ask, apart from every other question.
+
+Nothing is written before the code Apply. A note on either Apply is asked again: the main agent revises the description or the code by your note, reruns the check for code, and asks again. After the code Apply, the main agent writes each file with the `write` tool and reruns the check in the foreground, with the target's directory as working directory. `observer_resolve` records the change as applied only when the session holds those write and check calls and each file holds its approved text. It never writes these files itself.
+
+The ledger gets one record per hook or companion identity, at the end of the pass. It is `applied` when the code was approved and published, `declined` when either stage was declined, and `later` when either stage was answered Later, drafting or its check failed, or the code was never asked. A Later comes back as an intent question, and its re-offer condition says a draft existed. A record holds no file text, description or draft. A project hook's records show only in its project; global hook and companion records show in every project. Remedy outcomes count exercises after a record's timestamp, as for a project fix.
+
+A project proposal whose path lies in the project's hooks directory is refused, so no hook is written with one approval.
+
+### Removal
+
+Removing a hook takes one approval. The form shows the file as it stands, with Apply and Decline. On Apply the agent deletes the file with its own tools. `observer_resolve` records the removal only once the file is gone, as a withdrawal of the hook's applied record when the ledger holds one. The companion extension is not removed this way.
+
+### The check
+
+[`scripts/check-hook.ts`](../scripts/check-hook.ts) ships in the package:
+
+```sh
+bun --no-env-file scripts/check-hook.ts <hook-file> <samples-file>
+```
+
+It loads the hook's default-exported factory against a stand-in host with no UI, feeds the samples' events in file order and prints one `PASS` or `FAIL` line per sample, then a verdict. It exits 0 only when every sample got its expected outcome: `blocked`, `context` (added context only) or `untouched`. The samples file is a JSON array that holds at least one `mistake` sample and one `legitimate` sample. A hook that keeps state gets the sequence its state needs. Run the script without arguments for the full sample format.
+
+The check shows that the hook's predicate separates the samples. It does not show that the hook loads and behaves in a real session.
+
+### Activation
+
+A written, changed or deleted hook or companion file takes effect only after you restart omp. A new session in the same process keeps the hooks and extensions it started with. The code and removal forms say so.
+
+### Risks and manual removal
+
+Hook and companion code runs inside the omp process, with your permissions, without a sandbox, permission model or automatic disable. A `tool_call` handler that throws or times out blocks the call. A faulty observer hook can therefore block the tools a pass needs to remove it. Then delete the file by hand and restart omp:
+
+- a project hook: `<project>/.omp/hooks/pre/skill-observer-<fingerprint>.ts`;
+- a global hook: `<agent dir>/hooks/pre/skill-observer-<fingerprint>.ts`;
+- the companion extension: move or delete `<agent dir>/extensions/skill-observer-companion/`.
+
+A hand-written hook keeps its own file name. The intent and removal forms show its full path.
+
 ## Rules in force
 
 After the [proposal ledger](development.md#ledger), **Rules in force** lists what is already in force for each skill under **Skills loaded**, with no cap, so the pass neither proposes a duplicate nor misses a repeat. Skills not loaded in this session are left out. For each loaded skill, it lists every marked rule whose `amends` is that skill:
@@ -136,7 +217,7 @@ The pass dismisses a candidate that a listed rule already covers. A signal repea
 The digest keeps signals and drops everything else: harness messages (wiki recall, status notices, advisor, reminders and nudges, background-job and IRC deliveries, file mentions, `developer` messages), bookkeeping entries and thinking blocks.
 
 - **Corrections** carry the ~200 characters of assistant text just before them. Their own text is cut at 2,000 characters, so a pasted log can't fill the digest.
-- **Tool errors** show the tool, a short argument summary and the error. A long error keeps its start and its end around `…`, within about 300 characters, since a failed command may state why at either end. They name the skills loaded earlier in the same turn. Errors inside an observation pass are left out, and its calls get no outline.
+- **Tool errors** show the tool, a short argument summary and the error. A long error keeps its start and its end around `…`, within about 300 characters, since a failed command may state why at either end. They name the skills loaded earlier in the same turn, and end with the tool's [supplier label](#supplier-label). Errors inside an observation pass are left out, and its calls get no outline.
 - **Workflow outlines** list one line per tool call (name, argument summary, ok/error), up to 50 calls, so one long turn can't crowd out every other signal. A subagent run shows only its `task` call (task names and agents) and the status its subagents ended with, taken from `wait` results and background-job deliveries.
 - **Identical signals** are counted as one, with a `(×N)` count, placed where they last occurred. Each keeps the occurrence IDs it stands for; a tool error's ID nests under its turn's workflow outline (`<workflow>/<event>`), so ranking counts distinct occurrences, not descriptions.
 - **Device dispatch** (`write xd://<tool>`) is recorded once, as the inner tool. A call saved both natively and by the extension's hooks also counts once, at its first request and first outcome; calls nested in `eval` appear only through their hook records, and structured parallel calls through their `tool_uses`. This view is deliberately lossy: publication receipts never rely on it.
@@ -144,3 +225,16 @@ The digest keeps signals and drops everything else: harness messages (wiki recal
 - **Managed skills** created with `manage_skill` in the session are listed, so the pass doesn't propose them again.
 
 The rendered digest is capped at about 12k tokens (estimated as 4 characters per token). Over the cap, the oldest signals are dropped first and the digest says how many. The signals left are numbered `S1`, `S2`, … from the oldest, so proposals can cite them; the ids hold only within one pass.
+
+### Supplier label
+
+When the extension copies a tool result at its tool-result hook, it also stores who supplied the tool. It looks the tool up by name in the host's list of all tools at that moment. A tool error in the digest ends with:
+
+- `` Supplier: `<path>`. `` for a tool an extension registered, naming the extension's file, or the host's placeholder path for an SDK tool;
+- `` Supplier: MCP server `<name>`. `` for an MCP tool;
+- nothing for a built-in tool;
+- `Supplier not recorded.` when the copied result has no supplier: results saved before this version, results the extension did not copy, and lookups that failed.
+
+For a device dispatch (`write xd://<tool>`) the label is the inner tool's, found by call ID on the extension's copy of the result. A failed lookup stores nothing and never fails the hook.
+
+The label names who supplied the tool, never who caused the failure. Another extension can block or change a call and its result. The pass weighs caller error, configuration, another extension's interception and unknown as causes besides the supplier. Commands and hook-only behaviour get no label: the pass reads their owner's documentation when the evidence points there, and "unknown" is a valid owner. The payload lists no installed extensions.
