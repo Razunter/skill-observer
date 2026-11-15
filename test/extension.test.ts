@@ -2826,6 +2826,8 @@ describe("observer hook and companion intents", () => {
       ["no manifest in a new companion", companionFiles.filter(({ path }) => path !== "package.json"), bunTest, "package.json"],
       ["a manifest declaring no entry", [{ path: "package.json", text: '{ "name": "skill-observer-companion" }' }, ...companionFiles.slice(1)], bunTest, "omp.extensions"],
       ["a check other than bun test", companionFiles, { command: "bunx vitest run", output: "1 passed" }, "bun test"],
+      ["bun test followed by another command", companionFiles, { ...bunTest, command: "bun test ; true" }, "bun test"],
+      ["bun test with another command on the next line", companionFiles, { ...bunTest, command: "bun test \n/usr/bin/true" }, "bun test"],
     ])("refuses companion code with %s", async (_label, files, checked, reason) => {
       const host = loadExtension();
       mkdirSync(agentDir(host), { recursive: true });
