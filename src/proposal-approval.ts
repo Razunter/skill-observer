@@ -284,9 +284,10 @@ function approvedProposal<C>(ref: ProposalAnswerRef, evidence: SessionToolEviden
  * approval note on this scope is custom input: the description or code is
  * revised by it and asked again, so a noted Apply approves nothing. A later
  * Prepare or answer of the same stage and identity supersedes the Apply.
+ * Returns the branch position where the Apply was saved too.
  */
 export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<ProposalAnswerRef> | undefined, stages: readonly S[], branch: readonly SessionEntry[]):
-  { proposal: PreparedProposal; change: Extract<HarnessChange, { stage: S }> } {
+  { proposal: PreparedProposal; change: Extract<HarnessChange, { stage: S }>; answeredAt: number } {
   const approval = answerRef(ref);
   const evidence = sessionToolEvidence(branch);
   const { proposal, change, note, answeredAt } = approvedProposal(approval, evidence, branch, (prepared) => {
@@ -306,7 +307,7 @@ export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<P
   if (isReprepared || isReasked) {
     throw new Error("this Apply is superseded: a later Prepare or Ask of this pass holds the same proposal again; cite the user's latest answer, which must be an unnoted Apply");
   }
-  return { proposal, change };
+  return { proposal, change, answeredAt };
 }
 
 /** The reference that the branch's last successful Prepare holding `candidateId` returned for it; that Prepare may be native or nested. */

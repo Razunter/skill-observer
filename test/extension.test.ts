@@ -2615,6 +2615,18 @@ describe("observer hook and companion intents", () => {
       expect(existsSync(host.ledgerFile)).toBe(false);
     });
 
+    it("refuses an applied hook whose write and check came before the code's Apply", async () => {
+      const host = loadExtension();
+      const { proposal, approval: intentApproval } = await askIntent(host, intent("global-hooks", "Block git commit everywhere"));
+      const file = `skill-observer-${proposal.fingerprint}.ts`;
+      const hooks = join(agentDir(host), "hooks/pre");
+      const early = publish(host, join(hooks, file), hookText, hooks);
+      const { approval } = await askCode(host, code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]));
+      const result = await resolve(host, [applied(approval, { ...early, files: [{ path: file, afterHash: sha(hookText) }] })]);
+      expect(failures(result)).toEqual([expect.stringContaining("before the user's Apply")]);
+      expect(existsSync(host.ledgerFile)).toBe(false);
+    });
+
     it.each([
       ["no publication", "needs `publication`"], ["no write", "no observed write"], ["a write of another file", "no observed write"],
       ["a check before the write", "after its write"], ["a check in another directory", "in the target root"], ["a failed check", "no successful observed tool call"],

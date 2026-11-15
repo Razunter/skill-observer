@@ -42,12 +42,12 @@ export function checkCompanionCommand(command: string): void {
 
 /**
  * An applied hook or companion change's receipts: a successful normal write of
- * each approved file, still inside the target root, foreground checks in the
- * target root after every write, each the companion's check for a companion
- * change, and each file's stated hash equal to the hash of its approved text
- * and of the file as it is now.
+ * each approved file after the user's Apply saved at `approvedAt`, still
+ * inside the target root, foreground checks in the target root after every
+ * write, each the companion's check for a companion change, and each file's
+ * stated hash equal to the hash of its approved text and of the file as it is now.
  */
-export function checkHarnessPublication(change: { root: string; files: readonly HarnessFile[] }, publication: HarnessPublication | undefined, cwd: string, branch: readonly SessionEntry[], isCompanion: boolean): void {
+export function checkHarnessPublication(change: { root: string; files: readonly HarnessFile[] }, publication: HarnessPublication | undefined, cwd: string, branch: readonly SessionEntry[], isCompanion: boolean, approvedAt: number): void {
   if (!publication || !Array.isArray(publication.writeToolCallIds) || !Array.isArray(publication.checkToolCallIds) || !Array.isArray(publication.files) ||
       publication.checkToolCallIds.length === 0 || [...publication.writeToolCallIds, ...publication.checkToolCallIds].some((id) => typeof id !== "string" || !id)) {
     throw new Error("an applied hook or companion change needs `publication`: its observed write calls, foreground check calls and each written file's afterHash");
@@ -55,6 +55,7 @@ export function checkHarnessPublication(change: { root: string; files: readonly 
   const evidence = sessionToolEvidence(branch);
   const writes = publication.writeToolCallIds.map((id) => successfulCall(evidence, id));
   if (writes.some(({ call }) => call.name !== "write")) throw new Error("hook and companion files are published with the normal write tool");
+  if (writes.some(({ call }) => call.position <= approvedAt)) throw new Error("a cited write was made before the user's Apply of the code: write each file again after it, then rerun the check");
   const written = new Set(writes.map(({ call }) => typeof call.args.path === "string" ? canonical(resolvePath(cwd, writeTargetPath(call.args.path))) : ""));
   for (const { path, text } of change.files) {
     // A directory replaced by a symlink since Prepare would carry the write out of the root.

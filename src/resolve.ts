@@ -176,10 +176,10 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
     if (answer.approval === undefined || answer.proposal !== undefined) {
       throw new Error("an applied hook or companion change cites the user's Apply of its code stage or removal through `approval`; an intent Apply authorises drafting only: record it as `later` until its code is approved");
     }
-    const { proposal, change } = approvedHarness(answer.approval, ["code", "removal"], branch);
+    const { proposal, change, answeredAt } = approvedHarness(answer.approval, ["code", "removal"], branch);
     const identity = harnessIdentity(proposal);
     if (change.stage === "removal") return removalRecords(identity, change.file, ledger, timestamp, sessionId);
-    checkHarnessPublication(change, answer.publication, cwd, branch, identity.target.root === "companion");
+    checkHarnessPublication(change, answer.publication, cwd, branch, identity.target.root === "companion", answeredAt);
     return [{ ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId }];
   }
   if (!isProposalRef(answer.proposal) || answer.approval !== undefined) {
