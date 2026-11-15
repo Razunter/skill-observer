@@ -27,7 +27,7 @@ import {
   type SkillSignal,
 } from "./digest.js";
 import { registerAmendmentDelivery } from "./delivery.js";
-import { ledgerForProject, readLedger, renderLedger } from "./ledger.js";
+import { harnessRootDirs, ledgerForProject, readLedger, renderLedger } from "./ledger.js";
 import type { AskDetails, ExtensionAPI, ExtensionContext } from "./omp.js";
 import {
   createProvenanceResolver,
@@ -123,6 +123,7 @@ async function observationPayload(
   { note, digest, stale, observations, roots, provenance }: PassEvidence,
 ): Promise<ObservationPayload> {
   const ledger = ledgerForProject(readLedger(ledgerFile()), ctx.cwd);
+  const hookDirs = harnessRootDirs(ctx.cwd, ompAgentDir());
   const inForce = rulesInForce(ledger, readObserverRules(ruleDirs()), digest, referencesDir());
   const onReadAmendments = readOnReadAmendments(amendmentsDir());
   const gates = activeGates({
@@ -142,7 +143,8 @@ async function observationPayload(
         instructionText(gates),
         "",
         `These observer instructions live in \`${INSTRUCTIONS_PATH}\`.`,
-        `Skills directory: \`${roots.skillsDir}\`. Managed-skills directory: \`${roots.managedDir}\`. User rules directory: \`${userRulesDir()}\`. On-read amendments directory: \`${amendmentsDir()}\`. Reference files directory: \`${referencesDir()}\`.`,
+        `Skills directory: \`${roots.skillsDir}\`. Managed-skills directory: \`${roots.managedDir}\`. User rules directory: \`${userRulesDir()}\`. On-read amendments directory: \`${amendmentsDir()}\`. Reference files directory: \`${referencesDir()}\`. ` +
+          `Project hooks directory: \`${hookDirs["project-hooks"]}\`. Global hooks directory: \`${hookDirs["global-hooks"]}\`. Companion extension directory: \`${hookDirs.companion}\`.`,
       ].join("\n"),
     },
     { name: "note", text: note && `## User note\n\n${note}` },

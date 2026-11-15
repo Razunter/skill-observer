@@ -77,7 +77,7 @@ type ApprovedAnswer =
   | { skill: string; outcome: string; approval?: AnswerApproval };
 
 /** The prepared changes an approval lets `observer_resolve` carry out. */
-export type ApprovedChange = Exclude<PreparedChange, { operation: "direct-edit" }>;
+export type ApprovedChange = Exclude<PreparedChange, { operation: "direct-edit" | "harness" }>;
 /** The approved changes a reconciliation may revise. */
 type ReconcilableChange = Extract<PreparedChange, { operation: "on-read-append" | "rule" }>;
 
@@ -297,6 +297,7 @@ function approvingOptions(proposal: PreparedProposal): Map<string, ApprovedChang
   if ("alternatives" in proposal) return new Map(proposal.alternatives.map(({ change }) => [STALE_OPTIONS[change.operation], change]));
   const { change } = proposal;
   if (change.operation === "direct-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself");
+  if (change.operation === "harness") throw new Error("the approved proposal is a hook or companion intent, whose Apply authorises drafting only");
   return new Map([[APPLY, change]]);
 }
 

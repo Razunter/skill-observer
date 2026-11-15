@@ -29,6 +29,8 @@ import {
   type ProjectPublication,
   type ProjectLedgerRecord,
   type SkillLedgerRecord,
+  type HarnessLedgerRecord,
+  targetLabel,
   IN_FORCE_OUTCOMES,
   laterReoffer,
   PROPOSAL_KINDS,
@@ -87,6 +89,13 @@ interface ProjectAnswer {
   publication?: ProjectPublication;
   rule?: never;
 }
+/** The answer to an observer hook or companion intent, which its prepared proposal identifies. */
+interface HarnessAnswer {
+  kind: "harness";
+  proposal: PreparedProposalRef;
+  outcome: ProposalOutcome;
+  reoffer?: string;
+}
 export interface StaleAnswer {
   rule: string;
   action: StaleAction;
@@ -103,7 +112,7 @@ export interface CompactionAnswer {
 }
 
 interface ResolveParams {
-  outcomes: (CitingAnswer | ProjectAnswer)[];
+  outcomes: (CitingAnswer | ProjectAnswer | HarnessAnswer)[];
   compactions?: CompactionAnswer[];
   stale?: StaleAnswer[];
 }
@@ -143,6 +152,26 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
   return { kind: "project", target, fingerprint, gist: answer.gist, outcome: answer.outcome,
     ...(answer.evidence && { evidence: answer.evidence }), ...laterReoffer(answer),
     ...(answer.outcome === "applied" && { publication: answer.publication }), timestamp, sessionId };
+}
+
+/** An intent's Apply authorises drafting only, so its answer records `later` or `declined`, under the prepared proposal's identity, gist and evidence. */
+function harnessRecord(answer: HarnessAnswer, branch: readonly SessionEntry[], timestamp: string, sessionId: string): HarnessLedgerRecord {
+  if (answer.outcome === "applied") throw new Error("an intent Apply authorises drafting only and writes nothing: record it as `later` until its code is approved");
+  if (answer.outcome !== "later" && answer.outcome !== "declined") throw new Error("a harness answer is `later` or `declined`");
+  if (!isProposalRef(answer.proposal)) throw new Error("a harness answer cites its prepared proposal through `proposal`, its `reference` exactly as Prepare returned it");
+  const evidence = sessionToolEvidence(branch);
+  const { proposal } = preparedInPass(answer.proposal, evidence, branch);
+  if (proposal.kind !== "harness") throw new Error(`the cited proposal is a ${proposal.kind} proposal, not an observer hook or companion intent`);
+  const newer = latestPrepared(answer.proposal.candidateId, evidence);
+  if (newer !== undefined && newer.reviewToolCallId !== answer.proposal.reviewToolCallId) {
+    throw new Error(`a later Prepare of this pass holds this proposal again: cite its reference ${JSON.stringify(newer)}`);
+  }
+  const note = answer.outcome === "later" && answer.reoffer === undefined ? laterNote(answer.proposal, evidence) : undefined;
+  return {
+    kind: "harness", target: proposal.target, fingerprint: proposal.fingerprint, gist: proposal.gist, outcome: answer.outcome,
+    ...(proposal.evidence.length > 0 && { evidence: proposal.evidence.map(({ source: _, ...item }) => item) }),
+    ...laterReoffer({ outcome: answer.outcome, reoffer: answer.reoffer ?? note }), timestamp, sessionId,
+  };
 }
 
 export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): void {
@@ -213,6 +242,12 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
               checkToolCallIds: z.array(z.string()),
               afterHash: z.string(),
             }).optional().describe("Applied only: actual successful normal write/edit and subsequent foreground bash check IDs from this session branch, and current target SHA-256. Checks use explicit project cwd. This tool does not write project files."),
+          }),
+          z.object({
+            kind: z.enum(["harness"]),
+            proposal: proposalRefSchema(z).describe("The observer hook or companion intent's `reference` from the pass's latest Prepare holding it, exactly as Prepare returned it."),
+            outcome: z.enum(PROPOSAL_OUTCOMES).describe("`later` or `declined`: an intent's Apply authorises drafting only, so a hook whose code was not approved and written is `later`."),
+            reoffer: z.string().optional().describe(REOFFER_DESCRIPTION),
           })]),
         )
         .describe("One entry per proposal of this pass."),
@@ -258,7 +293,8 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const failures: string[] = [];
       const kept: string[] = [];
       let targetChanged = false;
-      const label = (answer: CitingAnswer | ProjectAnswer) => answer.kind === "project" ? `\`${answer.target?.path}\` (${answer.gist})`
+      const label = (answer: CitingAnswer | ProjectAnswer | HarnessAnswer) => answer.kind === "project" ? `\`${answer.target?.path}\` (${answer.gist})`
+        : answer.kind === "harness" ? `proposal \`${answer.proposal?.candidateId}\``
         : answer.gist === undefined ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
       // The latest record per fingerprint wins: it holds the fix a withdrawal takes back, and the evidence an answer citing nothing keeps.
       const latest = new Map(readLedger(ledger).map((record) => [record.fingerprint, record]));
@@ -271,12 +307,17 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
           return [];
         }
+        if (sent.kind === "harness") {
+          try { records.push(harnessRecord(sent, ctx.sessionManager.getBranch(), timestamp, sessionId)); }
+          catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
+          return [];
+        }
         let shown: CitingAnswer = sent;
         try {
           const answer = citedAnswer(sent, ctx.sessionManager.getBranch());
           shown = answer;
-          if ("target" in answer || "publication" in answer || latest.get(answer.fingerprint ?? "")?.kind === "project") {
-            throw new Error("project identity cannot be submitted as a global skill answer");
+          if ("target" in answer || "publication" in answer || latest.get(answer.fingerprint ?? "")?.target !== undefined) {
+            throw new Error("a project or harness identity cannot be submitted as a global skill answer");
           }
           const withdraws = answer.outcome === "withdrawn";
           laterReoffer(answer); // refuses a blank `reoffer` before anything is written
@@ -291,7 +332,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           const approved = writesRule || withdraws ? approvedChange(answer, ctx.sessionManager.getBranch()) : undefined;
           const fingerprint = approved?.evidence.fingerprint ?? (answer.fingerprint || proposalFingerprint(answer.skill, answer.gist));
           const historical = latest.get(fingerprint);
-          const historicalOwner = historical?.kind === "project" ? undefined : historical?.skill ?? answer.skill;
+          const historicalOwner = historical?.target !== undefined ? undefined : historical?.skill ?? answer.skill;
           const owner = claimed.get(fingerprint) ?? historicalOwner;
           if (owner !== answer.skill) throw new Error("proposal fingerprint belongs to another skill");
           if (answer.outcome === "declined" && historical !== undefined && IN_FORCE_OUTCOMES.has(historical.outcome)) {
@@ -335,7 +376,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const line = (record: LedgerRecord) => {
         const written = record.kind !== "project" && record.compaction && record.rule ? readReferenceFiles(referencesDir, record.skill) : [];
         return (
-          `- ${record.outcome} \`${record.kind === "project" ? record.target.path : record.skill}\` (${record.kind}), fingerprint \`${record.fingerprint}\`: ${record.gist}` +
+          `- ${record.outcome} ${targetLabel(record)}, fingerprint \`${record.fingerprint}\`: ${record.gist}` +
           (record.rule ? ` Rule file: \`${record.rule}\`.` : "") +
           referenceFilesSentence(written)
         );
@@ -432,7 +473,7 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
   if (!isProposalRef(cited)) throw new Error("a cited proposal is its `reference`, exactly as Prepare returned it");
   const evidence = sessionToolEvidence(branch);
   const { proposal } = preparedInPass(cited, evidence, branch);
-  if (proposal.kind === "project") throw new Error("the cited proposal is a project proposal, answered as a project outcome");
+  if (proposal.kind === "project" || proposal.kind === "harness") throw new Error(`the cited proposal is a ${proposal.kind} proposal, answered as a ${proposal.kind} outcome`);
   const operation = "change" in proposal ? proposal.change.operation : "stale amendment";
   const citable = CITABLE.includes(operation) || (operation === "withdrawal" && answer.outcome === "declined");
   if (reference !== undefined && !citable) throw new Error(`the cited proposal is a ${operation}, which \`proposal\` does not answer`);

@@ -2349,6 +2349,135 @@ describe("project proposal decisions", () => {
   });
 });
 
+describe("observer hook and companion intents", () => {
+  const agentDir = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.home, ".omp/agent");
+  const projectHooks = (host: ReturnType<typeof loadExtension>) => join(realpathSync(host.skillHome.roots.cwd), ".omp/hooks/pre");
+  const intent = (root: string, mechanism: string, target: Record<string, unknown> = {}) => ({
+    kind: "harness", target: { scope: "harness", root, mechanism, ...target },
+    gist: mechanism, priority: "evidence", remedy: "Block the mistake in code",
+    change: {
+      operation: "harness", stage: "intent", event: "tool_call for bash", predicate: "the command runs `git commit` in a jj repository",
+      action: "block the call and name `jj commit`", mistake: "git commit -m fix", legitimate: "jj commit -m fix",
+      scope: "every jj repository", lowerRungs: "A barrier rule only reminds; no project check runs before the commit.",
+    },
+    evidence: [{ quote: "git commit again", count: 2 }],
+  });
+  /** Prepares and selects `candidates` in a new pass, has the user give each the answer, and returns the selected references. */
+  const asked = async (host: ReturnType<typeof loadExtension>, candidates: unknown[], answer: AnswerUser) => {
+    const selection = await prepareAndSelect(host, candidates);
+    askUser(host, selection, answer);
+    return reviewEntries(selection, "selected");
+  };
+  const answered = (entries: ReviewEntry[], outcome: string) => entries.map(({ reference }) => ({ kind: "harness", proposal: reference, outcome }));
+  const otherProject = (host: ReturnType<typeof loadExtension>) => {
+    const other = join(host.skillHome.home, "other-project");
+    mkdirSync(other, { recursive: true });
+    host.setCwd(other);
+    return other;
+  };
+
+  it("prepares a project hook, a global hook and a companion intent, and the form shows each description with its root kind and path", async () => {
+    const host = loadExtension();
+    const selection = await prepareAndSelect(host, [
+      intent("project-hooks", "Block git commit here"), intent("global-hooks", "Block git commit everywhere"),
+      intent("global-hooks", "Fix my hand-written hook", { path: "mine.ts" }), intent("companion", "Register a jj tool"),
+    ]);
+    expect(selection.isError).toBeFalsy();
+    const [project, global, edited, companion] = reviewEntries(selection, "selected").map(({ proposal }) => proposal);
+    const { askHtml } = JSON.parse(resultText(selection));
+    expect(askHtml).toContain(`<legend>\`skill-observer-${project!.fingerprint}.ts\` (project hook): Block git commit here</legend>`);
+    expect(askHtml).toContain(`<legend>\`skill-observer-${global!.fingerprint}.ts\` (global hook): Block git commit everywhere</legend>`);
+    expect(askHtml).toContain("<legend>`mine.ts` (global hook): Fix my hand-written hook</legend>");
+    expect(askHtml).toContain("<legend>`skill-observer-companion` (companion extension): Register a jj tool</legend>");
+    expect(project!.preview).toContain(join(projectHooks(host), `skill-observer-${project!.fingerprint}.ts`));
+    expect(global!.preview).toContain(join(agentDir(host), "hooks/pre", `skill-observer-${global!.fingerprint}.ts`));
+    expect(edited!.preview).toContain(join(agentDir(host), "hooks/pre/mine.ts"));
+    expect(companion!.preview).toContain(join(agentDir(host), "extensions/skill-observer-companion"));
+    for (const line of ["Event: tool_call for bash", "Predicate: the command runs `git commit` in a jj repository", "Action: block the call and name `jj commit`",
+      "Mistake sample: git commit -m fix", "Legitimate sample: jj commit -m fix", "Scope: every jj repository",
+      "Why each lower rung fails: A barrier rule only reminds; no project check runs before the commit."]) {
+      expect(askHtml.split(line)).toHaveLength(5);
+    }
+    expect(askHtml.split("An Apply with a note is asked again.")).toHaveLength(5);
+    expect(new Set([project, global, edited, companion].map((proposal) => proposal!.fingerprint)).size).toBe(4);
+  });
+
+  it.each<[string, Record<string, unknown>, string]>([
+    ["another root kind", { root: "user-extensions" }, "needs a root"],
+    ["a path escaping its root", { path: "../escape.ts" }, "plain root-relative"],
+    ["an absolute path", { path: "/tmp/escape.ts" }, "plain root-relative"],
+    ["a path through a symlink out of its root", { path: "out/escape.ts" }, "escapes its root"],
+    ["a companion change naming a file", { root: "companion", path: "index.ts" }, "not by a file"],
+  ])("refuses a target with %s", async (_label, target, reason) => {
+    const host = loadExtension();
+    const hooks = join(agentDir(host), "hooks/pre");
+    mkdirSync(hooks, { recursive: true });
+    symlinkSync(host.skillHome.home, join(hooks, "out"));
+    const { root = "global-hooks", ...rest } = target;
+    const result = await host.callTool("observer_review", { action: "prepare", candidates: [intent(String(root), "Escape", rest)] });
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
+  });
+
+  it("refuses a project proposal inside the project's hooks directory, naming the harness scope", async () => {
+    const host = loadExtension();
+    const root = host.skillHome.roots.cwd;
+    const target = { scope: "project", root, path: ".omp/hooks/pre/block.ts", mechanism: "Block git commit" };
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{
+      kind: "project", target, gist: "Block git commit", priority: "evidence", remedy: "Write a hook", change: { operation: "direct-edit", preview: "export default () => {}" },
+    }] });
+    expect(prepared.isError).toBe(true);
+    expect(failures(prepared)).toEqual([expect.stringContaining("`harness`")]);
+    const resolved = await resolve(host, [{ kind: "project", target, gist: "Block git commit", outcome: "later" }]);
+    expect(failures(resolved)).toEqual([expect.stringContaining("`harness`")]);
+    expect(existsSync(host.ledgerFile)).toBe(false);
+  });
+
+  it("keeps a declined global hook out of another project's pass, and a declined project hook out of view there", async () => {
+    const host = loadExtension();
+    const candidates = [intent("global-hooks", "Block git commit everywhere"), intent("project-hooks", "Block git commit here")];
+    const declined = await asked(host, candidates, () => "Decline");
+    expect(failures(await resolve(host, answered(declined, "declined")))).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile).map(({ outcome }) => outcome)).toEqual(["declined", "declined"]);
+    const here = await host.callTool("observer_review", { action: "prepare", candidates });
+    expect(reviewEntries(here)).toEqual([]);
+    otherProject(host);
+    const there = await host.callTool("observer_review", { action: "prepare", candidates });
+    expect(reviewEntries(there).map(({ proposal }) => proposal.gist)).toEqual(["Block git commit here"]);
+  });
+
+  it("brings a Later intent back in the next pass of its scope, which names the three directories", async () => {
+    const host = loadExtension();
+    const later = await asked(host, [intent("global-hooks", "Block git commit everywhere"), intent("project-hooks", "Block git commit here")],
+      () => ({ option: "Later", note: "After the jj migration." }));
+    expect(failures(await resolve(host, answered(later, "later")))).toEqual([]);
+    await host.runCommand("observe", "Review hooks");
+    const here = String(host.sent.at(-1)?.message.content);
+    expect(here).toContain("Block git commit everywhere Re-offer when: After the jj migration.");
+    expect(here).toContain("Block git commit here Re-offer when: After the jj migration.");
+    expect(here).toContain(`Project hooks directory: \`${projectHooks(host)}\``);
+    expect(here).toContain(`Global hooks directory: \`${join(agentDir(host), "hooks/pre")}\``);
+    expect(here).toContain(`Companion extension directory: \`${join(agentDir(host), "extensions/skill-observer-companion")}\``);
+    otherProject(host);
+    await host.runCommand("observe", "Review hooks");
+    const there = String(host.sent.at(-1)?.message.content);
+    expect(there).toContain("Block git commit everywhere");
+    expect(there).not.toContain("Block git commit here");
+  });
+
+  it("writes no file and records nothing as applied for an intent Apply alone", async () => {
+    const host = loadExtension();
+    const approved = await asked(host, [intent("project-hooks", "Block git commit here"), intent("global-hooks", "Block git commit everywhere")], () => "Apply");
+    const applied = await resolve(host, answered(approved, "applied"));
+    expect(applied.isError).toBe(true);
+    expect(failures(applied)).toEqual([expect.stringContaining("drafting only"), expect.stringContaining("drafting only")]);
+    expect(existsSync(host.ledgerFile)).toBe(false);
+    expect(existsSync(projectHooks(host))).toBe(false);
+    expect(existsSync(join(agentDir(host), "hooks"))).toBe(false);
+    expect(existsSync(join(agentDir(host), "extensions"))).toBe(false);
+  });
+});
+
 describe("/observe with answers from earlier passes", () => {
   /** The lines under a `### <heading>` of the message, up to the next heading. */
   function ledgerList(content: string, heading: string): string {

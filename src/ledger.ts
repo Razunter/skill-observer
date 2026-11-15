@@ -86,7 +86,64 @@ export interface ProjectLedgerRecord extends LedgerEntry {
   compaction?: never;
 }
 
-export type LedgerRecord = SkillLedgerRecord | ProjectLedgerRecord;
+/**
+ * A target in one of the three roots an observer hook or the companion
+ * extension lives in. A hook is named by its root-relative `path`, or, for a
+ * new one, by its proposal fingerprint (see {@link hookFileName}); a companion
+ * change by the companion root alone, since it may touch several files.
+ */
+export type HarnessTarget =
+  | { scope: "harness"; root: "project-hooks"; /** The canonical project root whose hooks directory holds the hook. */ project: string; path?: string; mechanism: string }
+  | { scope: "harness"; root: "global-hooks"; path?: string; mechanism: string }
+  | { scope: "harness"; root: "companion"; path?: never; mechanism: string };
+export type HarnessRoot = HarnessTarget["root"];
+export const HARNESS_ROOTS = ["project-hooks", "global-hooks", "companion"] as const satisfies readonly HarnessRoot[];
+
+export interface HarnessLedgerRecord extends LedgerEntry {
+  kind: "harness";
+  target: HarnessTarget;
+  skill?: never;
+  rule?: never;
+  compaction?: never;
+  publication?: never;
+}
+
+export type LedgerRecord = SkillLedgerRecord | ProjectLedgerRecord | HarnessLedgerRecord;
+
+/** What a proposal or record targets: a skill, a project file or a harness root. */
+export type TargetScope =
+  | { kind: ProposalKind; skill: string; target?: never }
+  | { kind: "project"; target: ProjectTarget; skill?: never }
+  | { kind: "harness"; target: HarnessTarget; skill?: never };
+
+const HARNESS_ROOT_NAMES: Record<HarnessRoot, string> = { "project-hooks": "project hook", "global-hooks": "global hook", companion: "companion extension" };
+const COMPANION_DIR = "skill-observer-companion";
+
+/** How the form, the ledger section and the resolver name a target: `` `name` (kind) ``. */
+export function targetLabel(entry: TargetScope & { fingerprint: string }): string {
+  switch (entry.kind) {
+    case "project":
+      return `\`${entry.target.path}\` (project)`;
+    case "harness": {
+      const { target } = entry;
+      return `\`${target.root === "companion" ? COMPANION_DIR : target.path ?? hookFileName(entry.fingerprint)}\` (${HARNESS_ROOT_NAMES[target.root]})`;
+    }
+    default:
+      return `\`${entry.skill}\` (${entry.kind})`;
+  }
+}
+
+/** The directory each harness root names: hooks only load from a `pre` or `post` folder, and observer hooks go in `pre`. */
+export function harnessRootDirs(cwd: string, agentDir: string): Record<HarnessRoot, string> {
+  return {
+    "project-hooks": join(realpathSync(cwd), ".omp", "hooks", "pre"),
+    "global-hooks": join(agentDir, "hooks", "pre"),
+    companion: join(agentDir, "extensions", COMPANION_DIR),
+  };
+}
+
+/** A new hook's file name: a fixed prefix and its fingerprint, so a project hook and a global hook never share a name and hide one another. */
+export const hookFileName = (fingerprint: string) => `skill-observer-${fingerprint}.ts`;
 
 /** The launch directory defines project scope; symlink aliases share one identity. */
 export function canonicalProjectTarget(cwd: string, target: ProjectTarget): ProjectTarget {
@@ -94,13 +151,44 @@ export function canonicalProjectTarget(cwd: string, target: ProjectTarget): Proj
       typeof target.mechanism !== "string" || !target.mechanism.trim()) throw new Error("a project target needs root, path and mechanism");
   const root = realpathSync(cwd);
   if (!statSync(root).isDirectory() || realpathSync(target.root) !== root) throw new Error("project root must be the current working project");
-  if (!target.path || isAbsolute(target.path) || target.path.includes("\\") || target.path.includes("\0") ||
-      target.path.split("/").some((part) => !part || part === "." || part === "..")) throw new Error("project target must be a plain root-relative file path");
-  const path = relative(root, canonicalMissingPath(join(root, target.path)));
-  if (!path || path === ".." || path.startsWith(`..${sep}`) || isAbsolute(path)) throw new Error("project target escapes its root");
-  const file = join(root, path);
-  if (existsSync(file) && !statSync(file).isFile()) throw new Error("project target must name a file");
+  const path = canonicalPathIn(root, target.path, "project target");
+  // A hook written as a project fix would run after one approval; the harness scope asks for the description and then the code.
+  if (path === PROJECT_HOOKS_DIR || path.startsWith(`${PROJECT_HOOKS_DIR}${sep}`)) {
+    throw new Error(`\`${path}\` lies in the project's hooks directory: propose it with the \`harness\` target scope, as a project hook`);
+  }
   return { scope: "project", root, path, mechanism: target.mechanism.trim() };
+}
+
+const PROJECT_HOOKS_DIR = join(".omp", "hooks");
+
+/** The harness target as identity takes it: its root kind, the current project for a project hook, and a path that stays in its root. */
+export function canonicalHarnessTarget(cwd: string, agentDir: string, target: HarnessTarget): HarnessTarget {
+  if (!target || target.scope !== "harness" || !HARNESS_ROOTS.includes(target.root) || typeof target.mechanism !== "string" || !target.mechanism.trim()) {
+    throw new Error(`a harness target needs a root (${HARNESS_ROOTS.join(", ")}) and a mechanism`);
+  }
+  const mechanism = target.mechanism.trim();
+  if (target.root === "companion") {
+    if (target.path !== undefined) throw new Error("a companion change is identified by the companion root and its mechanism, not by a file");
+    return { scope: "harness", root: "companion", mechanism };
+  }
+  if (target.path !== undefined && typeof target.path !== "string") throw new Error("a hook target's path is a root-relative file path");
+  const root = canonicalMissingPath(harnessRootDirs(cwd, agentDir)[target.root]);
+  const path = target.path === undefined ? undefined : canonicalPathIn(root, target.path, "hook target");
+  const named = target.root === "project-hooks" ? { root: target.root, project: realpathSync(cwd), mechanism } : { root: target.root, mechanism };
+  const canonical: HarnessTarget = { scope: "harness", ...named, ...(path !== undefined && { path }) };
+  // A new hook named by its own file stays the identity it was proposed under.
+  return path !== undefined && path === hookFileName(harnessFingerprint({ ...canonical, path: undefined })) ? { scope: "harness", ...named } : canonical;
+}
+
+/** `path` canonical and relative to `root`: a plain root-relative file path, through no symlink out of the root. */
+function canonicalPathIn(root: string, path: string, label: string): string {
+  if (!path || isAbsolute(path) || path.includes("\\") || path.includes("\0") ||
+      path.split("/").some((part) => !part || part === "." || part === "..")) throw new Error(`${label} must be a plain root-relative file path`);
+  const canonical = relative(root, canonicalMissingPath(join(root, path)));
+  if (!canonical || canonical === ".." || canonical.startsWith(`..${sep}`) || isAbsolute(canonical)) throw new Error(`${label} escapes its root`);
+  const file = join(root, canonical);
+  if (existsSync(file) && !statSync(file).isFile()) throw new Error(`${label} must name a file`);
+  return canonical;
 }
 
 function canonicalMissingPath(path: string): string {
@@ -126,15 +214,28 @@ export function projectFingerprint(target: ProjectTarget): string {
   return createHash("sha256").update(JSON.stringify(["project", target.root, target.path, mechanism])).digest("hex").slice(0, 12);
 }
 
-/** Shared storage does not make another project's decisions visible in this pass. */
+/** A harness proposal's identity: root kind, the project for a project hook, root-relative path (none for a new hook or the companion) and mechanism. */
+export function harnessFingerprint(target: HarnessTarget): string {
+  const mechanism = normaliseText(target.mechanism);
+  if (!mechanism) throw new Error("harness mechanism must contain letters or digits");
+  const project = target.root === "project-hooks" ? target.project : null;
+  return createHash("sha256").update(JSON.stringify(["harness", target.root, project, target.path ?? null, mechanism])).digest("hex").slice(0, 12);
+}
+
+/** Shared storage does not make another project's decisions visible in this pass; global hook and companion decisions apply in every project. */
 export function ledgerForProject(records: readonly LedgerRecord[], cwd: string): LedgerRecord[] {
   const root = realpathSync(cwd);
   return records.filter((record) => {
-    if (record.kind !== "project") return record.target === undefined;
-    try {
-      const target = canonicalProjectTarget(root, record.target);
-      return projectFingerprint(target) === record.fingerprint;
-    } catch { return false; }
+    switch (record.kind) {
+      case "project":
+        try {
+          return projectFingerprint(canonicalProjectTarget(root, record.target)) === record.fingerprint;
+        } catch { return false; }
+      case "harness":
+        return record.target.root !== "project-hooks" || record.target.project === root;
+      default:
+        return record.target === undefined;
+    }
   });
 }
 
@@ -248,7 +349,7 @@ export function laterReoffer({ outcome, reoffer }: { outcome: string; reoffer?: 
 }
 
 const entryLine = (record: LedgerRecord) =>
-  `- \`${record.kind === "project" ? record.target.path : record.skill}\` (${record.kind}), fingerprint \`${record.fingerprint}\`${record.kind === "project" ? `, mechanism ${JSON.stringify(record.target.mechanism)}` : ""}: ${record.gist}` +
+  `- ${targetLabel(record)}, fingerprint \`${record.fingerprint}\`${record.kind === "project" || record.kind === "harness" ? `, mechanism ${JSON.stringify(record.target.mechanism)}` : ""}: ${record.gist}` +
   (record.reoffer ? ` Re-offer when: ${record.reoffer}` : "");
 
 /**

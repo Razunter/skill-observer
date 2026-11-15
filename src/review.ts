@@ -17,14 +17,14 @@ import {
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
-  canonicalProjectTarget, type Evidence, ledgerForProject, type LedgerRecord,
-  projectFingerprint, PROPOSAL_KINDS, type ProjectTarget, type ProposalKind,
-  proposalFingerprint, readLedger,
+  canonicalHarnessTarget, canonicalProjectTarget, type Evidence, harnessFingerprint, harnessRootDirs, hookFileName, ledgerForProject, type LedgerRecord,
+  projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind,
+  proposalFingerprint, readLedger, targetLabel, type TargetScope,
 } from "./ledger.js";
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, checkReconciliation, isReconcilable, preparedInPass, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
-import { createProvenanceResolver, defaultSkillRoots, type ProvenanceResolver } from "./provenance.js";
+import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver } from "./provenance.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
 import { type PatternDraft, type Sample, sampleSchemas } from "./replay.js";
@@ -34,7 +34,7 @@ import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-ev
 export const REVIEW_TOOL_NAME = "observer_review";
 const PRIORITIES = ["stale", "note", "evidence", "compaction"] as const;
 type Priority = (typeof PRIORITIES)[number];
-const OPERATIONS = ["direct-edit", "on-read-append", "rule", "stale-update", "stale-delete", "withdrawal", "compaction"] as const;
+const OPERATIONS = ["direct-edit", "on-read-append", "rule", "stale-update", "stale-delete", "withdrawal", "compaction", "harness"] as const;
 
 interface ReviewEvidence extends Evidence { source?: string }
 
@@ -47,7 +47,16 @@ type ChangeDraft =
   | { operation: "stale-update"; rule: string; body: string; references?: ReferenceFile[] }
   | { operation: "stale-delete"; rule: string }
   | { operation: "withdrawal"; body?: string; references?: ReferenceFile[] }
-  | { operation: "compaction"; includes: string[]; body: string; references: ReferenceFile[] };
+  | { operation: "compaction"; includes: string[]; body: string; references: ReferenceFile[] }
+  /** An observer hook or companion change, at the stage the user approves now: the described remedy, before any code is drafted. */
+  | ({ operation: "harness"; stage: "intent" } & HarnessIntent);
+
+/** The described remedy of an observer hook or companion change: the intent-stage preview, field by field. */
+interface HarnessIntent { event: string; predicate: string; action: string; mistake: string; legitimate: string; scope: string; lowerRungs: string }
+const INTENT_LINES: ReadonlyArray<[keyof HarnessIntent, string]> = [
+  ["event", "Event"], ["predicate", "Predicate"], ["action", "Action"], ["mistake", "Mistake sample"], ["legitimate", "Legitimate sample"],
+  ["scope", "Scope"], ["lowerRungs", "Why each lower rung fails"],
+];
 
 interface CandidateDraft {
   gist: string;
@@ -59,9 +68,7 @@ interface CandidateDraft {
   /** The approved on-read append or rule this candidate revises for its changed target, and the main agent's account of the revision. */
   reconciles?: Partial<ProposalReconciliation>;
 }
-type SkillScope = { kind: ProposalKind; skill: string; target?: never };
-type ProjectScope = { kind: "project"; target: ProjectTarget; skill?: never };
-type ReviewCandidate = CandidateDraft & (SkillScope | ProjectScope);
+type ReviewCandidate = CandidateDraft & TargetScope;
 
 /** A file's bytes as Prepare read them; `sha256` is null for a missing file. */
 interface FileSnapshot { path: string; sha256: string | null }
@@ -77,6 +84,8 @@ interface ReferenceChange { folder: string; before: FileSnapshot[]; write: Refer
  */
 export type PreparedChange =
   | { operation: "direct-edit" }
+  /** Apply of an intent authorises drafting only: nothing is written or recorded as applied from it. */
+  | { operation: "harness"; stage: "intent" }
   /** `record`: the amendment already holds the section verbatim, so publication writes nothing and only the ledger changes. */
   | { operation: "on-read-append"; effect: "create" | "append" | "record"; rule: RuleIdentity; target: FileSnapshot; section: string }
   /** Samples stay in the form the scope sees, as `observer_check` and `observer_resolve` take them. */
@@ -88,7 +97,7 @@ export type PreparedChange =
   | { operation: "withdrawal"; withdrawn: { fingerprint: string; gist: string }; effect: "rewrite"; rule: RuleIdentity; target: FileSnapshot; body: string; references?: ReferenceChange }
   /** `rule` is absent when this pass's additions create the amendment the compaction rewrites. */
   | { operation: "compaction"; rule?: RuleIdentity; target: FileSnapshot; includes: string[]; body: string; references: ReferenceChange };
-type ProtectedChange = Exclude<PreparedChange, { operation: "direct-edit" }>;
+type ProtectedChange = Exclude<PreparedChange, { operation: "direct-edit" | "harness" }>;
 type StaleChange = Extract<PreparedChange, { operation: "stale-update" | "stale-delete" }>;
 /** A stale amendment's answer that changes the rule, and the preview the Ask form shows under its heading. */
 interface StaleAlternative { change: StaleChange; preview: string }
@@ -107,7 +116,7 @@ export type PreparedProposal = {
   | { change: Exclude<PreparedChange, StaleChange>; preview: string }
   /** A stale amendment's one Keep/Update/Delete choice: each prepared answer, Update before Delete. */
   | { alternatives: StaleAlternative[] }
-) & (SkillScope | ProjectScope);
+) & TargetScope;
 
 export type PreparedProposalRef = Readonly<{ reviewToolCallId: string; candidateId: string; contentHash: string }>;
 export interface PreparedEntry { reference: PreparedProposalRef; proposal: PreparedProposal }
@@ -139,6 +148,8 @@ interface ReviewDetails {
 
 interface PrepareContext {
   cwd: string;
+  /** The agent directory, which holds the global hooks directory and the companion extension. */
+  agentDir: string;
   dirs: RuleDirs;
   referencesDir: string;
   /** The whole ledger: a withdrawal cites a fix wherever it was recorded. */
@@ -165,6 +176,14 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
       .describe("Takes back the applied fix named by the candidate `fingerprint`; for a fix inside the on-read amendment, `body` is its whole new body, empty to delete it."),
     z.object({ operation: z.enum(["compaction"]), includes: z.array(z.string()), body: z.string(), references: referenceFiles })
       .describe("`includes`: the on-read appends of this Prepare it covers, by gist or fingerprint; `references`: the complete set."),
+    z.object({
+      operation: z.enum(["harness"]), stage: z.enum(["intent"]),
+      event: z.string().describe("The host event the hook handles, such as `tool_call` for one tool."),
+      predicate: z.string().describe("What in the event marks the mistake."), action: z.string().describe("What the hook does then: block, add context, or change the call."),
+      mistake: z.string().describe("The session's mistake as a sample event."), legitimate: z.string().describe("Its nearest legitimate counterpart, which the hook leaves untouched."),
+      scope: z.string().describe("Why this project's hooks, or why the global hooks for a mistake that generalises."),
+      lowerRungs: z.string().describe("Why a configuration repair, skill text, barrier rule, pattern amendment, project check or, for the companion, a hook does not fit."),
+    }).describe("An observer hook or companion-extension change at its intent stage: the described remedy, previewed and asked before any code is drafted. Apply authorises drafting only."),
   ]);
   const draft = {
     gist: z.string(), priority: z.enum(PRIORITIES), remedy: z.string(), change,
@@ -187,6 +206,11 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
         z.object({ ...draft, kind: z.enum(["project"]), target: z.object({
           scope: z.enum(["project"]), root: z.string(), path: z.string(), mechanism: z.string(),
         }) }),
+        z.object({ ...draft, kind: z.enum(["harness"]), target: z.object({
+          scope: z.enum(["harness"]), root: z.enum(HARNESS_ROOTS),
+          path: z.string().optional().describe("An existing hook file, relative to its hooks directory; omit for a new hook, which is named by its fingerprint, and for the companion."),
+          mechanism: z.string(),
+        }) }),
       ])).optional().describe("Prepare only: exact candidate changes. Stale Keep is no candidate. Project identity uses target mechanism; global guidance uses its general gist."),
       proposals: z.array(proposalRefSchema(z)).optional()
         .describe("Select only: the `reference` of each eligible proposal, exactly as Prepare returned it."),
@@ -202,7 +226,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
         if (params?.action === "prepare") {
           if (!Array.isArray(params.candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
           const context: PrepareContext = {
-            cwd: ctx.cwd, dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
+            cwd: ctx.cwd, agentDir: ompAgentDir(), dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
             ledger, provenance: createProvenanceResolver(defaultSkillRoots(ctx.cwd)), branch: ctx.sessionManager.getBranch(), amendmentSections,
           };
           details.eligible = prepareProposals(params.candidates, context).map((proposal) => ({
@@ -231,8 +255,8 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
         if (params.action === "prepare") {
           for (const { proposal } of details.needsRanking ? compared : []) {
             details.judgeStates[proposal.candidateId] = {
-              target: proposal.kind === "project" ? `project:${proposal.target.path}` : `skill:${proposal.skill}`,
-              mechanism: proposal.kind === "project" ? proposal.target.mechanism : proposal.gist,
+              target: proposal.kind === "project" ? `project:${proposal.target.path}` : proposal.kind === "harness" ? `harness:${targetLabel(proposal)}` : `skill:${proposal.skill}`,
+              mechanism: proposal.target?.mechanism ?? proposal.gist,
               remedy: proposal.remedy, evidence: proposal.evidence,
               repeatCount: distinctOccurrences(proposal.evidence) || proposal.evidence.reduce((max, item) => Math.max(max, item.count), 0),
             };
@@ -268,7 +292,7 @@ function preparedSummary({ reference, proposal }: PreparedEntry, amendmentSectio
   const sections = "change" in proposal && proposal.change.operation === "on-read-append" ? amendmentSections.get(proposal.candidateId) : undefined;
   return {
     reference, fingerprint: proposal.fingerprint, kind: proposal.kind,
-    ...(proposal.kind === "project" ? { target: proposal.target } : { skill: proposal.skill }),
+    ...(proposal.target ? { target: proposal.target } : { skill: proposal.skill }),
     gist: proposal.gist,
     ...("alternatives" in proposal ? { previews: proposal.alternatives.map(({ preview }) => preview) } : { preview: proposal.preview }),
     ...optional("amendmentSections", sections),
@@ -287,7 +311,6 @@ export function renderAskHtml(proposals: readonly PreparedProposal[]): string {
 }
 
 function renderFieldset(proposal: PreparedProposal): string {
-  const target = proposal.kind === "project" ? proposal.target.path : proposal.skill;
   const previewParagraph = (preview: string) => `<p>${preview.split("\n").map((line) => escapeHtml(markHiddenWhitespace(line))).join("<br>")}</p>`;
   const isStale = "alternatives" in proposal;
   const staleLabels = isStale ? proposal.alternatives.map(({ change }) => STALE_OPTIONS[change.operation]) : [];
@@ -298,12 +321,12 @@ function renderFieldset(proposal: PreparedProposal): string {
     : proposal.change.operation === "withdrawal" ? [APPLY, "Decline"] : [APPLY, "Later", "Decline"];
   // Approval of these takes no note, so a noted answer becomes a new Prepare and Ask.
   const notedAsksAgain = isStale ? "An Update or Delete with a note is asked again."
-    : ["withdrawal", "compaction"].includes(proposal.change.operation) ? "An Apply with a note is asked again." : undefined;
+    : ["withdrawal", "compaction", "harness"].includes(proposal.change.operation) ? "An Apply with a note is asked again." : undefined;
   const evidence = proposal.evidence.map(({ quote, count, source }) => `<li>${escapeHtml(`"${quote}" (×${count}${source ? `, ${source}` : ""})`)}</li>`);
   const name = escapeHtml(proposal.candidateId).replace(/"/g, "&quot;");
   return [
     "<fieldset>",
-    `<legend>${escapeHtml(`\`${target}\` (${proposal.kind}): ${proposal.gist}`)}</legend>`,
+    `<legend>${escapeHtml(`${targetLabel(proposal)}: ${proposal.gist}`)}</legend>`,
     `<p>${escapeHtml(proposal.remedy)}</p>`,
     ...(evidence.length > 0 ? ["<ul>", ...evidence, "</ul>"] : []),
     ...previews,
@@ -353,7 +376,7 @@ function prepareProposals(candidates: readonly ReviewCandidate[], context: Prepa
   const scoped = ledgerForProject(context.ledger, context.cwd);
   const declined = declinedFingerprints(scoped);
   const grouped = new Map<string, PreparedProposal>();
-  const checked = candidates.map((draft) => checkedCandidate(draft, context.cwd));
+  const checked = candidates.map((draft) => checkedCandidate(draft, context));
   // A compaction's `includes` resolve to this Prepare's on-read appends, so it is prepared after them.
   const ordered = checked.toSorted((a, b) => Number(a.change.operation === "compaction") - Number(b.change.operation === "compaction"));
   for (const candidate of ordered) {
@@ -382,7 +405,7 @@ function joined(previous: PreparedProposal, next: PreparedProposal): PreparedPro
   return { ...preferred, evidence };
 }
 
-function checkedCandidate(candidate: ReviewCandidate, cwd: string): ReviewCandidate & { evidence: ReviewEvidence[] } {
+function checkedCandidate(candidate: ReviewCandidate, context: PrepareContext): ReviewCandidate & { evidence: ReviewEvidence[] } {
   if (!candidate || typeof candidate.gist !== "string" || !candidate.gist.trim() || !PRIORITIES.includes(candidate.priority) ||
       typeof candidate.remedy !== "string" || !candidate.remedy.trim() || !candidate.change || !OPERATIONS.includes(candidate.change.operation)) {
     throw new Error("each review candidate needs gist, priority, remedy and an exact change");
@@ -394,7 +417,11 @@ function checkedCandidate(candidate: ReviewCandidate, cwd: string): ReviewCandid
   const evidence = mergeEvidence(candidate.evidence ?? []);
   if (candidate.kind === "project") {
     if (candidate.skill !== undefined) throw new Error("project review candidates carry no skill name");
-    return { ...candidate, target: canonicalProjectTarget(cwd, candidate.target), evidence };
+    return { ...candidate, target: canonicalProjectTarget(context.cwd, candidate.target), evidence };
+  }
+  if (candidate.kind === "harness") {
+    if (candidate.skill !== undefined) throw new Error("harness review candidates carry no skill name");
+    return { ...candidate, target: canonicalHarnessTarget(context.cwd, context.agentDir, candidate.target), evidence };
   }
   if (!PROPOSAL_KINDS.includes(candidate.kind) || typeof candidate.skill !== "string" || !candidate.skill.trim() || candidate.target !== undefined) {
     throw new Error("global review candidate needs a valid skill kind and name, not a project target");
@@ -418,10 +445,20 @@ function preparedProposal(
   if (candidate.reconciles !== undefined && draft.operation !== "on-read-append" && draft.operation !== "rule") {
     throw new Error("only an on-read append or a rule can be reconciled: its revision keeps the target's current content; a change that would delete a changed target, or rewrite one without keeping its content, needs a new prepared proposal and Ask");
   }
-  const scope: SkillScope | ProjectScope = candidate.kind === "project"
-    ? { kind: "project", target: candidate.target }
+  const scope: TargetScope = candidate.kind === "project" ? { kind: "project", target: candidate.target }
+    : candidate.kind === "harness" ? { kind: "harness", target: candidate.target }
     : { kind: candidate.kind, skill: candidate.skill };
   const base = { priority: candidate.priority, ...scope, gist: candidate.gist, remedy: candidate.remedy, evidence: candidate.evidence };
+  if (candidate.kind === "harness") {
+    if (draft.operation !== "harness") throw new Error("an observer hook or companion change is a harness change, asked first as its intent");
+    if (draft.stage !== "intent") throw new Error("a harness change is prepared at its `intent` stage");
+    const missing = INTENT_LINES.find(([field]) => typeof draft[field] !== "string" || !draft[field].trim());
+    if (missing) throw new Error(`a harness intent needs its ${missing[1].toLowerCase()}`);
+    const fingerprint = proposalIdentity(candidate, scoped);
+    if (declined.has(fingerprint)) return undefined;
+    return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, change: { operation: "harness", stage: "intent" }, preview: intentPreview(candidate.target, fingerprint, draft, context) };
+  }
+  if (draft.operation === "harness") throw new Error("a harness change needs a harness target: the project or global hooks directory, or the companion extension");
   if (draft.operation === "direct-edit") {
     if (isPinKind(candidate.kind)) throw new Error("an upstream or plugin skill takes amendment rules, not a direct edit");
     if (typeof draft.preview !== "string" || !draft.preview.trim()) throw new Error("a direct edit needs its exact preview");
@@ -561,16 +598,29 @@ function includedAddition(skill: string, addition: string, prepared: readonly Pr
 
 /** A proposal's ledger identity: the scoped gist, or a re-offered Later entry's or withdrawn fix's recorded fingerprint. */
 function proposalIdentity(candidate: ReviewCandidate, ledger: readonly LedgerRecord[]): string {
-  let fingerprint = candidate.kind === "project" ? projectFingerprint(candidate.target) : proposalFingerprint(candidate.skill, candidate.gist);
-  if (candidate.kind !== "project" && candidate.fingerprint !== undefined) {
+  let fingerprint = candidate.kind === "project" ? projectFingerprint(candidate.target)
+    : candidate.kind === "harness" ? harnessFingerprint(candidate.target)
+    : proposalFingerprint(candidate.skill, candidate.gist);
+  if (candidate.kind !== "project" && candidate.kind !== "harness" && candidate.fingerprint !== undefined) {
     const existing = ledger.find((record) => record.fingerprint === candidate.fingerprint);
     if (existing) {
-      if (existing.kind === "project" || existing.skill !== candidate.skill) throw new Error("candidate fingerprint belongs to another target");
+      if (existing.target !== undefined || existing.skill !== candidate.skill) throw new Error("candidate fingerprint belongs to another target");
       fingerprint = existing.fingerprint;
     }
   }
   checkCurrentFingerprint(candidate, fingerprint);
   return fingerprint;
+}
+
+/** The intent-stage preview: where the hook or companion change goes, its description, and what Apply authorises. */
+function intentPreview(target: HarnessTarget, fingerprint: string, intent: HarnessIntent, { cwd, agentDir }: PrepareContext): string {
+  const dirs = harnessRootDirs(cwd, agentDir);
+  const where = target.root === "companion" ? `The companion extension \`${dirs.companion}\``
+    : `The ${target.root === "project-hooks" ? "project" : "global"} hook \`${join(dirs[target.root], target.path ?? hookFileName(fingerprint))}\``;
+  return [
+    `${where}:`, "", ...INTENT_LINES.map(([field, label]) => `${label}: ${intent[field].trim()}`), "",
+    "Apply authorises drafting only: the drafted code and its check result are shown and asked again before any file is written.",
+  ].join("\n");
 }
 
 function checkCurrentFingerprint(candidate: ReviewCandidate, fingerprint: string): void {

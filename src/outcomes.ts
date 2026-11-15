@@ -53,7 +53,7 @@ export function renderRemedyOutcomes(outcomes: readonly RemedyOutcome[], records
   const loaded = new Set(digest.skills.map((skill) => skill.name));
   const listed = outcomes.filter(({ fingerprint }) => {
     const record = latest.get(fingerprint)!;
-    return record.kind === "project" || loaded.has(record.skill);
+    return record.skill === undefined || loaded.has(record.skill);
   });
   const unlisted = outcomes.length - listed.length;
   return ["### Remedy outcomes", "", ...listed.map((outcome) => {
