@@ -245,6 +245,6 @@ The installed OMP host loads `test/native-schema.ts` without a model prompt to v
 
 The `/skill:` reminder finds the skill by the first line of OMP's user-invocation template. One test renders `src/prompts/skills/user-invocation.md` from the package of the first `omp` on `PATH` (an npm or Bun global install), so a reworded template in the installed OMP fails the suite. It is skipped, independently of the native-test flag, when `omp` is missing or is a compiled binary that ships no template. Native checks still require their OMP or Bun prerequisites.
 
-### Pre-commit hook
+### Git hooks
 
-Enable the bundled hook in each clone with `git config core.hooksPath hooks`. It rejects unstaged or untracked files so verification matches the index. It sets `SKILL_OBSERVER_NATIVE_TESTS=0` so a `1` inherited from the shell cannot enable native OMP checks, and runs `bun run check` (typecheck, then tests). Missing Bun/dependencies or a failing check blocks the commit.
+Enable the bundled hooks in each clone with `git config core.hooksPath hooks`. `pre-commit` exports the staged files to a temp folder, links the clone's `node_modules` there, and runs `bun run check` (typecheck, then tests) on that export, so unstaged edits and untracked files neither block the commit nor reach the check. It sets `SKILL_OBSERVER_NATIVE_TESTS=0` so a `1` inherited from the shell cannot enable native OMP checks. Missing Bun/dependencies or a failing check blocks the commit. `commit-msg` refuses a subject without a conventional type, as in `fix: …` or `feat(scope): …`.

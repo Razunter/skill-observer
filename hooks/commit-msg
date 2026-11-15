@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+subject=$(head -n 1 "$1")
+case "$subject" in
+    "Merge "*|"Revert "*|"fixup! "*|"squash! "*|"amend! "*) exit 0 ;;
+esac
+if ! printf '%s\n' "$subject" | grep -Eq '^(feat|fix|docs|refactor|test|perf|build|ci|chore|style|revert)(\([A-Za-z0-9._/-]+\))?!?: [^ ]'; then
+    echo "commit-msg: start the subject with a conventional type, as in 'fix: …' or 'feat(scope): …'" >&2
+    exit 1
+fi
