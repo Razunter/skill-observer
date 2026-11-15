@@ -229,6 +229,15 @@ export function harnessFingerprint(target: HarnessTarget): string {
   return createHash("sha256").update(JSON.stringify(["harness", target.root, project, target.path ?? null, mechanism])).digest("hex").slice(0, 12);
 }
 
+/** The hook file a harness target names, as a key: root kind, the project for a project hook, and file name; none for the companion. */
+export function hookFileKey(target: HarnessTarget, fingerprint: string): string | undefined {
+  if (target.root === "companion") return undefined;
+  return JSON.stringify([target.root, target.root === "project-hooks" ? target.project : null, target.path ?? hookFileName(fingerprint)]);
+}
+
+/** A hook removal's identity is its file alone, so a declined removal stays declined however it is worded and never suppresses a change to that hook. */
+export const removalFingerprint = (fileKey: string) => createHash("sha256").update(JSON.stringify(["harness-removal", fileKey])).digest("hex").slice(0, 12);
+
 /** Shared storage does not make another project's decisions visible in this pass; global hook and companion decisions apply in every project. */
 export function ledgerForProject(records: readonly LedgerRecord[], cwd: string): LedgerRecord[] {
   const root = realpathSync(cwd);

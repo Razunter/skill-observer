@@ -279,17 +279,17 @@ function approvedProposal<C>(ref: ProposalAnswerRef, evidence: SessionToolEviden
 }
 
 /**
- * The observer hook or companion proposal the user answered Apply at `stage`
- * in this pass, established from the saved Ask answer like any approval. An
+ * The observer hook or companion proposal the user answered Apply at one of
+ * `stages` in this pass, established from the saved Ask answer like any approval. An
  * approval note on this scope is custom input: the description or code is
  * revised by it and asked again, so a noted Apply approves nothing.
  */
-export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<ProposalAnswerRef> | undefined, stage: S, branch: readonly SessionEntry[]):
+export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<ProposalAnswerRef> | undefined, stages: readonly S[], branch: readonly SessionEntry[]):
   { proposal: PreparedProposal; change: Extract<HarnessChange, { stage: S }> } {
   const { proposal, change, note } = approvedProposal(answerRef(ref), sessionToolEvidence(branch), branch, (prepared) => {
     const change = "change" in prepared ? prepared.change : undefined;
-    if (change?.operation !== "harness" || change.stage !== stage) {
-      throw new Error(`the approved proposal is no hook or companion ${stage}${stage === "code" ? ": an intent Apply authorises drafting only" : ""}`);
+    if (change?.operation !== "harness" || !(stages as readonly string[]).includes(change.stage)) {
+      throw new Error(`the approved proposal is no hook or companion ${stages.join(" or ")}${stages.includes("code" as S) ? ": an intent Apply authorises drafting only" : ""}`);
     }
     return new Map([[APPLY, change as Extract<HarnessChange, { stage: S }>]]);
   });

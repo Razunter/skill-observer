@@ -17,8 +17,8 @@ import {
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
-  canonicalHarnessTarget, canonicalProjectTarget, type Evidence, harnessFingerprint, harnessRootDirs, hookFileName, ledgerForProject, type LedgerRecord,
-  projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind,
+  canonicalHarnessTarget, canonicalProjectTarget, type Evidence, harnessFingerprint, harnessRootDirs, hookFileKey, hookFileName, ledgerForProject, type LedgerRecord,
+  projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind, removalFingerprint,
   proposalFingerprint, readLedger, targetLabel, type TargetScope,
 } from "./ledger.js";
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
@@ -51,7 +51,9 @@ type ChangeDraft =
   /** An observer hook or companion change, at the stage the user approves now: the described remedy, before any code is drafted. */
   | ({ operation: "harness"; stage: "intent" } & HarnessIntent)
   /** The drafted code, after the user's Apply of the same identity's intent in this pass, which `intent` cites. */
-  | { operation: "harness"; stage: "code"; intent: ProposalAnswerRef; files: HarnessFile[]; check: HarnessCheck };
+  | { operation: "harness"; stage: "code"; intent: ProposalAnswerRef; files: HarnessFile[]; check: HarnessCheck }
+  /** Deleting the hook file the target names, asked once: the pass deletes it after Apply. */
+  | { operation: "harness"; stage: "removal" };
 
 /** The described remedy of an observer hook or companion change: the intent-stage preview, field by field. */
 interface HarnessIntent { event: string; predicate: string; action: string; mistake: string; legitimate: string; scope: string; lowerRungs: string }
@@ -94,6 +96,8 @@ export type PreparedChange =
   | { operation: "harness"; stage: "intent" }
   /** Approve the exact code: `root` is the target root's directory; the pass writes the files with normal tools and the resolver only records them. */
   | { operation: "harness"; stage: "code"; root: string; files: HarnessFile[]; check: HarnessCheck }
+  /** Delete the hook `file`: the pass deletes it with its own tools and the resolver records the removal once it is gone. */
+  | { operation: "harness"; stage: "removal"; file: string }
   /** `record`: the amendment already holds the section verbatim, so publication writes nothing and only the ledger changes. */
   | { operation: "on-read-append"; effect: "create" | "append" | "record"; rule: RuleIdentity; target: FileSnapshot; section: string }
   /** Samples stay in the form the scope sees, as `observer_check` and `observer_resolve` take them. */
@@ -198,6 +202,8 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
       files: z.array(z.object({ path: z.string().describe("Relative to the target root: for a hook, its one file."), text: z.string().describe("The file's exact text, as written.") })),
       check: z.object({ command: z.string(), output: z.string().describe("The check's observed output, unedited.") }),
     }).describe("The drafted code of an approved intent, with the check it passed: shown and asked in a Select and Ask of its own; Apply approves writing exactly these files."),
+    z.object({ operation: z.enum(["harness"]), stage: z.enum(["removal"]) })
+      .describe("Deletes the hook file the target names, in either hooks directory, hand-written ones included: asked once, showing the file as it stands, with Apply and Decline. After Apply the pass deletes the file itself; observer_resolve records the removal once it is gone."),
   ]);
   const draft = {
     gist: z.string(), priority: z.enum(PRIORITIES), remedy: z.string(), change,
@@ -335,7 +341,7 @@ function renderFieldset(proposal: PreparedProposal): string {
     ? proposal.alternatives.flatMap(({ preview }, i) => [`<p><b>${staleLabels[i]}</b></p>`, previewParagraph(preview)])
     : [previewParagraph(proposal.preview)];
   const labels = isStale ? ["Keep", ...staleLabels]
-    : proposal.change.operation === "withdrawal" ? [APPLY, "Decline"] : [APPLY, "Later", "Decline"];
+    : proposal.change.operation === "withdrawal" || isRemoval(proposal.change) ? [APPLY, "Decline"] : [APPLY, "Later", "Decline"];
   // Approval of these takes no note, so a noted answer becomes a new Prepare and Ask.
   const notedAsksAgain = isStale ? "An Update or Delete with a note is asked again."
     : ["withdrawal", "compaction", "harness"].includes(proposal.change.operation) ? "An Apply with a note is asked again." : undefined;
@@ -468,8 +474,15 @@ function preparedProposal(
   const base = { priority: candidate.priority, ...scope, gist: candidate.gist, remedy: candidate.remedy, evidence: candidate.evidence };
   if (candidate.kind === "harness") {
     if (draft.operation !== "harness") throw new Error("an observer hook or companion change is a harness change, asked first as its intent");
+    if (draft.stage === "removal") {
+      const removal = hookRemoval(candidate.target, context);
+      checkCurrentFingerprint(candidate, removal.fingerprint);
+      if (declined.has(removal.fingerprint)) return undefined;
+      const { priority, gist, remedy, evidence } = candidate;
+      return { candidateId: `removal:${removal.fingerprint}`, fingerprint: removal.fingerprint, priority, kind: "harness", target: removal.target, gist, remedy, evidence, ...removalStage(removal) };
+    }
     const isCode = draft.stage === "code";
-    if (!isCode && draft.stage !== "intent") throw new Error("a harness change is prepared at its `intent` stage, then at its `code` stage");
+    if (!isCode && draft.stage !== "intent") throw new Error("a harness change is prepared at its `intent` stage, then at its `code` stage, or as a `removal`");
     const missing = isCode ? undefined : INTENT_LINES.find(([field]) => typeof draft[field] !== "string" || !draft[field].trim());
     if (missing) throw new Error(`a harness intent needs its ${missing[1].toLowerCase()}`);
     const fingerprint = proposalIdentity(candidate, scoped);
@@ -650,7 +663,7 @@ function intentPreview(target: HarnessTarget, fingerprint: string, intent: Harne
 function codeStage(target: HarnessTarget, fingerprint: string, draft: Extract<ChangeDraft, { stage: "code" }>, { cwd, agentDir, branch }: PrepareContext):
   { change: Extract<PreparedChange, { stage: "code" }>; preview: string } {
   if (target.root === "companion") throw new Error("companion code is not prepared at the code stage: a companion change needs a test the code stage does not yet run");
-  const { proposal: intent } = approvedHarness(draft.intent, "intent", branch);
+  const { proposal: intent } = approvedHarness(draft.intent, ["intent"], branch);
   if (intent.fingerprint !== fingerprint) throw new Error(`the cited intent Apply approved another hook or companion change, \`${intent.fingerprint}\`, not \`${fingerprint}\``);
   const file = target.path ?? hookFileName(fingerprint);
   const [only, ...rest] = Array.isArray(draft.files) ? draft.files : [];
@@ -668,6 +681,31 @@ function codeStage(target: HarnessTarget, fingerprint: string, draft: Extract<Ch
   if (preview.includes("\r")) throw new Error("the code or its check output holds a carriage return, which the Ask preview would not show; send it with `\\n` line ends only");
   return { change: { operation: "harness", stage: "code", root, files, check: { command, output } }, preview };
 }
+
+/**
+ * A hook removal's target, naming its file, and its identity: the file alone
+ * (see {@link removalFingerprint}), not the hook's own identity, so a recorded
+ * hook's applied record is found by its file when the removal is recorded.
+ */
+function hookRemoval(target: HarnessTarget, { cwd, agentDir }: PrepareContext): HookRemoval {
+  if (target.root === "companion") throw new Error("only a hook file is removed this way, not the companion extension");
+  const hook = harnessFingerprint(target);
+  const path = target.path ?? hookFileName(hook);
+  return { target: { ...target, path }, fingerprint: removalFingerprint(hookFileKey(target, hook)!), file: join(harnessRootDirs(cwd, agentDir)[target.root], path) };
+}
+interface HookRemoval { target: HarnessTarget; fingerprint: string; file: string }
+
+/** The removal's preview is the file as it stands; deleting writes nothing, so a carriage return the form hides changes nothing approved. */
+function removalStage({ target, file }: HookRemoval): { change: Extract<PreparedChange, { stage: "removal" }>; preview: string } {
+  if (!existsSync(file)) throw new Error(`there is no hook file \`${file}\` to remove`);
+  const preview = [
+    `Delete the ${target.root === "project-hooks" ? "project" : "global"} hook \`${file}\`, which holds:`, "", readFileSync(file, "utf8"), "",
+    "Apply lets the agent delete this file; the removal is recorded once it is gone. A removed hook stops acting only after omp restarts.",
+  ].join("\n");
+  return { change: { operation: "harness", stage: "removal", file }, preview };
+}
+
+const isRemoval = (change: PreparedChange) => change.operation === "harness" && change.stage === "removal";
 
 function checkCurrentFingerprint(candidate: ReviewCandidate, fingerprint: string): void {
   if (candidate.fingerprint !== undefined && candidate.fingerprint !== fingerprint) throw new Error("candidate fingerprint does not match its current scoped identity");

@@ -14,6 +14,7 @@
  * model with the normal tools; this tool only records them.
  */
 
+import { existsSync } from "node:fs";
 import { isPinKind, type RuleDirs } from "./amendments.js";
 import {
   ANSWER_OUTCOMES,
@@ -30,6 +31,7 @@ import {
   type ProjectLedgerRecord,
   type SkillLedgerRecord,
   type HarnessLedgerRecord,
+  hookFileKey,
   type HarnessPublication,
   targetLabel,
   IN_FORCE_OUTCOMES,
@@ -92,8 +94,9 @@ interface ProjectAnswer {
 }
 /**
  * The answer to an observer hook or companion proposal: a Later or Decline of
- * either stage cites the prepared proposal; an applied one cites the user's
- * Apply of its code stage and the receipts of its publication.
+ * any stage cites the prepared proposal; an applied one cites the user's
+ * Apply of its code stage and the receipts of its publication, or the Apply
+ * of a hook removal, recorded once the file is gone.
  */
 interface HarnessAnswer {
   kind: "harness";
@@ -162,20 +165,21 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
 }
 
 /**
- * One identity's record for the pass, under its prepared proposal's identity,
+ * One identity's records for the pass, under its prepared proposal's identity,
  * gist and evidence, never its description or code: `applied` once the
  * approved code is published; otherwise `later` or `declined`. A Later of the
  * code says a draft existed, since it comes back as an intent question.
  */
-function harnessRecord(answer: HarnessAnswer, cwd: string, branch: readonly SessionEntry[], timestamp: string, sessionId: string): HarnessLedgerRecord {
+function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly LedgerRecord[], branch: readonly SessionEntry[], timestamp: string, sessionId: string): HarnessLedgerRecord[] {
   if (!PROPOSAL_OUTCOMES.includes(answer.outcome)) throw new Error("a harness answer is `applied`, `later` or `declined`");
   if (answer.outcome === "applied") {
     if (answer.approval === undefined || answer.proposal !== undefined) {
-      throw new Error("an applied hook or companion change cites the user's Apply of its code stage through `approval`; an intent Apply authorises drafting only: record it as `later` until its code is approved");
+      throw new Error("an applied hook or companion change cites the user's Apply of its code stage or removal through `approval`; an intent Apply authorises drafting only: record it as `later` until its code is approved");
     }
-    const { proposal, change } = approvedHarness(answer.approval, "code", branch);
+    const { proposal, change } = approvedHarness(answer.approval, ["code", "removal"], branch);
+    if (change.stage === "removal") return removalRecords(harnessIdentity(proposal), change.file, ledger, timestamp, sessionId);
     checkHarnessPublication(change, answer.publication, cwd, branch);
-    return { ...harnessIdentity(proposal), outcome: "applied", publication: answer.publication!, timestamp, sessionId };
+    return [{ ...harnessIdentity(proposal), outcome: "applied", publication: answer.publication!, timestamp, sessionId }];
   }
   if (!isProposalRef(answer.proposal) || answer.approval !== undefined) {
     throw new Error("a Later or Decline of a hook or companion change cites its prepared proposal through `proposal`, its `reference` exactly as Prepare returned it");
@@ -189,14 +193,29 @@ function harnessRecord(answer: HarnessAnswer, cwd: string, branch: readonly Sess
   const note = answer.outcome === "later" && answer.reoffer === undefined ? laterNote(answer.proposal, evidence) : undefined;
   const reoffer = answer.reoffer ?? note;
   const drafted = "change" in proposal && proposal.change.operation === "harness" && proposal.change.stage === "code";
-  return {
+  return [{
     ...harnessIdentity(proposal), outcome: answer.outcome,
     ...laterReoffer({ outcome: answer.outcome, reoffer: drafted ? `A draft existed: its code was shown and answered Later; ask the intent again before drafting anew.${reoffer === undefined ? "" : ` ${reoffer}`}` : reoffer }),
     timestamp, sessionId,
-  };
+  }];
 }
 
-function harnessIdentity(proposal: PreparedProposal): Pick<HarnessLedgerRecord, "kind" | "target" | "fingerprint" | "gist" | "evidence"> {
+/**
+ * A hook removal, recorded only once its file is gone, since the pass deletes
+ * it: as a withdrawal of every record that holds a hook at that file in force,
+ * or, for a hook no pass recorded, under the removal's own identity.
+ */
+function removalRecords(removal: HarnessIdentity, file: string, ledger: readonly LedgerRecord[], timestamp: string, sessionId: string): HarnessLedgerRecord[] {
+  if (existsSync(file)) throw new Error(`\`${file}\` is still there: after the user's Apply, delete it with your own tools, then record its removal; this tool deletes nothing`);
+  const at = hookFileKey(removal.target, removal.fingerprint);
+  const inForce = ledger.filter((record): record is HarnessLedgerRecord =>
+    record.kind === "harness" && IN_FORCE_OUTCOMES.has(record.outcome) && hookFileKey(record.target, record.fingerprint) === at);
+  const withdrawn = inForce.length > 0 ? inForce.map(({ target, fingerprint, gist }) => ({ ...removal, target, fingerprint, gist })) : [removal];
+  return withdrawn.map((identity) => ({ ...identity, outcome: "withdrawn", timestamp, sessionId }));
+}
+
+type HarnessIdentity = Pick<HarnessLedgerRecord, "kind" | "target" | "fingerprint" | "gist" | "evidence">;
+function harnessIdentity(proposal: PreparedProposal): HarnessIdentity {
   if (proposal.kind !== "harness") throw new Error(`the cited proposal is a ${proposal.kind} proposal, not an observer hook or companion change`);
   return {
     kind: "harness", target: proposal.target, fingerprint: proposal.fingerprint, gist: proposal.gist,
@@ -275,13 +294,13 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           }),
           z.object({
             kind: z.enum(["harness"]),
-            proposal: proposalRefSchema(z).optional().describe("`later` or `declined` only: the `reference` of the intent or code proposal answered, from the pass's latest Prepare holding it, exactly as Prepare returned it."),
-            approval: z.object(approvalShape(z)).optional().describe("`applied` only, and required for it: where the user's Apply of the code stage is saved."),
+            proposal: proposalRefSchema(z).optional().describe("`later` or `declined` only: the `reference` of the intent, code or removal proposal answered, from the pass's latest Prepare holding it, exactly as Prepare returned it."),
+            approval: z.object(approvalShape(z)).optional().describe("`applied` only, and required for it: where the user's Apply of the code stage, or of a hook removal, is saved."),
             publication: z.object({
               writeToolCallIds: z.array(z.string()), checkToolCallIds: z.array(z.string()),
               files: z.array(z.object({ path: z.string().describe("Root-relative, as the code stage named it."), afterHash: z.string() })),
-            }).optional().describe("`applied` only: the successful normal write of each approved file, the foreground checks after them with the target root as `cwd`, and each file's SHA-256 now. This tool does not write the files."),
-            outcome: z.enum(PROPOSAL_OUTCOMES).describe("One answer per hook or companion identity: `applied` when its approved code was written and checked; `declined` when either stage was declined; otherwise `later`."),
+            }).optional().describe("`applied` code only: the successful normal write of each approved file, the foreground checks after them with the target root as `cwd`, and each file's SHA-256 now. This tool does not write the files."),
+            outcome: z.enum(PROPOSAL_OUTCOMES).describe("One answer per hook or companion identity: `applied` when its approved code was written and checked, or its approved removal deleted the hook file (recorded as `withdrawn`); `declined` when either stage or the removal was declined; otherwise `later`."),
             reoffer: z.string().optional().describe(REOFFER_DESCRIPTION),
           })]),
         )
@@ -344,11 +363,10 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         }
         if (sent.kind === "harness") {
           try {
-            const record = harnessRecord(sent, ctx.cwd, ctx.sessionManager.getBranch(), timestamp, sessionId);
-            if (records.some((other) => other.kind === "harness" && other.fingerprint === record.fingerprint)) {
-              throw new Error(`this call already answers \`${record.fingerprint}\`: send one answer per hook or companion identity`);
-            }
-            records.push(record);
+            const answered = harnessRecords(sent, ctx.cwd, [...latest.values()], ctx.sessionManager.getBranch(), timestamp, sessionId);
+            const repeated = answered.find((record) => records.some((other) => other.kind === "harness" && other.fingerprint === record.fingerprint));
+            if (repeated) throw new Error(`this call already answers \`${repeated.fingerprint}\`: send one answer per hook or companion identity`);
+            records.push(...answered);
           }
           catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
           return [];

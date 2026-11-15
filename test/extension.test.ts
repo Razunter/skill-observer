@@ -2375,6 +2375,48 @@ describe("observer hook and companion intents", () => {
     host.setCwd(other);
     return other;
   };
+  const hookText = "export default function (pi) {\n  pi.on(\"tool_call\", (event) => event.input.command?.startsWith(\"git commit\") ? { block: true, reason: \"use jj commit\" } : undefined);\n}\n";
+  const check = { command: "bun scripts/check-hook.ts hook.ts samples.json", output: "mistake git commit -m fix: blocked\nlegitimate jj commit -m fix: untouched" };
+  const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+  const evidence = [{ quote: 'Tool error in `bash` "git commit -m fix": "fatal: not a git repository"', count: 2 }];
+  const code = (root: string, mechanism: string, approval: unknown, files: unknown[], target: Record<string, unknown> = {}) => ({
+    ...intent(root, mechanism, target), evidence, change: { operation: "harness", stage: "code", intent: approval, files, check },
+  });
+  /** Starts a pass in which the user answers `candidate` alone with `answer`; returns its form, proposal and where the answer is saved. */
+  const askIntent = async (host: ReturnType<typeof loadExtension>, candidate: unknown, answer: AnswerUser = () => "Apply") => {
+    const selection = await prepareAndSelect(host, [candidate]);
+    const selectionToolCallId = lastCallId(host);
+    const askToolCallId = askUser(host, selection, answer);
+    const [entry] = reviewEntries(selection, "selected");
+    return { selection, proposal: entry!.proposal, approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } };
+  };
+  /** Prepares, selects and asks the code candidate in the current pass. */
+  const askCode = async (host: ReturnType<typeof loadExtension>, candidate: unknown, answer: AnswerUser = () => "Apply") => {
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [candidate] });
+    expect(failures(prepared)).toEqual([]);
+    const selection = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
+    const selectionToolCallId = lastCallId(host);
+    const askToolCallId = askUser(host, selection, answer);
+    const [entry] = reviewEntries(selection, "selected");
+    return { selection, entry: entry!, approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } };
+  };
+  /** Saves a native write of `text` to `file` and a foreground check in `cwd` after it, as the pass publishes an approved hook; writes the file too. */
+  const publish = (host: ReturnType<typeof loadExtension>, file: string, text: string, cwd: string, { checkFirst = false, checkFails = false } = {}) => {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, text);
+    const n = host.getBranch().length;
+    const write = [
+      { type: "message", id: `call-write-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `write-${n}`, name: "write", arguments: { path: file, content: text } }] } },
+      { type: "message", id: `result-write-${n}`, message: { role: "toolResult", toolName: "write", toolCallId: `write-${n}`, isError: false, content: [{ type: "text", text: "Written" }] } },
+    ];
+    const run = [
+      { type: "message", id: `call-check-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `check-${n}`, name: "bash", arguments: { command: check.command, cwd } }] } },
+      { type: "message", id: `result-check-${n}`, message: { role: "toolResult", toolName: "bash", toolCallId: `check-${n}`, isError: checkFails, details: { exitCode: checkFails ? 1 : 0 }, content: [{ type: "text", text: check.output }] } },
+    ];
+    host.getBranch().push(...(checkFirst ? [...run, ...write] : [...write, ...run]) as SessionEntry[]);
+    return { writeToolCallIds: [`write-${n}`], checkToolCallIds: [`check-${n}`] };
+  };
+  const applied = (approval: unknown, publication: unknown) => ({ kind: "harness", outcome: "applied", approval, publication });
 
   it("prepares a project hook, a global hook and a companion intent, and the form shows each description with its root kind and path", async () => {
     const host = loadExtension();
@@ -2478,49 +2520,6 @@ describe("observer hook and companion intents", () => {
   });
 
   describe("at the code stage", () => {
-    const hookText = "export default function (pi) {\n  pi.on(\"tool_call\", (event) => event.input.command?.startsWith(\"git commit\") ? { block: true, reason: \"use jj commit\" } : undefined);\n}\n";
-    const check = { command: "bun scripts/check-hook.ts hook.ts samples.json", output: "mistake git commit -m fix: blocked\nlegitimate jj commit -m fix: untouched" };
-    const sha = (text: string) => createHash("sha256").update(text).digest("hex");
-    const evidence = [{ quote: 'Tool error in `bash` "git commit -m fix": "fatal: not a git repository"', count: 2 }];
-    const code = (root: string, mechanism: string, approval: unknown, files: unknown[], target: Record<string, unknown> = {}) => ({
-      ...intent(root, mechanism, target), evidence, change: { operation: "harness", stage: "code", intent: approval, files, check },
-    });
-    /** Starts a pass in which the user answers the intent with `answer`; returns its proposal and where the answer is saved. */
-    const askIntent = async (host: ReturnType<typeof loadExtension>, candidate: unknown, answer: AnswerUser = () => "Apply") => {
-      const selection = await prepareAndSelect(host, [candidate]);
-      const selectionToolCallId = lastCallId(host);
-      const askToolCallId = askUser(host, selection, answer);
-      const [entry] = reviewEntries(selection, "selected");
-      return { proposal: entry!.proposal, approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } };
-    };
-    /** Prepares, selects and asks the code candidate in the current pass. */
-    const askCode = async (host: ReturnType<typeof loadExtension>, candidate: unknown, answer: AnswerUser = () => "Apply") => {
-      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [candidate] });
-      expect(failures(prepared)).toEqual([]);
-      const selection = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
-      const selectionToolCallId = lastCallId(host);
-      const askToolCallId = askUser(host, selection, answer);
-      const [entry] = reviewEntries(selection, "selected");
-      return { selection, entry: entry!, approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } };
-    };
-    /** Saves a native write of `text` to `file` and a foreground check in `cwd` after it, as the pass publishes an approved hook; writes the file too. */
-    const publish = (host: ReturnType<typeof loadExtension>, file: string, text: string, cwd: string, { checkFirst = false, checkFails = false } = {}) => {
-      mkdirSync(dirname(file), { recursive: true });
-      writeFileSync(file, text);
-      const n = host.getBranch().length;
-      const write = [
-        { type: "message", id: `call-write-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `write-${n}`, name: "write", arguments: { path: file, content: text } }] } },
-        { type: "message", id: `result-write-${n}`, message: { role: "toolResult", toolName: "write", toolCallId: `write-${n}`, isError: false, content: [{ type: "text", text: "Written" }] } },
-      ];
-      const run = [
-        { type: "message", id: `call-check-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `check-${n}`, name: "bash", arguments: { command: check.command, cwd } }] } },
-        { type: "message", id: `result-check-${n}`, message: { role: "toolResult", toolName: "bash", toolCallId: `check-${n}`, isError: checkFails, details: { exitCode: checkFails ? 1 : 0 }, content: [{ type: "text", text: check.output }] } },
-      ];
-      host.getBranch().push(...(checkFirst ? [...run, ...write] : [...write, ...run]) as SessionEntry[]);
-      return { writeToolCallIds: [`write-${n}`], checkToolCallIds: [`check-${n}`] };
-    };
-    const applied = (approval: unknown, publication: unknown) => ({ kind: "harness", outcome: "applied", approval, publication });
-
     it.each<[string, (host: ReturnType<typeof loadExtension>, candidate: unknown) => Promise<unknown>, string]>([
       ["no intent approval cited", async () => undefined, "needs `approval`"],
       ["an intent answered Later", async (host, candidate) => (await askIntent(host, candidate, () => "Later")).approval, "selected `Later`"],
@@ -2676,6 +2675,95 @@ describe("observer hook and companion intents", () => {
       expect(blocks[blocks.indexOf("### Remedy outcomes") + 1]).toBe(`- ${proposal.fingerprint} (\`${file}\` (project hook)): exercised-clean (evidence: tool-result:commit).`);
       await host.runCommand("observe-report");
       expect(host.notices.at(-1)).toContain(`- ${proposal.fingerprint}: exercised-clean (\`${file}\` (project hook))`);
+    });
+  });
+
+  describe("removing a hook", () => {
+    const handText = "export default function (pi) {\n\tpi.on(\"tool_call\", () => ({ block: true }));\n}\n";
+    const removal = (root: string, path: string | undefined, gist = "Remove the misfiring hook") => ({
+      kind: "harness", target: { scope: "harness", root, mechanism: "remove the hook", ...(path !== undefined && { path }) },
+      gist, priority: "evidence", remedy: "It blocks legitimate commits", change: { operation: "harness", stage: "removal" },
+      evidence: [{ quote: "the hook blocked jj commit", count: 1 }],
+    });
+    /** Writes a hook no pass wrote, `mine.ts`, in the `root` hooks directory; returns its path. */
+    const handWritten = (host: ReturnType<typeof loadExtension>, root: "project-hooks" | "global-hooks") => {
+      const dir = root === "project-hooks" ? projectHooks(host) : join(agentDir(host), "hooks/pre");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "mine.ts"), handText);
+      return join(dir, "mine.ts");
+    };
+    const removed = (approval: unknown) => ({ kind: "harness", outcome: "applied", approval });
+
+    it("shows the hook file as it stands, offering Apply and Decline only", async () => {
+      const host = loadExtension();
+      const file = handWritten(host, "project-hooks");
+      const { selection } = await askIntent(host, removal("project-hooks", "mine.ts"));
+      const { askHtml } = JSON.parse(resultText(selection));
+      expect(askHtml).toContain("<legend>`mine.ts` (project hook): Remove the misfiring hook</legend>");
+      expect(askHtml).toContain(file);
+      expect(askHtml).toContain('export default function (pi) {<br>→pi.on("tool_call", () =&gt; ({ block: true }));<br>}');
+      expect(askHtml).toContain(">Apply</label>");
+      expect(askHtml).toContain(">Decline</label>");
+      expect(askHtml).not.toContain(">Later</label>");
+    });
+
+    it.each([
+      ["a hook file that is not there", "global-hooks", "gone.ts", "no hook file"],
+      ["the companion extension", "companion", undefined, "only a hook file"],
+    ] as const)("refuses removing %s", async (_label, root, path, reason) => {
+      const host = loadExtension();
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [removal(root, path)] });
+      expect(prepared.isError).toBe(true);
+      expect(failures(prepared)).toEqual([expect.stringContaining(reason)]);
+    });
+
+    it("records an approved removal only once the file is gone, and a hand-written hook's without a prior applied record", async () => {
+      const host = loadExtension();
+      const file = handWritten(host, "global-hooks");
+      const { proposal, approval } = await askIntent(host, removal("global-hooks", "mine.ts"));
+      const early = await resolve(host, [removed(approval)]);
+      expect(failures(early)).toEqual([expect.stringContaining("still there")]);
+      expect(readFileSync(file, "utf8")).toBe(handText);
+      expect(existsSync(host.ledgerFile)).toBe(false);
+
+      rmSync(file);
+      const result = await resolve(host, [removed(approval)]);
+      expect(failures(result)).toEqual([]);
+      expect(resultText(result)).toContain(`- withdrawn \`mine.ts\` (global hook), fingerprint \`${proposal.fingerprint}\`: Remove the misfiring hook`);
+      expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({
+        kind: "harness", outcome: "withdrawn", fingerprint: proposal.fingerprint, target: expect.objectContaining({ root: "global-hooks", path: "mine.ts" }),
+      })]);
+    });
+
+    it("records removing an observer hook as a withdrawal of its applied record", async () => {
+      const host = loadExtension();
+      const { proposal, approval: intentApproval } = await askIntent(host, intent("project-hooks", "Block git commit here"));
+      const file = `skill-observer-${proposal.fingerprint}.ts`;
+      const { approval: codeApproval } = await askCode(host, code("project-hooks", "Block git commit here", intentApproval, [{ path: file, text: hookText }]));
+      const receipts = publish(host, join(projectHooks(host), file), hookText, projectHooks(host));
+      expect(failures(await resolve(host, [applied(codeApproval, { ...receipts, files: [{ path: file, afterHash: sha(hookText) }] })]))).toEqual([]);
+
+      const { approval } = await askIntent(host, removal("project-hooks", file));
+      rmSync(join(projectHooks(host), file));
+      const result = await resolve(host, [removed(approval)]);
+      expect(failures(result)).toEqual([]);
+      expect(resultText(result)).toContain(`- withdrawn \`${file}\` (project hook), fingerprint \`${proposal.fingerprint}\`: Block git commit here`);
+      expect(ledgerRecords(host.ledgerFile).map(({ fingerprint, outcome }) => [fingerprint, outcome])).toEqual([[proposal.fingerprint, "applied"], [proposal.fingerprint, "withdrawn"]]);
+      await host.runCommand("observe", "Is the hook gone?");
+      expect(String(host.sent.at(-1)?.message.content)).not.toContain("### Remedy outcomes");
+    });
+
+    it("leaves a declined removal's file and does not offer it again, while a change to the same hook is still offered", async () => {
+      const host = loadExtension();
+      const file = handWritten(host, "global-hooks");
+      const { approval } = await askIntent(host, removal("global-hooks", "mine.ts"), () => "Decline");
+      expect(failures(await resolve(host, [{ kind: "harness", proposal: approval.proposal, outcome: "declined" }]))).toEqual([]);
+      expect(readFileSync(file, "utf8")).toBe(handText);
+      startPass(host);
+      const again = await host.callTool("observer_review", { action: "prepare", candidates: [removal("global-hooks", "mine.ts", "Remove it after all")] });
+      expect(reviewEntries(again)).toEqual([]);
+      const change = await host.callTool("observer_review", { action: "prepare", candidates: [intent("global-hooks", "Fix my hand-written hook", { path: "mine.ts" })] });
+      expect(reviewEntries(change).map(({ proposal: { gist } }) => gist)).toEqual(["Fix my hand-written hook"]);
     });
   });
 });
