@@ -5758,8 +5758,9 @@ describe("observations", () => {
   const OBSERVATION = "Recalled memories repeat the commit-style fact in twelve entries; merge them into one.";
   const today = () => new Date().toISOString().slice(0, 10);
 
-  /** The list lines of the Observations section of the last payload `/observe` sent. */
-  const observationLines = (host: ReturnType<typeof loadExtension>) => {
+  /** The list lines of the Observations section of the last payload, once `/observe` has sent exactly `payloads` of them. */
+  const observationLines = (host: ReturnType<typeof loadExtension>, payloads: number) => {
+    expect(host.sent).toHaveLength(payloads);
     const content = String(host.sent.at(-1)?.message.content ?? "");
     const section = /\n## Observations\n\n([\s\S]*?)(?=\n## |$)/.exec(content)?.[1] ?? "";
     return section.split("\n").filter((line) => line.startsWith("- "));
@@ -5785,7 +5786,7 @@ describe("observations", () => {
 
   it("lists an observation recorded in one session in the next session's /observe as one line, marked as the agent's unverified remark", async () => {
     const host = await recordThenObserve(OBSERVATION);
-    expect(observationLines(host)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${today()})`]);
+    expect(observationLines(host, 1)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${today()})`]);
     const content = String(host.sent[0]?.message.content);
     const section = content.slice(content.indexOf("\n## Observations"));
     expect(section).toMatch(/unverified/);
@@ -5813,11 +5814,11 @@ describe("observations", () => {
     git(main, "init", "-q", "-b", "main");
     git(main, "commit", "-q", "--allow-empty", "-m", "init");
     git(main, "worktree", "add", "-q", join(root, "linked"));
-    expect(observationLines(await recordThenObserve(OBSERVATION, join(main, "sub"), join(root, "linked")))).toHaveLength(1);
+    expect(observationLines(await recordThenObserve(OBSERVATION, join(main, "sub"), join(root, "linked")), 1)).toHaveLength(1);
 
     git(root, "init", "-q", "--bare", "bare.git");
     git(join(root, "bare.git"), "worktree", "add", "-q", "--orphan", "-b", "main", join(root, "bare-linked"));
-    expect(observationLines(await recordThenObserve(OBSERVATION, join(root, "bare-linked"), join(root, "bare.git")))).toHaveLength(1);
+    expect(observationLines(await recordThenObserve(OBSERVATION, join(root, "bare-linked"), join(root, "bare.git")), 1)).toHaveLength(1);
   });
 
   it("identifies a checkout holding tracked HEAD and objects paths by its git directory, shared with its linked worktree", async () => {
@@ -5830,7 +5831,7 @@ describe("observations", () => {
     git(main, "add", ".");
     git(main, "commit", "-q", "-m", "init");
     git(main, "worktree", "add", "-q", join(root, "linked"));
-    expect(observationLines(await recordThenObserve(OBSERVATION, main, join(root, "linked")))).toHaveLength(1);
+    expect(observationLines(await recordThenObserve(OBSERVATION, main, join(root, "linked")), 1)).toHaveLength(1);
   });
 
   it("keeps a text recorded again while /observe assembles its payload pending for the next pass", async () => {
@@ -5841,9 +5842,9 @@ describe("observations", () => {
     const pass = second.runCommand("observe");
     expect((await first.callTool("observe", { text: OBSERVATION })).isError).toBeFalsy();
     await pass;
-    expect(observationLines(second)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${today()})`]);
+    expect(observationLines(second, 1)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${today()})`]);
     await second.runCommand("observe");
-    expect(observationLines(second)).toEqual([`- ${OBSERVATION} (count 2, last recorded ${today()})`]);
+    expect(observationLines(second, 2)).toEqual([`- ${OBSERVATION} (count 2, last recorded ${today()})`]);
   });
 
   it("keeps a text recorded again pending when the shown row for its earlier recording lands after it", async () => {
@@ -5854,7 +5855,7 @@ describe("observations", () => {
     appendFileSync(host.observationsFile, `${JSON.stringify({ ...JSON.parse(first!), shownAt: new Date().toISOString() })}\n`);
     host.setBranch(fx.plainUserMessage);
     await host.runCommand("observe");
-    expect(observationLines(host)).toEqual([`- ${OBSERVATION} (count 2, last recorded ${today()})`]);
+    expect(observationLines(host, 1)).toEqual([`- ${OBSERVATION} (count 2, last recorded ${today()})`]);
   });
 
   it("keeps both recordings shown when their shown rows land in reverse order", async () => {
@@ -5878,15 +5879,14 @@ describe("observations", () => {
     await host.runCommand("observe");
     await host.callTool("observe", { text: OBSERVATION });
     await host.runCommand("observe");
-    expect(host.sent).toHaveLength(2);
-    expect(observationLines(host)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${new Date(T0).toISOString().slice(0, 10)})`]);
+    expect(observationLines(host, 2)).toEqual([`- ${OBSERVATION} (count 1, last recorded ${new Date(T0).toISOString().slice(0, 10)})`]);
   });
 
   it("keeps another project's observations out, and outside git identifies a project by the working directory's real path", async () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "skill-observer-plain-")));
     for (const dir of ["one", "two"]) mkdirSync(join(root, dir));
     symlinkSync(join(root, "one"), join(root, "one-link"));
-    expect(observationLines(await recordThenObserve(OBSERVATION, join(root, "one-link"), join(root, "one")))).toHaveLength(1);
+    expect(observationLines(await recordThenObserve(OBSERVATION, join(root, "one-link"), join(root, "one")), 1)).toHaveLength(1);
     const other = await recordThenObserve(OBSERVATION, join(root, "one"), join(root, "two"));
     expect(other.sent).toEqual([]);
   });
@@ -5916,7 +5916,7 @@ describe("observations", () => {
     second.setBranch(fx.plainUserMessage);
     await second.runCommand("observe-report");
     await second.runCommand("observe");
-    expect(observationLines(second)).toHaveLength(1);
+    expect(observationLines(second, 1)).toHaveLength(1);
     await second.runCommand("observe");
     expect(second.sent).toHaveLength(1);
     expect(second.notices.at(-1)).toMatch(/^Nothing to observe/);
@@ -5929,7 +5929,7 @@ describe("observations", () => {
     const second = loadExtension({ skillHome: first.skillHome });
     second.setBranch(fx.plainUserMessage);
     await second.runCommand("observe");
-    expect(observationLines(second)).toHaveLength(1);
+    expect(observationLines(second, 1)).toHaveLength(1);
     expect(second.activeTools()).toContain("observer_resolve");
     expect(second.noticeEvents).toEqual([
       { message: expect.stringMatching(/^Observations not marked as shown: .+; the next \/observe lists them again\.$/), type: "error" },
@@ -5946,7 +5946,7 @@ describe("observations", () => {
     const second = loadExtension({ skillHome: first.skillHome });
     second.setBranch(fx.plainUserMessage);
     await second.runCommand("observe");
-    expect(observationLines(second)).toHaveLength(listed);
+    expect(observationLines(second, listed)).toHaveLength(listed);
   });
 
   it("counts a text recorded again in other case, punctuation or spacing as one, and starts again at count 1 once shown or expired", async () => {
@@ -5958,18 +5958,18 @@ describe("observations", () => {
     vi.setSystemTime(T0 + DAY);
     await host.callTool("observe", { text: "bun TEST reads the real env-file" });
     await host.runCommand("observe");
-    expect(observationLines(host)).toEqual(["- bun TEST reads the real env-file (count 2, last recorded 2026-10-02)"]);
+    expect(observationLines(host, 1)).toEqual(["- bun TEST reads the real env-file (count 2, last recorded 2026-10-02)"]);
 
     // Recorded while that pass runs: it waits for the next one.
     await host.callTool("observe", { text: "Bun test reads the real .env file!" });
     await host.runCommand("observe");
-    expect(observationLines(host)).toEqual(["- Bun test reads the real .env file! (count 1, last recorded 2026-10-02)"]);
+    expect(observationLines(host, 2)).toEqual(["- Bun test reads the real .env file! (count 1, last recorded 2026-10-02)"]);
 
     await host.callTool("observe", { text: "Bun test reads the real .env file!" });
     vi.setSystemTime(T0 + 40 * DAY);
     await host.callTool("observe", { text: "Bun test reads the real .env file!" });
     await host.runCommand("observe");
-    expect(observationLines(host)).toEqual(["- Bun test reads the real .env file! (count 1, last recorded 2026-11-10)"]);
+    expect(observationLines(host, 3)).toEqual(["- Bun test reads the real .env file! (count 1, last recorded 2026-11-10)"]);
   });
 
   it.each([
@@ -6007,7 +6007,7 @@ describe("observations", () => {
     const second = loadExtension({ skillHome: first.skillHome });
     second.setBranch(fx.plainUserMessage);
     await second.runCommand("observe");
-    expect(observationLines(second)).toHaveLength(1);
+    expect(observationLines(second, 1)).toHaveLength(1);
   });
 
   it("returns a tool error saying nothing was recorded when the append fails", async () => {
@@ -6073,7 +6073,7 @@ describe("observations", () => {
     expect(report).toMatch(/\nPayload estimate for \/observe now: ≈ \d+ tokens \(.*observations \d+/);
     expect(report).not.toContain("twelve entries");
     await second.runCommand("observe");
-    expect(observationLines(second)).toHaveLength(1);
+    expect(observationLines(second, 1)).toHaveLength(1);
   });
 
   it("tells the agent the observation was recorded, the project's pending count and that /observe reviews them", async () => {
