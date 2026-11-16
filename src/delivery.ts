@@ -102,14 +102,17 @@ const SKILL_ENTRY_URL = /^skill:\/\/([^/:\s]+)(?:\/SKILL\.md)?(?::[^/]*)?$/;
 const SKILL_ENTRY_FILE = /^(.*\/SKILL\.md)(?::[^/]*)?$/;
 const URL_SCHEME = /^[a-z][a-z\d+.-]*:\/\//i;
 
-/** The skill whose entry file `path` reads; `undefined` for a reference file, another URL or a path no installed skill owns. */
+/** The skill whose entry file `path` reads; `undefined` for a reference file, another URL, a path no installed skill owns or a skill a same-named one shadows. */
 function entrySkill(path: string, provenance: ProvenanceResolver): string | undefined {
   const url = SKILL_ENTRY_URL.exec(path);
   if (url) return url[1];
   const file = SKILL_ENTRY_FILE.exec(path);
   if (!file || URL_SCHEME.test(path)) return undefined;
   const skill = provenance.byPath(file[1]!);
-  return skill.kind === "unknown" ? undefined : skill.name;
+  if (skill.kind === "unknown") return undefined;
+  // Amendments belong to the skill that wins its name, so a shadowed same-named skill gets none.
+  const winner = provenance.byName(skill.name);
+  return winner.kind !== "unknown" && winner.path === skill.path ? skill.name : undefined;
 }
 
 /** Delivers the read skill's undelivered on-read amendments after a successful `read` of its entry file, and records the delivery. */

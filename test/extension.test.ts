@@ -5977,6 +5977,21 @@ describe("amendments for skills read with the read tool", () => {
     });
   });
 
+  it("delivers nothing for a direct read of a local skill a same-named plugin skill shadows", async () => {
+    const host = loadExtension();
+    splitAmendment(host, "ce-code-review", "ce-code-review-amendment", { body: "## Mode\n\nName the mode first." });
+    host.setBranch(fx.plainUserMessage);
+    const winner = createProvenanceResolver(host.skillHome.roots).byName("ce-code-review");
+    if (winner.kind === "unknown") throw new Error("ce-code-review is not installed");
+    const shadowed = copySkillEntry(winner.path, join(host.skillHome.roots.skillsDir, "ce-code-review"), "Other instructions.");
+
+    const result = await readSkill(host, shadowed);
+
+    expect(result.additionalContext).toBeUndefined();
+    expect(deliveries(host)).toEqual([]);
+    expect((await readSkill(host, winner.path)).additionalContext).toContain("Name the mode first.");
+  });
+
   it("leaves the read whole and logs the error when delivering fails", async () => {
     const host = loadExtension();
     // A directory where an amendment file belongs makes reading it throw.

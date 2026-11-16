@@ -30,6 +30,7 @@
 - `observer_resolve` records approvals on OMP 18.18 and later; it refused every one because the Ask no longer held `questions[]`.
 - The digest's `ask` signals (custom input, an answer off the preselected option) fire for HTML-form results. Results saved before OMP 18.18 are still read.
 - A `SKILL.md` that is a byte-identical copy of an installed skill's entry file counts as that skill: the digest shows its provenance and the skill's on-read amendment is delivered on the read. A copy that differs stays provenance unknown.
+- A direct read of an installed skill that a same-named skill shadows (a local `tdd` behind a plugin `tdd`) no longer gets the name winner's on-read amendment. Amendments belong to the skill that wins its name, as their pinned skill hash already did; the digest still shows the shadowed skill with its own provenance.
 - A long tool error is quoted by its start and its end around `…`, within about 300 characters, since a failed command may state why at either end. Before, only its start was kept.
 - Prepare no longer refuses a revision identical to the approved change under an approval note, so an Apply whose note asks only for a check, or only acknowledges, can be written.
 - Decline on a withdrawal keeps the fix: `observer_resolve` records nothing for a `declined` answer whose fix is in force, cited or typed, and says the fix stays in force. Before, citing the withdrawal was refused and the typed retry recorded `declined` under the fix's fingerprint, dropping it from later Prepares and remedy outcomes while its text stayed delivered.
