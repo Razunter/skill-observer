@@ -7211,4 +7211,182 @@ describe("observer_review inspect and grounded repairs", () => {
   });
 });
 
+describe("approval compatibility under the evidence gate", () => {
+  const amendment = (host: ReturnType<typeof loadExtension>) => join(host.amendmentsDir, "tdd-amendment.md");
+  const tddSkill = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.roots.skillsDir, "tdd", "SKILL.md");
+  const prepare = (host: ReturnType<typeof loadExtension>, candidates: unknown[]) => host.callTool("observer_review", { action: "prepare", candidates });
+  const DIAGNOSIS_LINE = /<p>(?:Diagnosis: |Behavior change: |Cited guidance, inspection )[^\n]*\n/g;
+  const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+
+  /**
+   * Rewrites the branch as a pass before the evidence gate saved it: no
+   * Prepare draft or saved proposal holds a diagnosis, each reference carries
+   * the content hash of the proposal without one, and each Ask shows the form
+   * without one. Returns `ref` under its rewritten content hash.
+   */
+  function savedBeforeGate(host: ReturnType<typeof loadExtension>) {
+    const lists = ["eligible", "selected", "deferred"] as const;
+    const savedEntries = (entry: SessionEntry) => entry.message?.role === "toolResult" && entry.message.toolName === "observer_review"
+      ? lists.flatMap((list) => (entry.message!.details as Partial<Record<typeof list, Array<{ reference: { contentHash: string }; proposal: { diagnosis?: unknown } }>>>)[list] ?? []) : [];
+    const hashes = new Map<string, string>();
+    for (const { reference, proposal: { diagnosis: _, ...proposal } } of host.getBranch().flatMap(savedEntries)) hashes.set(reference.contentHash, sha(JSON.stringify(proposal)));
+    let json = JSON.stringify(host.getBranch());
+    for (const [from, to] of hashes) json = json.replaceAll(from, to);
+    const branch = JSON.parse(json) as SessionEntry[];
+    for (const entry of branch) {
+      for (const saved of savedEntries(entry)) delete saved.proposal.diagnosis;
+      if (entry.message?.role !== "assistant" || !Array.isArray(entry.message.content)) continue;
+      for (const block of entry.message.content as Array<{ name?: string; arguments?: { html?: string; candidates?: Array<{ diagnosis?: unknown }> } }>) {
+        if (block.name === "ask" && block.arguments?.html) block.arguments.html = block.arguments.html.replace(DIAGNOSIS_LINE, "");
+        for (const candidate of block.arguments?.candidates ?? []) delete candidate.diagnosis;
+      }
+    }
+    host.setBranch(branch);
+    expect(json).toContain('"diagnosis"');
+    expect(JSON.stringify(host.getBranch())).not.toContain('"diagnosis"');
+    return <R extends { contentHash: string }>(ref: R): R => ({ ...ref, contentHash: hashes.get(ref.contentHash) ?? ref.contentHash });
+  }
+
+  it("gives a repair one identity whatever its diagnosis, so a Later answer is re-offered and a decline suppresses every later draft", async () => {
+    const host = loadExtension();
+    const draft = onReadCandidate({ gist: "Name the seam", section: SEAMS });
+    startPass(host);
+    const [first] = reviewEntries(await prepare(host, [draft]));
+    const diagnosis = (first!.proposal as { diagnosis?: Record<string, unknown> }).diagnosis;
+    expect(diagnosis).toBeDefined();
+    const [reworded] = reviewEntries(await prepare(host, [{ ...draft, diagnosis: { ...diagnosis, explanation: "Read Seams again: it never says to name the seam first." } }]));
+    expect(reworded!.reference.candidateId).toBe(first!.reference.candidateId);
+    expect(reworded!.proposal.fingerprint).toBe(proposalFingerprint("tdd", "Name the seam"));
+    expect(first!.proposal.fingerprint).toBe(reworded!.proposal.fingerprint);
+    expect(reworded!.reference.contentHash).not.toBe(first!.reference.contentHash);
+
+    expect(failures(await resolve(host, [{ outcome: "later", proposal: reworded!.reference }]))).toEqual([]);
+    await host.runCommand("observe", "Look at the seams again.");
+    expect(String(host.sent.at(-1)?.message.content)).toContain(proposalFingerprint("tdd", "Name the seam"));
+    const [reoffered] = reviewEntries(await prepare(host, [draft]));
+    expect(reoffered!.proposal.fingerprint).toBe(first!.proposal.fingerprint);
+
+    expect(failures(await resolve(host, [{ outcome: "declined", proposal: reoffered!.reference }]))).toEqual([]);
+    startPass(host);
+    const afterDecline = await prepare(host, [draft]);
+    expect(failures(afterDecline)).toEqual([]);
+    expect(reviewEntries(afterDecline)).toEqual([]);
+  });
+
+  it("reconciles a grounded repair whose target changed after approval by a fresh inspection, never a second Ask", async () => {
+    const host = loadExtension();
+    await addOnReadFix(host, "tdd", "Name the seam before the first test.", SEAMS);
+    const [applied] = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }]);
+    const asks = () => host.getBranch().filter((entry) => entry.message?.toolName === "ask").length;
+    const askCount = asks();
+    const approvedInspection = host.getBranch().flatMap((entry) => entry.message?.role === "assistant" && Array.isArray(entry.message.content)
+      ? (entry.message.content as Array<{ id?: string; name?: string; arguments?: { action?: string } }>).filter((block) => block.name === "observer_review" && block.arguments?.action === "inspect").map((block) => block.id!) : []).at(-1)!;
+    appendFileSync(amendment(host), "\n## Mine\n\nThe user's own words.\n");
+    const revision = {
+      ...onReadCandidate({ gist: applied!.gist, section: RED }),
+      reconciles: { approval: applied!.approval, changedTarget: "The user appended a Mine section.", reason: "Append the approved section after it.", preserved: "Mine stays as written." },
+    };
+
+    const stale = await prepare(host, [{ ...revision, diagnosis: { inspection: approvedInspection, explanation: "Seams says nothing on reds.", delta: "A future agent reads a red as a diff.",
+      citations: [{ source: tddSkill(host), lines: { from: 1, to: 1 } }] } }]);
+    expect(failures(stale)).toEqual([expect.stringContaining("no longer current")]);
+    expect(failures(stale)[0]).toContain("inspect `tdd` again");
+    expect(failures(stale)[0]).not.toMatch(/ask/i);
+
+    const fresh = await prepare(host, [revision]);
+    expect(failures(fresh)).toEqual([]);
+    const [prepared] = reviewEntries(fresh);
+    expect((prepared!.proposal as { diagnosis?: { inspection: string } }).diagnosis?.inspection).not.toBe(approvedInspection);
+    const result = await resolve(host, [{ ...applied, approval: { ...applied!.approval, revision: prepared!.reference } }]);
+    expect(failures(result)).toEqual([]);
+    expect(readRule(amendment(host)).body).toBe(`${SEAMS}\n\n## Mine\n\nThe user's own words.\n\n${RED}`);
+    expect(asks()).toBe(askCount);
+  });
+
+  it("applies an approval saved before the gate under its original contract, labelling nothing evidence-validated", async () => {
+    const host = loadExtension();
+    await addOnReadFix(host, "tdd", "Name the seam before the first test.", SEAMS);
+    const [applied] = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }]);
+    const legacy = savedBeforeGate(host);
+    const answer = { ...applied!, approval: { ...applied!.approval, proposal: legacy(applied!.approval.proposal) } };
+
+    const result = await resolve(host, [answer]);
+
+    expect(failures(result)).toEqual([]);
+    expect(readRule(amendment(host)).body).toBe(`${SEAMS}\n\n${RED}`);
+    expect(JSON.stringify(result)).not.toMatch(/diagnos|inspection|evidence-validated/i);
+    const record = ledgerRecords(host.ledgerFile).at(-1)!;
+    expect(Object.keys(record).sort()).toEqual(Object.keys(ledgerRecords(host.ledgerFile)[0]!).sort());
+    expect(record).toMatchObject({ gist: "A red is an assertion diff.", outcome: "applied", fingerprint: applied!.fingerprint });
+  });
+
+  it("produces no Ask form from a repair prepared before the gate and not yet approved, until it is inspected and prepared again", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const prepared = await prepare(host, [onReadCandidate({ gist: "Name the seam", section: SEAMS })]);
+    const legacy = savedBeforeGate(host);
+    const [entry] = reviewEntries(prepared);
+
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [legacy(entry!.reference)] });
+
+    expect(selection.isError).toBe(true);
+    expect(JSON.parse(resultText(selection)).askHtml).toBeUndefined();
+    expect(reviewEntries(selection, "selected")).toEqual([]);
+    const reason = failures(selection).join("\n");
+    expect(reason).toContain(entry!.reference.candidateId);
+    expect(reason).toContain("inspect `tdd`");
+    expect(reason).toContain("prepare it again");
+
+    const again = await prepare(host, [onReadCandidate({ gist: "Name the seam", section: SEAMS })]);
+    const reselected = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(again).map(({ reference }) => reference) });
+    expect(failures(reselected)).toEqual([]);
+    expect(JSON.parse(resultText(reselected)).askHtml).toContain("Name the seam");
+  });
+
+  it("adds no expiry at Resolve when other guidance of the skill changed after approval, while a changed target still refuses", async () => {
+    const host = loadExtension();
+    await addOnReadFix(host, "tdd", "Name the seam before the first test.", SEAMS);
+    const [applied] = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }]);
+    appendFileSync(tddSkill(host), "\n## Fixtures\n\nOne fixture per seam.\n");
+    expect(failures(await resolve(host, [applied]))).toEqual([]);
+    expect(readRule(amendment(host)).body).toBe(`${SEAMS}\n\n${RED}`);
+
+    const other = loadExtension();
+    await addOnReadFix(other, "tdd", "Name the seam before the first test.", SEAMS);
+    const [changed] = await approveOnRead(other, [{ gist: "A red is an assertion diff.", section: RED }]);
+    appendFileSync(amendment(other), "\n## Mine\n\nThe user's own words.\n");
+    expect(failures(await resolve(other, [changed]))).toEqual([expect.stringContaining("changed since Prepare")]);
+  });
+
+  it("leaves a Select of maintenance and non-skill proposals without a diagnosis as it was", async () => {
+    const host = loadExtension();
+    splitAmendment(host, "domain-modeling", "dm-define-terms");
+    const [fix] = ledgerRecords(host.ledgerFile);
+    writeFileSync(join(host.skillHome.roots.cwd, "AGENTS.md"), "Guidance.\n");
+    startPass(host);
+    const prepared = await prepare(host, [
+      withdrawalCandidate({ skill: "domain-modeling", fingerprint: fix!.fingerprint, gist: String(fix!.gist) }),
+      { kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path: "AGENTS.md", mechanism: "navigation" }, gist: "Point at the check.",
+        priority: "evidence", remedy: "Add a pointer", change: { operation: "direct-edit", preview: "+ Run bun run check." } },
+    ]);
+    expect(failures(prepared)).toEqual([]);
+    const selection = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
+    expect(failures(selection)).toEqual([]);
+    expect(reviewEntries(selection, "selected").map(({ proposal }) => proposal.gist).sort()).toEqual([String(fix!.gist), "Point at the check."].sort());
+  });
+
+  it("/observe-report over a grounded pass starts no pass and changes no branch, ledger, observer file or observation", async () => {
+    const host = loadExtension();
+    await host.callTool("observe", { text: "The seam section repeats itself." });
+    const [applied] = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }]);
+    await resolve(host, [{ outcome: "later", proposal: applied!.approval.proposal }]);
+    const before = { branch: structuredClone(host.getBranch()), files: observerBytes(host), observations: readFileSync(host.observationsFile, "utf8"), sent: host.sent.length };
+
+    await host.runCommand("observe-report");
+
+    expect({ branch: host.getBranch(), files: observerBytes(host), observations: readFileSync(host.observationsFile, "utf8"), sent: host.sent.length }).toEqual(before);
+    expect(host.notices.at(-1)).toContain("Evidence report (no observation pass started)");
+  });
+});
+
 const escapeHtmlText = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

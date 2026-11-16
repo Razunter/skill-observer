@@ -341,8 +341,14 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
           const selection = selectCandidates(details.eligible, compared, params.rankings, modelUnavailable ?? params.rankingFailure);
           const selected = selection.ordered.slice(0, 5);
           const guidance = { dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(), provenance: createProvenanceResolver(defaultSkillRoots(ctx.cwd)) };
-          for (const { reference, proposal: { diagnosis } } of selected) {
-            if (!diagnosis) continue;
+          for (const { reference, proposal } of selected) {
+            const { diagnosis } = proposal;
+            if (!diagnosis) {
+              if (isSkillTextRepair(proposal)) {
+                throw new Error(`proposal \`${reference.candidateId}\` was prepared without a candidate diagnosis: inspect \`${proposal.skill}\` with observer_review \`action: "inspect"\`, cite that receipt, then prepare it again`);
+              }
+              continue;
+            }
             try {
               checkCurrent(diagnosis.inspection, inspectionReceipt(diagnosis.inspection, ctx.sessionManager.getBranch()), guidance);
             } catch (error) {
@@ -563,11 +569,11 @@ function prepareProposals(candidates: readonly ReviewCandidate[], context: Prepa
   return [...grouped.values()];
 }
 
-const SKILL_TEXT_OPERATIONS: ReadonlyArray<ChangeDraft["operation"]> = ["direct-edit", "on-read-append", "rule"];
+const SKILL_TEXT_OPERATIONS: ReadonlyArray<string> = ["direct-edit", "on-read-append", "rule"];
 
 /** A change to an installed skill's guidance, which needs a candidate diagnosis; a new skill, project and harness remedies and maintenance keep their own evidence. */
-function isSkillTextRepair(candidate: ReviewCandidate): candidate is Extract<ReviewCandidate, { skill: string }> {
-  return candidate.kind !== "project" && candidate.kind !== "harness" && candidate.kind !== "new" && SKILL_TEXT_OPERATIONS.includes(candidate.change.operation);
+function isSkillTextRepair<T extends { kind: string; change?: { operation: string } }>(subject: T): subject is T & { skill: string } {
+  return subject.kind !== "project" && subject.kind !== "harness" && subject.kind !== "new" && subject.change !== undefined && SKILL_TEXT_OPERATIONS.includes(subject.change.operation);
 }
 
 /** The candidate diagnosis of a repair to `skill`, its citations checked against the current inspection receipt it names on this branch. */
