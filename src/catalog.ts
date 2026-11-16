@@ -151,10 +151,12 @@ export function registerCatalogCapture(pi: ExtensionAPI, isObservable: (ctx: Ext
       observedAt = prompt.id;
       const { definition } = staged;
       staged = undefined;
-      const latest = catalogBindings(branch).at(-1);
-      if (!gap && latest?.binding.catalogId === definition.catalogId) return;
-      const definitionReachable = branch.some((entry) => entry.type === "custom" && entry.customType === CATALOG_DEFINITION_TYPE && (entry.data as CatalogDefinition).catalogId === definition.catalogId);
-      if (!definitionReachable) pi.appendEntry(CATALOG_DEFINITION_TYPE, definition);
+      const { bound, definitions } = catalogBindings(branch);
+      const latest = bound.at(-1);
+      // After a /clear OMP rebuilds the system prompt, so the next observation is bound again even when unchanged.
+      const cleared = branch.findLastIndex((entry) => entry.type === "reset_boundary") > (latest?.index ?? -1);
+      if (!gap && !cleared && latest?.binding.catalogId === definition.catalogId) return;
+      if (!definitions.has(definition.catalogId)) pi.appendEntry(CATALOG_DEFINITION_TYPE, definition);
       pi.appendEntry(CATALOG_BINDING_TYPE, { catalogId: definition.catalogId, observedAt, boundary: "before_agent_start", ...(gap && { afterGap: gap }) } satisfies CatalogBinding);
       gap = undefined;
     } catch (error) {
@@ -174,27 +176,50 @@ export function registerCatalogCapture(pi: ExtensionAPI, isObservable: (ctx: Ext
 
 interface BoundCatalog { index: number; bindingId: string; binding: CatalogBinding; definitionId: string; definition: CatalogDefinition }
 
-/** The branch's bindings in order, each with the definition before it on the branch; a binding whose definition isn't there is skipped. */
-function catalogBindings(branch: readonly SessionEntry[]): BoundCatalog[] {
-  const definitions = new Map<string, { id: string; definition: CatalogDefinition }>();
+interface CatalogHistory { bound: BoundCatalog[]; definitions: Map<string, { id: string; definition: CatalogDefinition }>; unavailable: string[] }
+
+/**
+ * The active branch's catalog history: its bindings in order, each with the
+ * definition before it on the same branch, the definitions it reaches, and
+ * why any of the extension's entries are unavailable evidence: malformed, or
+ * a binding whose definition isn't on this branch (lost, or a copy that left
+ * it behind), never resolved from another branch or session.
+ */
+function catalogBindings(branch: readonly SessionEntry[]): CatalogHistory {
+  const definitions: CatalogHistory["definitions"] = new Map();
   const bound: BoundCatalog[] = [];
+  const unavailable: string[] = [];
   for (const [index, entry] of branch.entries()) {
     if (entry.type !== "custom" || !entry.id) continue;
     if (entry.customType === CATALOG_DEFINITION_TYPE) {
-      const definition = entry.data as CatalogDefinition;
-      definitions.set(definition.catalogId, { id: entry.id, definition });
+      if (isCatalogDefinition(entry.data)) definitions.set(entry.data.catalogId, { id: entry.id, definition: entry.data });
+      else unavailable.push(`the catalog definition at entry \`${entry.id}\` is malformed, so an observation bound to it is unavailable`);
     } else if (entry.customType === CATALOG_BINDING_TYPE) {
-      const binding = entry.data as CatalogBinding;
+      const binding = entry.data;
+      if (!isCatalogBinding(binding)) {
+        unavailable.push(`the catalog binding at entry \`${entry.id}\` is malformed, so what the system prompt listed there is unknown`);
+        continue;
+      }
       const found = definitions.get(binding.catalogId);
       if (found) bound.push({ index, bindingId: entry.id, binding, definitionId: found.id, definition: found.definition });
+      else unavailable.push(`the observation at entry \`${binding.observedAt}\` (binding \`${entry.id}\`) refers to catalog \`${binding.catalogId}\`, whose definition is not on this branch, so that observation is unavailable`);
     }
   }
-  return bound;
+  return { bound, definitions, unavailable };
 }
 
-/** The known capture gaps: each recorded before a later observation, then one not yet followed by an observation. */
-function captureGaps(bound: readonly BoundCatalog[], pending: string | undefined): string[] {
+const isCatalogDefinition = (data: unknown): data is CatalogDefinition =>
+  isRecord(data) && typeof data.catalogId === "string" && ["observed", "partial", "no-block", "unsupported"].includes(data.coverage as string) &&
+  Array.isArray(data.entries) && data.entries.every((entry) => isRecord(entry) && typeof entry.name === "string" && typeof entry.description === "string") &&
+  Array.isArray(data.limitations) && data.limitations.every((limitation) => typeof limitation === "string");
+
+const isCatalogBinding = (data: unknown): data is CatalogBinding =>
+  isRecord(data) && typeof data.catalogId === "string" && typeof data.observedAt === "string" && (data.afterGap === undefined || typeof data.afterGap === "string");
+
+/** The known gaps: unavailable entries, each capture failure recorded before a later observation, then one not yet followed by an observation. */
+function captureGaps({ bound, unavailable }: CatalogHistory, pending: string | undefined): string[] {
   return [
+    ...unavailable,
     ...bound.flatMap(({ binding }) => binding.afterGap ? [`${binding.afterGap}; what the system prompt listed before the observation at entry \`${binding.observedAt}\` is unknown back to the previous one`] : []),
     ...(pending ? [`${pending}; what the system prompt listed since the latest observation is unknown until the next one`] : []),
   ];
@@ -209,12 +234,12 @@ export interface CatalogSummary {
 }
 
 export function catalogSummary(branch: readonly SessionEntry[], pendingGap?: string): CatalogSummary {
-  const bound = catalogBindings(branch);
-  const latest = bound.at(-1);
+  const history = catalogBindings(branch);
+  const latest = history.bound.at(-1);
   return {
-    observations: bound.length,
+    observations: history.bound.length,
     ...(latest && { latest: { observedAt: latest.binding.observedAt, ...(latest.definition.coverage === "observed" && { skills: latest.definition.entries.length }) } }),
-    gaps: captureGaps(bound, pendingGap),
+    gaps: captureGaps(history, pendingGap),
   };
 }
 
@@ -251,9 +276,9 @@ export interface CatalogMatch {
   bindingId: string;
   definitionId: string;
   coverage: CatalogCoverage;
-  /** Where this state took effect: the observation's prompt entry, a later skill notice or a compaction. */
+  /** Where this state took effect: the observation's prompt entry, a later skill notice, a compaction or a `/clear` reset boundary. */
   at: string;
-  via: "catalog" | "skill-notice" | "compaction";
+  via: "catalog" | "skill-notice" | "compaction" | "reset";
   /** `listed` with the rendered description, `not-listed`, or `unknown`, with any rendered description kept. */
   status: SkillState["status"];
   description?: string;
@@ -272,8 +297,9 @@ export interface CatalogLookup { skill: string; matches: CatalogMatch[]; gaps: s
 export function lookupCatalog(skill: unknown, branch: readonly SessionEntry[], pendingGap?: string): { lookup: CatalogLookup; text: string } {
   if (typeof skill !== "string" || !skill.trim()) throw new Error("A catalog lookup needs the exact skill name in `skill`");
   const name = skill.trim();
-  const bound = catalogBindings(branch);
-  const gaps = captureGaps(bound, pendingGap);
+  const history = catalogBindings(branch);
+  const { bound } = history;
+  const gaps = captureGaps(history, pendingGap);
   const matches = bound.flatMap((catalog, index) => skillHistory(name, branch, catalog, bound[index + 1]?.index ?? branch.length));
   const gapLines = gaps.map((gap) => `- Known gap: ${gap}.`);
   if (matches.length === 0) {
@@ -282,7 +308,7 @@ export function lookupCatalog(skill: unknown, branch: readonly SessionEntry[], p
   return {
     lookup: { skill: name, matches, gaps },
     text: [
-      `Skill catalog observations of \`${name}\` on this branch, oldest first, each followed by what OMP's later skill notices and compactions changed. Each observation is what the system prompt listed when the \`before_agent_start\` hook ran for the prompt at that entry, not proof of what the model received; descriptions are as rendered then, not as installed now.`,
+      `Skill catalog observations of \`${name}\` on this branch, oldest first, each followed by what OMP's later skill notices, compactions and \`/clear\` resets changed. Each observation is what the system prompt listed when the \`before_agent_start\` hook ran for the prompt at that entry, not proof of what the model received; descriptions are as rendered then, not as installed now.`,
       ...matches.map(describeMatch),
       ...gapLines,
     ].join("\n"),
@@ -292,7 +318,8 @@ export function lookupCatalog(skill: unknown, branch: readonly SessionEntry[], p
 function describeMatch(match: CatalogMatch): string {
   const where = match.via === "catalog" ? `At entry \`${match.observedAt}\` (binding \`${match.bindingId}\`, catalog \`${match.definitionId}\`)`
     : match.via === "skill-notice" ? `At entry \`${match.at}\`, a skill notice after the observation at \`${match.observedAt}\``
-    : `At compaction \`${match.at}\`, after the observation at \`${match.observedAt}\``;
+    : match.via === "compaction" ? `At compaction \`${match.at}\`, after the observation at \`${match.observedAt}\``
+    : `At reset boundary \`${match.at}\` (\`/clear\`), after the observation at \`${match.observedAt}\``;
   const state = match.status === "listed" ? `listed as "${match.description}"`
     : match.status === "not-listed" ? `not listed (${match.reason ?? "not in that observed skills block; another advertisement may still have named it"})`
     : `unknown (${match.reason})${match.description === undefined ? "" : `; its rendered description reads "${match.description}"`}`;
@@ -304,7 +331,7 @@ function skillHistory(name: string, branch: readonly SessionEntry[], catalog: Bo
   const { binding, bindingId, definitionId, definition } = catalog;
   const match = (at: string, via: CatalogMatch["via"], state: SkillState): CatalogMatch =>
     ({ observedAt: binding.observedAt, bindingId, definitionId, coverage: definition.coverage, at, via, ...state, limitations: definition.limitations });
-  const base = catalogState(definition, name);
+  let base = catalogState(definition, name);
   const history = [match(binding.observedAt, "catalog", base)];
   const notices: Array<{ index: number; id: string; state: SkillState }> = [];
   let compaction: { index: number; entry: SessionEntry } | undefined;
@@ -317,6 +344,12 @@ function skillHistory(name: string, branch: readonly SessionEntry[], catalog: Bo
       notices.push({ index, id: entry.id ?? "(no id)", state });
       current = state;
       history.push(match(entry.id ?? "(no id)", "skill-notice", state));
+    } else if (entry.type === "reset_boundary") {
+      // OMP's context build starts after the latest /clear boundary and the system prompt is rebuilt, so earlier notices are gone.
+      notices.length = 0;
+      base = { status: "unknown", reason: "a `/clear` dropped the context and OMP rebuilt the system prompt, so what it lists is unknown until the next observation" };
+      current = base;
+      history.push(match(entry.id ?? "(no id)", "reset", base));
     } else if (entry.type === "compaction") {
       compaction = { index, entry };
       const next = stateAfterCompaction(base, notices, compaction, branch);

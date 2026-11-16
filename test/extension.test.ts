@@ -7944,4 +7944,179 @@ describe("qualified skill catalog capture", () => {
   });
 });
 
+describe("catalog history across the session tree", () => {
+  const SEAMS = ["seam-finder", "Finds test seams before writing tests."] as const;
+  const NOTES = ["release-notes", "Drafts release notes from merged changes."] as const;
+  type Host = ReturnType<typeof loadExtension>;
+  const reply = (id: string) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }) as SessionEntry;
+  const append = (host: Host, ...entries: SessionEntry[]) => host.setBranch([...host.getBranch(), ...entries]);
+  /** A fresh extension instance, with no warm process state, over `branch` as OMP would load it from the saved session. */
+  const restore = async (branch: readonly SessionEntry[]) => {
+    const host = loadExtension();
+    host.setBranch(structuredClone([...branch]));
+    await host.emit("session_start");
+    return host;
+  };
+  const lookups = async (host: Host) => Promise.all([SEAMS[0], NOTES[0], "absent-skill"].map(async (skill) => {
+    const { text, matches, gaps } = await lookUp(host, skill);
+    return { text, matches, gaps };
+  }));
+
+  it("returns the same lookup results from the persisted entries alone after a restore without warm memory", async () => {
+    const warm = loadExtension();
+    await observeCatalog(warm, [SEAMS]);
+    append(warm, reply("reply-1"), skillNotice("notice-1", { added: [NOTES] }), reply("reply-2"),
+      { type: "compaction", id: "compaction-1", firstKeptEntryId: "reply-2", summary: "Earlier work." } as SessionEntry);
+    await observeCatalog(warm, [SEAMS, NOTES]);
+    const saved = warm.getBranch().filter((entry) => !entry.id?.startsWith("result-") && !entry.id?.startsWith("assistant-"));
+    warm.setBranch(saved);
+    const before = await lookups(warm);
+    expect(before[1]!.matches.length).toBeGreaterThan(1);
+    const restored = await restore(saved);
+    expect(await lookups(restored)).toEqual(before);
+  });
+
+  it("applies only the active branch's bindings after branching or rewinding, even when they share a content definition", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS, NOTES]);
+    await observeCatalog(host, [SEAMS]);
+    const fork = host.getBranch();
+    // The first branch observes the shared ancestor's definition again.
+    await observeCatalog(host, [SEAMS, NOTES]);
+    const first = host.getBranch();
+    const firstBinding = catalogEntries(host).at(-1)!;
+    expect(firstBinding.customType).toBe("skill-observer-catalog-binding");
+    expect(catalogEntries(host)).toHaveLength(5);
+    expect((await lookUp(host, NOTES[0])).matches.map(({ status }) => status)).toEqual(["listed", "not-listed", "listed"]);
+
+    host.setBranch([...fork, reply("sibling-reply")]);
+    await host.emit("session_tree");
+    const sibling = await lookUp(host, NOTES[0]);
+    expect(sibling.matches.map(({ status }) => status)).toEqual(["listed", "not-listed"]);
+    expect(sibling.text).not.toContain(firstBinding.id!);
+
+    // Rewinding before the shared definition: the sibling stores its own copy rather than borrowing the first branch's.
+    host.setBranch([reply("rewound-reply")]);
+    await host.emit("session_branch");
+    expect((await lookUp(host, NOTES[0])).matches).toEqual([]);
+    await observeCatalog(host, [SEAMS, NOTES]);
+    const own = catalogEntries(host);
+    expect(own.map(({ customType }) => customType)).toEqual(["skill-observer-catalog", "skill-observer-catalog-binding"]);
+    expect((await lookUp(host, NOTES[0])).matches).toEqual([expect.objectContaining({ status: "listed", definitionId: own[0]!.id, bindingId: own[1]!.id })]);
+
+    host.setBranch(first);
+    await host.emit("session_tree");
+    expect((await lookUp(host, NOTES[0])).matches.map(({ status }) => status)).toEqual(["listed", "not-listed", "listed"]);
+  });
+
+  it("still finds observations from ancestry a compaction or handoff summarized away", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS]);
+    append(host, reply("reply-1"), reply("reply-2"),
+      { type: "compaction", id: "compaction-1", firstKeptEntryId: "reply-2", summary: "Earlier work." } as SessionEntry,
+      reply("reply-3"),
+      { type: "compaction", id: "handoff-1", firstKeptEntryId: "", summary: "Handoff document." } as SessionEntry);
+    await observeCatalog(host, [SEAMS]);
+    expect(catalogEntries(host)).toHaveLength(2);
+    expect(await lookUp(host, SEAMS[0])).toMatchObject({ gaps: [], matches: [{ observedAt: "user-0", status: "listed", description: SEAMS[1] }] });
+  });
+
+  it("reaches a forked session's copied definitions, and reports one the copy lacks unavailable instead of borrowing the source's", async () => {
+    const source = loadExtension();
+    await observeCatalog(source, [SEAMS]);
+    append(source, reply("reply-1"));
+    // OMP's branch-into-new-session copies the root-to-leaf path into the new session file.
+    const copied = await restore(source.getBranch());
+    await copied.emit("session_branch");
+    expect(await lookups(copied)).toEqual(await lookups(source));
+
+    const lacking = await restore(source.getBranch().filter((entry) => entry.customType !== "skill-observer-catalog"));
+    const dangling = await lookUp(lacking, SEAMS[0]);
+    expect(dangling.result.isError).toBe(false);
+    expect(dangling.matches).toEqual([]);
+    expect(dangling.gaps).toEqual([expect.stringMatching(/user-0[^\n]*definition is not on this branch[^\n]*unavailable/)]);
+    expect(dangling.text).toContain("unknown, not absent");
+    expect(dangling.text).not.toContain(SEAMS[1]);
+    const next = `user-${lacking.getBranch().length}`;
+    await observeCatalog(lacking, [SEAMS]);
+    expect(catalogEntries(lacking).map(({ customType }) => customType)).toEqual(["skill-observer-catalog-binding", "skill-observer-catalog", "skill-observer-catalog-binding"]);
+    expect((await lookUp(lacking, SEAMS[0])).matches).toEqual([expect.objectContaining({ status: "listed", observedAt: next })]);
+  });
+
+  it.each(["session_switch", "session_branch", "session_tree"])("leaks no staged observation or capture gap across %s", async (event) => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS]);
+    host.failAppend(new Error("disk full"));
+    await observeCatalog(host, [SEAMS, NOTES]);
+    expect((await lookUp(host, SEAMS[0])).gaps).toEqual([expect.stringContaining("disk full")]);
+    await host.startAgent("Write the tests.", { systemPrompt: catalogPrompt([NOTES]) });
+    await host.emit(event);
+    host.setBranch([reply("other-reply")]);
+    await host.commitPrompt("Write the tests.");
+    expect(catalogEntries(host)).toEqual([]);
+    expect(await lookUp(host, SEAMS[0])).toMatchObject({ matches: [], gaps: [] });
+    await host.runCommand("observe-report");
+    expect(host.notices.at(-1)).not.toContain("disk full");
+  });
+
+  it("reports unknown, with no durability claim, when appended entries are missing after a restore", async () => {
+    const warm = loadExtension();
+    await observeCatalog(warm, [SEAMS]);
+    await observeCatalog(warm, [SEAMS, NOTES]);
+    expect((await lookUp(warm, NOTES[0])).matches.at(-1)).toMatchObject({ status: "listed" });
+    const saved = warm.getBranch().filter((entry) => entry.type !== "message" || entry.message?.role === "user");
+
+    const lost = await restore(saved.filter((entry) => entry.type !== "custom"));
+    const unknown = await lookUp(lost, NOTES[0]);
+    expect(unknown).toMatchObject({ matches: [], gaps: [] });
+    expect(unknown.text).toContain(`whether \`${NOTES[0]}\` was listed is unknown, not absent`);
+    expect(unknown.text).not.toMatch(/durab|persisted|saved/i);
+
+    // Only the later definition lost: its binding is unavailable, the earlier observation stays as it was.
+    const laterDefinition = saved.filter((entry) => entry.customType === "skill-observer-catalog").at(-1)!;
+    const partial = await lookUp(await restore(saved.filter((entry) => entry !== laterDefinition)), NOTES[0]);
+    expect(partial.matches).toEqual([expect.objectContaining({ observedAt: "user-0", status: "not-listed" })]);
+    expect(partial.gaps).toEqual([expect.stringMatching(/user-3[^\n]*unavailable/)]);
+  });
+
+  it("turns a malformed catalog definition or binding into a coverage gap instead of failing the lookup, summary or capture", async () => {
+    const host = loadExtension();
+    host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage, ...fx.skillUrlRead,
+      { type: "custom", id: "bad-definition", customType: "skill-observer-catalog", data: null } as unknown as SessionEntry,
+      { type: "custom", id: "bad-binding", customType: "skill-observer-catalog-binding", data: { catalogId: 7 } } as unknown as SessionEntry,
+      { type: "custom", id: "bad-entries", customType: "skill-observer-catalog", data: { catalogId: "c1", coverage: "observed", entries: "seam-finder", limitations: [] } } as unknown as SessionEntry,
+      { type: "custom", id: "bound-to-bad", customType: "skill-observer-catalog-binding", data: { catalogId: "c1", observedAt: "user-x", boundary: "before_agent_start" } } as unknown as SessionEntry,
+    ]);
+    const malformed = await lookUp(host, SEAMS[0]);
+    expect(malformed.result.isError).toBe(false);
+    expect(malformed.matches).toEqual([]);
+    expect(malformed.gaps).toEqual([
+      expect.stringMatching(/bad-definition[^\n]*malformed/),
+      expect.stringMatching(/bad-binding[^\n]*malformed/),
+      expect.stringMatching(/bad-entries[^\n]*malformed/),
+      expect.stringMatching(/user-x[^\n]*unavailable/),
+    ]);
+    await host.runCommand("observe-report");
+    expect(host.notices.at(-1)).toMatch(/Skill catalog observations: none on this branch[^\n]*bad-definition[^\n]*malformed/);
+    await observeCatalog(host, [SEAMS]);
+    expect((await lookUp(host, SEAMS[0])).matches).toEqual([expect.objectContaining({ status: "listed" })]);
+  });
+
+  it("drops skill notices before a /clear reset boundary and binds the next observation again even when unchanged", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS]);
+    append(host, reply("reply-1"), skillNotice("notice-1", { added: [NOTES] }), reply("reply-2"), { type: "reset_boundary", id: "reset-1" } as SessionEntry);
+    expect((await lookUp(host, NOTES[0])).matches.map(({ at, via, status }) => [at, via, status])).toEqual([
+      ["user-0", "catalog", "not-listed"], ["notice-1", "skill-notice", "listed"], ["reset-1", "reset", "unknown"],
+    ]);
+    await host.emit("session_clear");
+    const next = `user-${host.getBranch().length}`;
+    await observeCatalog(host, [SEAMS]);
+    expect(catalogEntries(host).map(({ customType }) => customType)).toEqual(["skill-observer-catalog", "skill-observer-catalog-binding", "skill-observer-catalog-binding"]);
+    const after = await lookUp(host, NOTES[0]);
+    expect(after.matches.at(-1)).toMatchObject({ observedAt: next, via: "catalog", status: "not-listed" });
+    expect(after.text).toMatch(/reset-1[^\n]*\/clear/);
+  });
+});
+
 const escapeHtmlText = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
