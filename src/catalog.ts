@@ -22,7 +22,7 @@ export interface CatalogSkill { name: string; description: string }
 export type CatalogFormat = "standard" | "custom";
 
 export type SkillsBlock =
-  | { status: "listed"; format: CatalogFormat; skills: CatalogSkill[]; unrecognizedLines: number }
+  | { status: "listed"; format: CatalogFormat | "unknown"; skills: CatalogSkill[]; unrecognizedLines: number }
   | { status: "no-block" }
   | { status: "unsupported" };
 
@@ -51,9 +51,13 @@ const CUSTOM_ENTRY = /^<skill name="([^"\n]+)">\n([^\n]*)\n<\/skill>$/gm;
 const CUSTOM_ENTRY_LINES = 3;
 
 export function parseSkillsBlock(systemPrompt: readonly string[]): SkillsBlock {
-  const block = /<skills>\n([\s\S]*?)\n<\/skills>/.exec(systemPrompt.join("\n"))?.[1];
-  if (block === undefined) return { status: "no-block" };
+  // The lazy optional body lets `<skills>\n</skills>` match as an empty block before any later closing tag.
+  const match = /<skills>\n(?:([\s\S]*?)\n)??<\/skills>/.exec(systemPrompt.join("\n"));
+  if (!match) return { status: "no-block" };
+  const block = match[1] ?? "";
   const lines = block.split("\n").filter((line) => line.trim() !== "");
+  // An empty block, which neither host template renders, still lists no skill.
+  if (lines.length === 0) return { status: "listed", format: "unknown", skills: [], unrecognizedLines: 0 };
   const standard = lines.flatMap((line) => {
     const entry = STANDARD_ENTRY.exec(line);
     return entry ? [{ name: entry[1]!, description: entry[2]! }] : [];

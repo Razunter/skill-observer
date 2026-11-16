@@ -7944,6 +7944,25 @@ describe("qualified skill catalog capture", () => {
     expect(await states(host, "missing-skill")).toEqual([{ at: "user-0", via: "catalog", status: "not-listed" }]);
   });
 
+  it.each([
+    ["standard", catalogPrompt([])],
+    ["bundled custom-prompt", customCatalogPrompt([])],
+    ["tag-only", ["You are a coding agent.\n<skills>\n</skills>"]],
+  ])("observes an empty %s skills block as listing no skills, claiming no absence beyond it", async (_label, systemPrompt) => {
+    const host = loadExtension();
+    await observeCatalog(host, [], systemPrompt);
+    expect(catalogEntries(host)[0]?.data).toMatchObject({ coverage: "observed", entries: [] });
+    const { text } = await lookUp(host, SEAMS[0]);
+    expect(await states(host, SEAMS[0])).toEqual([{ at: "user-0", via: "catalog", status: "not-listed" }]);
+    expect(text).toContain("another advertisement may still have named it");
+    const miss = await host.callTool("observer_review", { action: "catalog", terms: ["seams"] });
+    expect(resultText(miss)).toContain("not evidence no such skill existed");
+
+    const unrecognized = loadExtension();
+    await observeCatalog(unrecognized, [], ["<skills>\n* seam-finder (Finds seams.)\n</skills>"]);
+    expect(catalogEntries(unrecognized)[0]?.data).toMatchObject({ coverage: "unsupported", entries: [] });
+  });
+
   it("applies native skill notice additions, updates and removals after the binding at later points, without copying them", async () => {
     const host = loadExtension();
     append(host, skillNotice("notice-early", { added: [["early-skill", "Announced before any observation."]] }));
