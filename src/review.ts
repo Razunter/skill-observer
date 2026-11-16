@@ -23,7 +23,7 @@ import {
 } from "./ledger.js";
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
-import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
+import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, observationPassStart, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver, skillHash, type SkillProvenance } from "./provenance.js";
 import { checkCompanionCommand, checkHookCommand } from "./project-publication.js";
 import { fixRule } from "./publication.js";
@@ -267,7 +267,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Inspect a skill's current guidance before drafting a repair to it: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force), and the reference files requested from its observer reference folder, each with line numbers, `sha256` and `## ` sections, plus the folder's inventory by fingerprint; the successful result is the receipt a candidate `diagnosis` cites by its call ID. Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. Prepare refuses a direct edit of a local or managed skill, an on-read append or a rule without a `diagnosis` naming a successful inspect receipt of its skill, its explanation, its behavior delta and citations of places that receipt inspected. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither writes, asks, approves nor publishes and never calls a model.",
+    description: "Inspect a skill's current guidance before drafting a repair to it: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force), and the reference files requested from its observer reference folder, each with line numbers, `sha256` and `## ` sections, plus the folder's inventory by fingerprint; the successful result is the receipt a candidate `diagnosis` cites by its call ID. Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. Prepare refuses a direct edit of a local or managed skill, an on-read append or a rule without a `diagnosis` naming a successful inspect receipt of its skill from this pass on this branch, its explanation, its behavior delta and citations of places that receipt inspected; Prepare, and Select again before producing its form, refuse it once that skill's inspected sources, rules or reference folder inventory changed: inspect again and prepare again. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither writes, asks, approves nor publishes and never calls a model.",
     parameters: z.object({
       action: z.enum(["inspect", "prepare", "select"]),
       skill: z.string().optional().describe("Inspect only: the installed skill whose current guidance to read."),
@@ -339,7 +339,17 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
           }
         } else {
           const selection = selectCandidates(details.eligible, compared, params.rankings, modelUnavailable ?? params.rankingFailure);
-          details.selected = selection.ordered.slice(0, 5);
+          const selected = selection.ordered.slice(0, 5);
+          const guidance = { dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(), provenance: createProvenanceResolver(defaultSkillRoots(ctx.cwd)) };
+          for (const { reference, proposal: { diagnosis } } of selected) {
+            if (!diagnosis) continue;
+            try {
+              checkCurrent(diagnosis.inspection, inspectionReceipt(diagnosis.inspection, ctx.sessionManager.getBranch()), guidance);
+            } catch (error) {
+              throw new Error(`proposal \`${reference.candidateId}\`: ${error instanceof Error ? error.message : String(error)}, then prepare it again`);
+            }
+          }
+          details.selected = selected;
           details.deferred = selection.ordered.slice(5);
           if (selection.fallback) details.fallback = selection.fallback;
         }
@@ -546,7 +556,7 @@ function prepareProposals(candidates: readonly ReviewCandidate[], context: Prepa
     const prepared = preparedProposal(candidate, scoped, declined, [...grouped.values()], context);
     if (!prepared) continue;
     const proposal = isSkillTextRepair(candidate)
-      ? { ...prepared, diagnosis: candidateDiagnosis(candidate.skill, candidate.diagnosis, context.branch) } : prepared;
+      ? { ...prepared, diagnosis: candidateDiagnosis(candidate.skill, candidate.diagnosis, context) } : prepared;
     const previous = grouped.get(proposal.candidateId);
     grouped.set(proposal.candidateId, previous ? joined(previous, proposal) : proposal);
   }
@@ -560,8 +570,8 @@ function isSkillTextRepair(candidate: ReviewCandidate): candidate is Extract<Rev
   return candidate.kind !== "project" && candidate.kind !== "harness" && candidate.kind !== "new" && SKILL_TEXT_OPERATIONS.includes(candidate.change.operation);
 }
 
-/** The candidate diagnosis of a repair to `skill`, its citations checked against the inspection receipt it names on this branch. */
-function candidateDiagnosis(skill: string, draft: Partial<CandidateDiagnosis> | undefined, branch: readonly SessionEntry[]): CandidateDiagnosis {
+/** The candidate diagnosis of a repair to `skill`, its citations checked against the current inspection receipt it names on this branch. */
+function candidateDiagnosis(skill: string, draft: Partial<CandidateDiagnosis> | undefined, context: PrepareContext): CandidateDiagnosis {
   const text = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
   const [inspection, explanation, delta] = [text(draft?.inspection), text(draft?.explanation), text(draft?.delta)];
   const citations = Array.isArray(draft?.citations) && draft.citations.length > 0 ? draft.citations : undefined;
@@ -574,12 +584,13 @@ function candidateDiagnosis(skill: string, draft: Partial<CandidateDiagnosis> | 
   if (!inspection || !explanation || !delta || !citations) {
     throw new Error(`the repair of \`${skill}\` needs its candidate diagnosis ${missing.join("; ")}: inspect the skill with observer_review \`action: "inspect"\` and cite that receipt`);
   }
-  const receipt = inspectionReceipt(inspection, branch);
+  const receipt = inspectionReceipt(inspection, context.branch);
   if (receipt.skill !== skill) throw new Error(`inspection \`${inspection}\` read \`${receipt.skill}\`, not \`${skill}\`: inspect \`${skill}\` and cite that receipt`);
+  checkCurrent(inspection, receipt, context);
   return { inspection, explanation, delta, citations: citations.map((citation) => checkedCitation(citation, receipt, inspection)) };
 }
 
-/** The receipt of the successful inspect call `id` on this branch. */
+/** The receipt of the successful inspect call `id` of the current observation pass on this branch. */
 function inspectionReceipt(id: string, branch: readonly SessionEntry[]): GuidanceInspection {
   const label = `inspection \`${id}\``;
   let completed;
@@ -592,7 +603,41 @@ function inspectionReceipt(id: string, branch: readonly SessionEntry[]): Guidanc
   if (call.name !== REVIEW_TOOL_NAME || call.args.action !== "inspect") throw new Error(`${label}: that call is not an observer_review inspect`);
   const inspection = (result.details as { inspection?: GuidanceInspection } | undefined)?.inspection;
   if (result.isError !== false || !inspection) throw new Error(`${label}: that inspection failed; inspect the skill again`);
+  const passStart = observationPassStart(branch);
+  if (passStart === undefined) throw new Error(`${label}: no observation pass is current on this branch, so no inspection grounds a repair`);
+  if (call.position < passStart) throw new Error(`${label} is from an earlier observation pass; inspect the skill again in this pass`);
   return inspection;
+}
+
+/**
+ * Throws unless the guidance `receipt` read is still current: re-inspected
+ * the same way, with the same reference files, every source and the reference
+ * folder's inventory hold the same bytes and status.
+ */
+function checkCurrent(id: string, receipt: GuidanceInspection, { dirs, referencesDir, provenance }: Pick<PrepareContext, "dirs" | "referencesDir" | "provenance">): void {
+  const requested = receipt.sources.filter(({ role }) => role === "reference").map(({ path }) => basename(path));
+  let changes: string[];
+  try {
+    changes = guidanceChanges(receipt, inspectGuidance(receipt.skill, requested, dirs, referencesDir, provenance).inspection);
+  } catch (error) {
+    changes = [error instanceof Error ? error.message : String(error)];
+  }
+  if (changes.length > 0) {
+    throw new Error(`inspection \`${id}\` of \`${receipt.skill}\` is no longer current: ${changes.join("; ")}; inspect \`${receipt.skill}\` again and cite the new receipt`);
+  }
+}
+
+function guidanceChanges(inspected: GuidanceInspection, current: GuidanceInspection): string[] {
+  const diff = (noun: string, was: ReadonlyArray<{ path: string; sha256: string }>, now: ReadonlyArray<{ path: string; sha256: string }>) => [
+    ...now.filter(({ path }) => !was.some((old) => old.path === path)).map(({ path }) => `${noun} \`${path}\` was added`),
+    ...was.flatMap(({ path, sha256 }) => {
+      const found = now.find((next) => next.path === path);
+      return !found ? [`${noun} \`${path}\` was removed`] : found.sha256 !== sha256 ? [`${noun} \`${path}\` changed`] : [];
+    }),
+  ];
+  const statuses = current.sources.flatMap(({ path, sha256, status }) =>
+    inspected.sources.some((old) => old.path === path && old.sha256 === sha256 && old.status !== status) ? [`source \`${path}\` is now ${status}`] : []);
+  return [...diff("source", inspected.sources, current.sources), ...statuses, ...diff("reference folder file", inspected.referenceInventory, current.referenceInventory)];
 }
 
 /** A citation naming a source the receipt lists, at lines or a section present in the version it inspected. */

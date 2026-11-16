@@ -952,6 +952,7 @@ describe("observer_review selection", () => {
     await host.callTool("observer_resolve", { outcomes: [{ ...project, outcome: "declined" }] });
     host.setCwd(root);
     await host.callTool("observer_resolve", { outcomes: [outcome("tdd", "upstream", "Declined mechanism", "declined")] });
+    startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [
       candidate("Declined mechanism"),
       candidate("One mechanism"),
@@ -1042,6 +1043,7 @@ describe("observer_review selection", () => {
 
   it("skips judge work for singleton classes and keeps previews out of minimized ranking states", async () => {
     const host = loadExtension();
+    startPass(host);
     const singleton = await host.callTool("observer_review", { action: "prepare", candidates: [candidate("Only note", "note"), candidate("Only evidence")] });
     expect(singleton.details).toMatchObject({ needsRanking: false, judgeStates: {} });
     const fullySelected = await host.callTool("observer_review", { action: "prepare", candidates: [candidate("First evidence"), candidate("Second evidence")] });
@@ -1124,6 +1126,7 @@ describe("observer_review prepared proposals", () => {
     splitAmendment(host, "tdd", "tdd-amendment");
     const amendment = join(host.amendmentsDir, "tdd-amendment.md");
     const before = ownedFiles(host);
+    startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [
       { kind: "upstream", skill: "tdd", gist: "Name the seam", priority: "evidence", remedy,
         change: { operation: "on-read-append", section: "\n## Seams\n\nName the seam first.\n\n" } },
@@ -1168,6 +1171,7 @@ describe("observer_review prepared proposals", () => {
     const host = loadExtension();
     appendLedger(host.ledgerFile, [{ fingerprint: proposalFingerprint("removed-skill", "Declined fix"), skill: "removed-skill", kind: "upstream",
       gist: "Declined fix", outcome: "declined", timestamp: new Date().toISOString(), sessionId: "fixture-session" } as LedgerRecord]);
+    startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [
       { kind: "upstream", skill: "removed-skill", gist: "Declined fix", priority: "evidence", remedy, change: { operation: "on-read-append", section: "## Gone\n\nGone." } },
       { kind: "upstream", skill: "tdd", gist: "Name the seam", priority: "evidence", remedy, change: { operation: "on-read-append", section: "## Seams\n\nName the seam." } },
@@ -1212,6 +1216,7 @@ describe("observer_review prepared proposals", () => {
     const before = ownedFiles(host);
     const stale = { kind: "upstream", skill: "tdd", gist: "Gist of tdd-amendment.", priority: "stale", remedy };
     const withdraw = { kind: "upstream", skill: "tdd", gist: tddFix.gist, fingerprint: tddFix.fingerprint, priority: "note", remedy };
+    startPass(host);
     const first = await host.callTool("observer_review", { action: "prepare", candidates: [
       { ...stale, change: { operation: "stale-update", rule: "tdd-amendment", body: `## Reds\n\nWhen red, read \`${reds}\`.\n`, references: [{ name: "reds.md", body: "Red first.\n" }] } },
       { ...withdraw, change: { operation: "withdrawal", body: "## Left\n\nThe rest." } },
@@ -7028,6 +7033,181 @@ describe("observer_review inspect and grounded repairs", () => {
       expect.not.objectContaining({ diagnosis: expect.anything() }), expect.not.objectContaining({ diagnosis: expect.anything() }),
     ]);
     expect(host.getBranch().some((entry) => entry.message?.role === "assistant" && JSON.stringify(entry.message.content).includes('"inspect"'))).toBe(false);
+  });
+
+  const groundedDraft = (host: ReturnType<typeof loadExtension>, inspection: string, citations: unknown[] = [{ source: guidePath(host), lines: { from: 6, to: 8 } }]) => ({
+    ...onReadCandidate({ skill: GUIDE, gist: "One fixture per seam.", section: "## Fixtures\n\nBuild one fixture per seam." }),
+    diagnosis: { inspection, explanation: "Checked the Seams section: it has no fixture step.", delta: "A future agent builds one fixture per seam.", citations },
+  });
+
+  it("refuses a repair whose receipt is forged, failed, of another skill, from an earlier pass or from an abandoned branch", async () => {
+    const cases: Array<[string, (host: ReturnType<typeof loadExtension>) => Promise<string>, string]> = [
+      ["a forged receipt", async () => "observer_review-call-999", "observer_review-call-999"],
+      ["a failed inspection", async (host) => (await inspect(host, { references: ["absent.md"] })).id, "failed"],
+      ["a receipt of another skill", async (host) => {
+        writeSkill(join(host.skillHome.roots.skillsDir, "sample-local"), "sample-local");
+        return (await inspect(host, { skill: "sample-local" })).id;
+      }, "sample-local"],
+      ["a receipt of an earlier pass", async (host) => {
+        const { id } = await inspect(host);
+        startPass(host);
+        return id;
+      }, "earlier observation pass"],
+      ["a receipt of an abandoned branch", async (host) => {
+        const kept = [...host.getBranch()];
+        const { id } = await inspect(host);
+        host.setBranch(kept);
+        return id;
+      }, "no completed"],
+    ];
+    for (const [label, receipt, named] of cases) {
+      const host = loadExtension();
+      installGuide(host);
+      startPass(host);
+      const inspection = await receipt(host);
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, inspection)] });
+      expect(prepared.isError, label).toBe(true);
+      expect(reviewEntries(prepared), label).toEqual([]);
+      const reason = failures(prepared).join("\n");
+      expect(reason, label).toContain(inspection);
+      expect(reason, label).toContain(named);
+      expect(reason, label).toMatch(/inspect/);
+    }
+  });
+
+  it("refuses a citation of a source label, an uninspected file, an absent section or no place in the inspected version", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    mkdirSync(guideReferences(host), { recursive: true });
+    const unrequested = join(guideReferences(host), "unrequested.md");
+    writeFileSync(unrequested, "## Unrequested\n\nUnrequested reference text.\n");
+    startPass(host);
+    const { id } = await inspect(host);
+    const cases: Array<[unknown, string]> = [
+      [{ source: "the sample-guide skill", section: "Seams" }, "the sample-guide skill"],
+      [{ source: unrequested, section: "Unrequested" }, unrequested],
+      [{ source: guidePath(host), section: "Fixtures" }, "Fixtures"],
+      [{ source: guidePath(host) }, "`lines` or a `section`"],
+    ];
+    for (const [citation, named] of cases) {
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id, [citation])] });
+      expect(prepared.isError, named).toBe(true);
+      expect(reviewEntries(prepared), named).toEqual([]);
+      expect(failures(prepared).join("\n"), named).toContain(named);
+    }
+  });
+
+  const stashed = new Map<ReturnType<typeof loadExtension>, Buffer>();
+  /** Each change to the guidance an inspection read: `before` runs ahead of the inspection, `change` after it, and the refusal names `named`. */
+  const guidanceChanges: Array<{ label: string; before?: (host: ReturnType<typeof loadExtension>) => void; change: (host: ReturnType<typeof loadExtension>) => void; named: string }> = [
+    { label: "a changed skill file", change: (host) => appendFileSync(guidePath(host), "\n## Fixtures\n\nOne per seam.\n"), named: "SKILL.md" },
+    { label: "an added amendment", before: (host) => {
+      const rule = join(host.rulesDir, "guide-no-todo.md");
+      stashed.set(host, readFileSync(rule));
+      rmSync(rule);
+    }, change: (host) => writeFileSync(join(host.rulesDir, "guide-no-todo.md"), stashed.get(host)!), named: "guide-no-todo.md" },
+    { label: "a removed amendment", change: (host) => rmSync(join(host.rulesDir, "guide-no-todo.md")), named: "guide-no-todo.md" },
+    { label: "a removed reference file", change: (host) => rmSync(join(guideReferences(host), "requested.md")), named: "requested.md" },
+    { label: "an unreadable skill file", change: (host) => { rmSync(guidePath(host)); mkdirSync(guidePath(host)); }, named: "SKILL.md" },
+    { label: "a changed reference inventory", change: (host) => writeFileSync(join(guideReferences(host), "unrequested.md"), "Unrequested.\n"), named: "unrequested.md" },
+  ];
+
+  /** The guide with a barrier rule and a requested reference file, inspected in a new pass after `before`. */
+  async function inspectedGuide(before?: (host: ReturnType<typeof loadExtension>) => void) {
+    const host = loadExtension();
+    installGuide(host);
+    await amend(host, GUIDE, guideRule);
+    mkdirSync(guideReferences(host), { recursive: true });
+    writeFileSync(join(guideReferences(host), "requested.md"), "## Requested\n\nRequested reference text.\n");
+    before?.(host);
+    startPass(host);
+    const { id } = await inspect(host, { references: ["requested.md"] });
+    return { host, id };
+  }
+
+  it("refuses preparing a repair once the guidance its receipt read has changed, naming what to inspect again", async () => {
+    for (const { label, before, change, named } of guidanceChanges) {
+      const { host, id } = await inspectedGuide(before);
+      change(host);
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
+      expect(prepared.isError, label).toBe(true);
+      expect(reviewEntries(prepared), label).toEqual([]);
+      const reason = failures(prepared).join("\n");
+      expect(reason, label).toContain(id);
+      expect(reason, label).toContain(named);
+      expect(reason, label).toContain(`inspect \`${GUIDE}\` again`);
+    }
+  });
+
+  it("produces no Ask form when the guidance a prepared repair's receipt read changes before Select, naming the proposal to refresh", async () => {
+    for (const { label, before, change, named } of guidanceChanges) {
+      const { host, id } = await inspectedGuide(before);
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
+      expect(failures(prepared), label).toEqual([]);
+      const [entry] = reviewEntries(prepared);
+      change(host);
+      const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+      expect(selection.isError, label).toBe(true);
+      expect(JSON.parse(resultText(selection)).askHtml, label).toBeUndefined();
+      expect(reviewEntries(selection, "selected"), label).toEqual([]);
+      const reason = failures(selection).join("\n");
+      expect(reason, label).toContain(entry!.reference.candidateId);
+      expect(reason, label).toContain(named);
+      expect(reason, label).toContain(`inspect \`${GUIDE}\` again`);
+    }
+  });
+
+  it("selects a prepared repair whose inspected guidance is unchanged, while unrelated skills change", async () => {
+    const { host, id } = await inspectedGuide();
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
+    writeSkill(join(host.skillHome.roots.skillsDir, "sample-local"), "sample-local");
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [reviewEntries(prepared)[0]!.reference] });
+    expect(failures(selection)).toEqual([]);
+    expect(JSON.parse(resultText(selection)).askHtml).toContain("A future agent builds one fixture per seam.");
+  });
+
+  it("refuses a Select whose saved candidate diagnosis was replaced after Prepare under the same reference", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    startPass(host);
+    const { id } = await inspect(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
+    const [entry] = reviewEntries(prepared);
+    const saved = host.getBranch().at(-1)!.message!.details as { eligible: Array<{ proposal: { diagnosis: { explanation: string } } }> };
+    saved.eligible[0]!.proposal.diagnosis.explanation = "Swapped explanation.";
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+    expect(selection.isError).toBe(true);
+    expect(JSON.parse(resultText(selection)).askHtml).toBeUndefined();
+    expect(failures(selection).join("\n")).toContain("content hash");
+  });
+
+  it("merges same-identity repairs only when every diagnosis holds, keeping the chosen draft's diagnosis and change together", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    startPass(host);
+    const { id } = await inspect(host);
+    const evidenceDraft = { ...groundedDraft(host, id), evidence: [{ quote: "no fixture again", count: 1 }] };
+    const noteDraft = {
+      ...onReadCandidate({ skill: GUIDE, gist: "One fixture per seam.", section: "## Fixtures\n\nBuild one fixture per seam, named for it." }),
+      priority: "note", evidence: [{ quote: "fixtures, please", count: 1, source: "user" }],
+      diagnosis: { inspection: id, explanation: "The user's note asks for named fixtures; Seams says nothing on them.", delta: "A future agent names each fixture after its seam.",
+        citations: [{ source: guidePath(host), section: "Seams" }] },
+    };
+
+    const merged = await host.callTool("observer_review", { action: "prepare", candidates: [evidenceDraft, noteDraft] });
+    expect(failures(merged)).toEqual([]);
+    const [entry, ...rest] = reviewEntries(merged);
+    expect(rest).toEqual([]);
+    expect(entry!.proposal).toMatchObject({ priority: "note", diagnosis: noteDraft.diagnosis });
+    expect((entry!.proposal as { preview: string }).preview).toContain("named for it");
+    expect(entry!.proposal.evidence.map(({ quote }) => quote).sort()).toEqual(["fixtures, please", "no fixture again"]);
+
+    for (const broken of [{ ...evidenceDraft, diagnosis: { ...evidenceDraft.diagnosis, citations: [{ source: guidePath(host), section: "Absent" }] } },
+      { ...evidenceDraft, diagnosis: { ...evidenceDraft.diagnosis, inspection: "observer_review-call-999" } }]) {
+      const refused = await host.callTool("observer_review", { action: "prepare", candidates: [broken, noteDraft] });
+      expect(refused.isError).toBe(true);
+      expect(reviewEntries(refused)).toEqual([]);
+    }
   });
 });
 
