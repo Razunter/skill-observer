@@ -150,18 +150,21 @@ function readPlugins(registryFile: string): InstalledPlugin[] {
   }
 }
 
-function parsePlugins(text: string): InstalledPlugin[] {
+/** `strict` throws on an enabled entry without an install path, which would hide that plugin's skills. */
+function parsePlugins(text: string, strict = false): InstalledPlugin[] {
   const registry = JSON.parse(text) as { plugins?: unknown } | null;
   const plugins = registry?.plugins ?? {};
   if (typeof registry !== "object" || registry === null || typeof plugins !== "object" || plugins === null || Array.isArray(plugins) ||
       Object.values(plugins).some((entries) => !Array.isArray(entries) || entries.some((entry) => typeof entry !== "object" || entry === null))) {
     throw new Error("its `plugins` must map each plugin id to a list of install entries");
   }
-  return Object.entries(plugins as Record<string, Array<{ installPath?: string; version?: string; enabled?: boolean }>>).flatMap(([id, entries]) =>
-    entries
-      // OMP skips a disabled entry, so its skills are not loaded.
-      .filter((entry) => entry.enabled !== false && typeof entry.installPath === "string")
-      .map((entry) => ({ id, version: entry.version || "unknown", installPath: resolve(entry.installPath as string) })),
+  return Object.entries(plugins as Record<string, Array<{ installPath?: unknown; version?: string; enabled?: boolean }>>).flatMap(([id, entries]) =>
+    // OMP skips a disabled entry, so its skills are not loaded.
+    entries.filter((entry) => entry.enabled !== false).flatMap((entry) => {
+      if (typeof entry.installPath === "string") return [{ id, version: entry.version || "unknown", installPath: resolve(entry.installPath) }];
+      if (strict) throw new Error(`its enabled \`${id}\` entry has no string \`installPath\``);
+      return [];
+    }),
   );
 }
 
@@ -217,7 +220,7 @@ export function scanInstalledSkills(roots: SkillRoots): InstalledSkillScan {
   }
   let plugins: InstalledPlugin[];
   try {
-    plugins = parsePlugins(readFileSync(roots.pluginsRegistry, "utf8"));
+    plugins = parsePlugins(readFileSync(roots.pluginsRegistry, "utf8"), true);
   } catch (error) {
     coverage.push({ ...registry, status: "unavailable", reason: failure(error) });
     return { coverage, skills };

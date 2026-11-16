@@ -7448,6 +7448,8 @@ describe("observer_review new-skill search", () => {
       ["unreadable enabled-plugin skills", (host) => { const skills = join(pluginInstall(host), "skills"); rmSync(skills, { recursive: true }); writeFileSync(skills, ""); }, (host) => join(pluginInstall(host), "skills")],
       ["a plugin registry that is no JSON", (host) => writeFileSync(host.skillHome.roots.pluginsRegistry, "{not json"), (host) => host.skillHome.roots.pluginsRegistry],
       ["a plugin registry of another shape", (host) => writeFileSync(host.skillHome.roots.pluginsRegistry, JSON.stringify({ plugins: { [CE_PLUGIN]: "installed" } })), (host) => host.skillHome.roots.pluginsRegistry],
+      ["an enabled plugin entry without an install path", (host) => writeFileSync(host.skillHome.roots.pluginsRegistry, JSON.stringify({ plugins: { [CE_PLUGIN]: [{ version: "1.0.0" }] } })), (host) => host.skillHome.roots.pluginsRegistry],
+      ["an enabled plugin entry whose install path is no string", (host) => writeFileSync(host.skillHome.roots.pluginsRegistry, JSON.stringify({ plugins: { [CE_PLUGIN]: [{ installPath: 42, enabled: true }] } })), (host) => host.skillHome.roots.pluginsRegistry],
       ["an installed skill of that name", (host) => writeSkill(join(host.skillHome.roots.managedDir, NEW), NEW), () => "already exists"],
       ["a skill of that name created this session", (host) => createInSession(host, NEW), () => "created this session"],
     ];
@@ -7462,6 +7464,14 @@ describe("observer_review new-skill search", () => {
       expect(reviewEntries(prepared), label).toEqual([]);
       expect(failures(prepared).join("\n"), label).toContain("failed");
     }
+  });
+
+  it("passes over a disabled plugin entry without an install path, as OMP does", async () => {
+    const host = passHost();
+    writeFileSync(host.skillHome.roots.pluginsRegistry, JSON.stringify({ plugins: { [CE_PLUGIN]: [{ version: "1.0.0", enabled: false }] } }));
+    const { result } = await search(host);
+    expect(failures(result)).toEqual([]);
+    expect(searchOf(result)?.coverage).toContainEqual({ source: "plugin registry", path: host.skillHome.roots.pluginsRegistry, status: "present" });
   });
 
   it("reports a missing optional installation or prompt catalog as coverage, without blocking the new skill", async () => {
