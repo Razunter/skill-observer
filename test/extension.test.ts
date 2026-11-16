@@ -7188,6 +7188,22 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(JSON.parse(resultText(selection)).askHtml).toContain("A future agent builds one fixture per seam.");
   });
 
+  it("refuses a repair once its inspected skill changed owner with the same SKILL.md, naming the kind to inspect again", async () => {
+    const host = loadExtension();
+    const skill = "sample-local";
+    writeSkill(join(host.skillHome.roots.skillsDir, skill), skill);
+    startPass(host);
+    const { id, result } = await inspect(host, { skill });
+    expect(inspectionOf(result)?.kind).toBe("local");
+    setLockHash(host, skill, "fixture-lock-hash");
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [descriptionFix(skill, "local", id, firstSource(result))] });
+    expect(prepared.isError).toBe(true);
+    expect(reviewEntries(prepared)).toEqual([]);
+    const reason = failures(prepared).join("\n");
+    expect(reason).toContain("now an upstream skill");
+    expect(reason).toContain(`inspect \`${skill}\` again`);
+  });
+
   it("refuses a Select whose saved candidate diagnosis was replaced after Prepare under the same reference", async () => {
     const host = loadExtension();
     installGuide(host);

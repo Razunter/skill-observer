@@ -829,7 +829,8 @@ function guidanceChanges(inspected: GuidanceInspection, current: GuidanceInspect
   ];
   const statuses = current.sources.flatMap(({ path, sha256, status }) =>
     inspected.sources.some((old) => old.path === path && old.sha256 === sha256 && old.status !== status) ? [`source \`${path}\` is now ${status}`] : []);
-  return [...diff("source", inspected.sources, current.sources), ...statuses, ...diff("reference folder file", inspected.referenceInventory, current.referenceInventory)];
+  const owner = current.kind === inspected.kind ? [] : [`\`${current.skill}\` is now ${current.kind === "upstream" ? "an" : "a"} ${current.kind} skill, not ${inspected.kind}`];
+  return [...owner, ...diff("source", inspected.sources, current.sources), ...statuses, ...diff("reference folder file", inspected.referenceInventory, current.referenceInventory)];
 }
 
 function checkedCitation(citation: Partial<Citation> | undefined, receipt: GuidanceInspection, inspection: string): Citation {
