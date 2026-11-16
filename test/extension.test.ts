@@ -61,6 +61,9 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+/** OMP's entry IDs are unique across sessions, so a restored session's entries never share one with entries appended later. */
+let customEntryIds = 0;
+
 /**
  * Loads the extension against a fake OMP host whose home directory is a temp
  * skill home, and records what it shows and sends. The host has an explicit,
@@ -104,7 +107,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     appendEntry: (customType, data) => {
       const failure = appendFailures.shift();
       if (failure) throw failure;
-      branch = [...branch, { type: "custom", id: `custom-${branch.length}`, customType, data: data as SessionEntry["data"] }];
+      branch = [...branch, { type: "custom", id: `custom-${++customEntryIds}`, customType, data: data as SessionEntry["data"] }];
     },
     zod,
     pi: {
@@ -115,6 +118,12 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
   skillObserver(pi);
 
   let branch: SessionEntry[] = [];
+  /** Every entry the session ever held, by ID, as OMP keeps abandoned branches in the session file. */
+  const session = new Map<string, SessionEntry>();
+  const sessionEntries = () => {
+    for (const entry of branch) if (entry.id) session.set(entry.id, entry);
+    return [...session.values()];
+  };
   const appendFailures: Error[] = [];
   let calls = 0;
   const statusCalls: Array<[string, string | undefined]> = [];
@@ -125,7 +134,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     hasUI: options.hasUI ?? true,
     agent: options.agentKind === "unknown" ? undefined : { kind: options.agentKind ?? "main" },
     cwd: skillHome.roots.cwd,
-    sessionManager: { getBranch: () => branch, getSessionId: () => "fixture-session" },
+    sessionManager: { getBranch: () => branch, getEntries: sessionEntries, getSessionId: () => "fixture-session" },
     ...(options.systemPrompt && { getSystemPrompt: () => options.systemPrompt! }),
     modelRegistry: { getAvailable: () => [{ provider: "fixture", id: "explicit-judge" }] },
     ui: {
@@ -215,6 +224,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
 
   return {
     getBranch: () => branch,
+    sessionEntries,
     toolCall: async (toolName: string, input: Record<string, unknown>, toolCallId: string) => {
       for (const handler of handlers.tool_call ?? []) {
         const result = await handler({ type: "tool_call", toolName, input, toolCallId }, ctx);
@@ -222,7 +232,9 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
       }
     },
     setCwd: (cwd: string) => { ctx.cwd = cwd; },
+    /** Moves to `entries` as the active branch; the entries of the branch it leaves stay in the session. */
     setBranch: (entries: SessionEntry[]) => {
+      sessionEntries();
       branch = skillHome.relocate(entries);
     },
     endTurn: () => emit("agent_end"),
@@ -8171,9 +8183,10 @@ describe("catalog history across the session tree", () => {
     expect(await lookups(restored)).toEqual(before);
   });
 
-  it("applies only the active branch's bindings after branching or rewinding, even when they share a content definition", async () => {
+  it("applies only the active branch's bindings after branching or rewinding, even when they share a content definition stored once per session", async () => {
     const host = loadExtension();
     await observeCatalog(host, [SEAMS, NOTES]);
+    const shared = catalogEntries(host)[0]!;
     await observeCatalog(host, [SEAMS]);
     const fork = host.getBranch();
     await observeCatalog(host, [SEAMS, NOTES]);
@@ -8190,12 +8203,12 @@ describe("catalog history across the session tree", () => {
     expect(sibling.text).not.toContain(firstBinding.id!);
 
     host.setBranch([reply("rewound-reply")]);
-    await host.emit("session_branch");
+    await host.emit("session_tree");
     expect((await lookUp(host, NOTES[0])).matches).toEqual([]);
     await observeCatalog(host, [SEAMS, NOTES]);
     const own = catalogEntries(host);
-    expect(own.map(({ customType }) => customType)).toEqual(["skill-observer-catalog", "skill-observer-catalog-binding"]);
-    expect((await lookUp(host, NOTES[0])).matches).toEqual([expect.objectContaining({ status: "listed", definitionId: own[0]!.id, bindingId: own[1]!.id })]);
+    expect(own.map(({ customType }) => customType)).toEqual(["skill-observer-catalog-binding"]);
+    expect((await lookUp(host, NOTES[0])).matches).toEqual([expect.objectContaining({ status: "listed", definitionId: shared.id, bindingId: own[0]!.id })]);
 
     host.setBranch(first);
     await host.emit("session_tree");
@@ -8227,13 +8240,36 @@ describe("catalog history across the session tree", () => {
     const dangling = await lookUp(lacking, SEAMS[0]);
     expect(dangling.result.isError).toBe(false);
     expect(dangling.matches).toEqual([]);
-    expect(dangling.gaps).toEqual([expect.stringMatching(/user-0[^\n]*definition is not on this branch[^\n]*unavailable/)]);
+    expect(dangling.gaps).toEqual([expect.stringMatching(/user-0[^\n]*definition is not in this session[^\n]*unavailable/)]);
     expect(dangling.text).toContain("unknown, not absent");
     expect(dangling.text).not.toContain(SEAMS[1]);
     const next = `user-${lacking.getBranch().length}`;
     await observeCatalog(lacking, [SEAMS]);
     expect(catalogEntries(lacking).map(({ customType }) => customType)).toEqual(["skill-observer-catalog-binding", "skill-observer-catalog", "skill-observer-catalog-binding"]);
-    expect((await lookUp(lacking, SEAMS[0])).matches).toEqual([expect.objectContaining({ status: "listed", observedAt: next })]);
+    // The materialized content resolves the earlier binding to the same catalog too: a definition serves the whole session.
+    const recaptured = await lookUp(lacking, SEAMS[0]);
+    expect(recaptured.matches.map(({ status, observedAt }) => [status, observedAt])).toEqual([["listed", "user-0"], ["listed", next]]);
+    expect(recaptured.gaps).toEqual([]);
+  });
+
+  it("stores one definition for identical catalogs observed on sibling branches, each bound on its own branch", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [NOTES]);
+    const fork = host.getBranch();
+    await observeCatalog(host, [SEAMS]);
+    const [, , stored, firstBinding] = catalogEntries(host);
+    host.setBranch([...fork, reply("sibling-reply")]);
+    await host.emit("session_tree");
+    expect((await lookUp(host, SEAMS[0])).matches.map(({ status }) => status)).toEqual(["not-listed"]);
+    await observeCatalog(host, [SEAMS]);
+
+    const definitions = host.sessionEntries().filter(({ customType }) => customType === "skill-observer-catalog");
+    expect(definitions.filter(({ data }) => JSON.stringify(data) === JSON.stringify(stored!.data))).toHaveLength(1);
+    const siblingBinding = catalogEntries(host).at(-1)!;
+    expect(siblingBinding.customType).toBe("skill-observer-catalog-binding");
+    const sibling = await lookUp(host, SEAMS[0]);
+    expect(sibling.matches.map(({ status, definitionId, bindingId }) => [status, definitionId, bindingId])).toEqual([["not-listed", expect.any(String), expect.any(String)], ["listed", stored!.id, siblingBinding.id]]);
+    expect(sibling.text).not.toContain(firstBinding!.id!);
   });
 
   it.each(["session_switch", "session_branch", "session_tree"])("leaks no staged observation, nor a capture gap onto another branch, across %s", async (event) => {

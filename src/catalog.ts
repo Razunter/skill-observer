@@ -3,7 +3,7 @@
  * `<skills>` block listed, in the host's standard or bundled custom-prompt
  * form, when `before_agent_start` saw it, kept in non-model custom entries for
  * missed-trigger diagnosis. A definition holds each distinct catalog once per
- * branch; a binding marks where the branch observed it. Lookup applies OMP's
+ * session; a binding marks where a branch observed it. Lookup applies OMP's
  * own persisted skill notices on top without copying them. An observation is
  * the hook's view, never proof of what the model received: a later handler or
  * provider hook may change the request.
@@ -156,7 +156,7 @@ export function registerCatalogCapture(pi: ExtensionAPI, isObservable: (ctx: Ext
       observedAt = anchor = prompt.id;
       const { definition } = staged;
       staged = undefined;
-      const { bound, definitions } = catalogBindings(branch);
+      const { bound, definitions } = catalogBindings(branch, ctx.sessionManager.getEntries());
       const latest = bound.at(-1);
       const recovered = gapsOn(branch);
       const gap = recovered.at(-1)?.text;
@@ -188,8 +188,13 @@ interface BoundCatalog { index: number; promptIndex: number; noticesFrom: number
 
 interface CatalogHistory { bound: BoundCatalog[]; definitions: Map<string, { id: string; definition: CatalogDefinition }>; unavailable: Array<{ index: number; text: string }> }
 
-function catalogBindings(branch: readonly SessionEntry[]): CatalogHistory {
+/** The active branch's bindings, each resolved against a definition anywhere in `session`: content is stored once per session, but only a binding on the branch shows that the branch observed it. */
+function catalogBindings(branch: readonly SessionEntry[], session: readonly SessionEntry[]): CatalogHistory {
   const definitions: CatalogHistory["definitions"] = new Map();
+  for (const entry of session) {
+    if (entry.type !== "custom" || entry.customType !== CATALOG_DEFINITION_TYPE || !entry.id || !isCatalogDefinition(entry.data)) continue;
+    if (!definitions.has(entry.data.catalogId)) definitions.set(entry.data.catalogId, { id: entry.id, definition: entry.data });
+  }
   const bound: BoundCatalog[] = [];
   const unavailable: CatalogHistory["unavailable"] = [];
   const positions = new Map<string, number>();
@@ -197,8 +202,7 @@ function catalogBindings(branch: readonly SessionEntry[]): CatalogHistory {
     if (entry.id) positions.set(entry.id, index);
     if (entry.type !== "custom" || !entry.id) continue;
     if (entry.customType === CATALOG_DEFINITION_TYPE) {
-      if (isCatalogDefinition(entry.data)) definitions.set(entry.data.catalogId, { id: entry.id, definition: entry.data });
-      else unavailable.push({ index, text: `the catalog definition at entry \`${entry.id}\` is malformed, so an observation bound to it is unavailable` });
+      if (!isCatalogDefinition(entry.data)) unavailable.push({ index, text: `the catalog definition at entry \`${entry.id}\` is malformed, so an observation bound to it is unavailable` });
     } else if (entry.customType === CATALOG_BINDING_TYPE) {
       const binding = entry.data;
       if (!isCatalogBinding(binding)) {
@@ -207,7 +211,7 @@ function catalogBindings(branch: readonly SessionEntry[]): CatalogHistory {
       }
       const found = definitions.get(binding.catalogId);
       if (!found) {
-        unavailable.push({ index, text: `the observation at entry \`${binding.observedAt}\` (binding \`${entry.id}\`) refers to catalog \`${binding.catalogId}\`, whose definition is not on this branch, so that observation is unavailable` });
+        unavailable.push({ index, text: `the observation at entry \`${binding.observedAt}\` (binding \`${entry.id}\`) refers to catalog \`${binding.catalogId}\`, whose definition is not in this session, so that observation is unavailable` });
         continue;
       }
       const promptIndex = positions.get(binding.observedAt);
@@ -247,8 +251,8 @@ export interface CatalogSummary {
   gaps: string[];
 }
 
-export function catalogSummary(branch: readonly SessionEntry[], pendingGap?: string): CatalogSummary {
-  const history = catalogBindings(branch);
+export function catalogSummary(branch: readonly SessionEntry[], session: readonly SessionEntry[], pendingGap?: string): CatalogSummary {
+  const history = catalogBindings(branch, session);
   const latest = history.bound.at(-1);
   return {
     observations: history.bound.length,
@@ -304,14 +308,14 @@ export interface CatalogLookup { skill?: string; terms?: string[]; at?: string; 
 
 const PAGE_SIZE = 20;
 
-export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry[], pendingGap?: string): { lookup: CatalogLookup; text: string } {
+export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry[], session: readonly SessionEntry[], pendingGap?: string): { lookup: CatalogLookup; text: string } {
   const name = query.skill?.trim() ?? "";
   const terms = (query.terms ?? []).map((term) => term.trim().toLowerCase()).filter(Boolean);
   if (!name && terms.length === 0) throw new Error("A catalog lookup needs the exact skill name in `skill` or non-blank description words in `terms`; it never lists the whole catalog");
   if (name && query.terms !== undefined) throw new Error("A catalog lookup takes either the exact skill name in `skill` or description words in `terms`, not both");
   const limit = query.limit ?? PAGE_SIZE;
   if (!Number.isInteger(limit) || limit < 1) throw new Error("`limit` is the page size, a whole number of at least 1");
-  const history = catalogBindings(branch);
+  const history = catalogBindings(branch, session);
   let gaps = captureGaps(history, pendingGap);
   let scope = history.bound.map((catalog, at) => ({ catalog, end: history.bound[at + 1]?.noticesFrom ?? branch.length }));
   if (query.at !== undefined) {
@@ -328,7 +332,8 @@ export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry
     .filter((match) => name || describes(match)));
 
   const queryKey = digest([name, terms, query.at ?? null]);
-  const revision = digest([pendingGap ?? null, branch.filter(isCatalogEvidence)]);
+  // A definition saved on another branch can resolve a binding here, so the resolved definitions are evidence too.
+  const revision = digest([pendingGap ?? null, branch.filter(isCatalogEvidence), history.bound.map(({ definitionId }) => definitionId)]);
   const offset = query.cursor === undefined ? 0 : cursorOffset(query.cursor, queryKey, revision, all.length);
   const matches = all.slice(offset, offset + limit);
   const remaining = all.length - offset - matches.length;

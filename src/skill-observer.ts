@@ -295,7 +295,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
           ctx.ui.notify("Nothing to observe: no skill signals, stale amendments or pending observations, and no note.", "info");
           return;
         }
-        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, roots, provenance, catalog: catalogSummary(branch, catalogGap(branch)) });
+        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, roots, provenance, catalog: catalogSummary(branch, ctx.sessionManager.getEntries(), catalogGap(branch)) });
       } catch (error) {
         ctx.ui.notify(`Observation pass not started: ${error instanceof Error ? error.message : String(error)}`, "error");
         return;
@@ -330,7 +330,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const stale = findStaleAmendments(ruleDirs(), provenance);
       try {
         const observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
-        const catalog = catalogSummary(branch, catalogGap(branch));
+        const catalog = catalogSummary(branch, ctx.sessionManager.getEntries(), catalogGap(branch));
         const report = evidenceReport({
           digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale, observations: observations.length, catalog,
         });

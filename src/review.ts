@@ -436,7 +436,7 @@ function readOnlyActionResult(params: ReviewParams, files: ObserverFiles, ctx: E
       if (params.candidates !== undefined || params.proposals !== undefined || params.references !== undefined) {
         throw new Error("A catalog lookup takes `skill` or `terms`, with optional `at`, `limit` and `cursor`");
       }
-      const { lookup, text } = lookupCatalog(params, ctx.sessionManager.getBranch(), catalogGap);
+      const { lookup, text } = lookupCatalog(params, ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries(), catalogGap);
       details.catalog = lookup;
       return ok(text);
     }
