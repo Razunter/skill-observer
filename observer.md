@@ -56,6 +56,8 @@ Done when every signal and relevant note point is either an evidence-backed cand
 
 Skill, rule and agent-guidance drafts follow `skill://writing-for-agents`: read it before drafting those texts, then apply its no-op and negation tests. If unavailable, say so and delete instructions the agent would obey untold; state the positive behavior, keeping prohibitions only as hard guardrails. Project code/configuration repairs follow the target's existing conventions.
 
+**Inspect before a skill-text repair.** Before drafting an edit to an installed local or managed skill, an on-read fix or a barrier rule, call `observer_review` with `action: "inspect"`, the `skill` and, in `references`, the reference files of its on-read amendment the finding touches. It returns the skill file, every rule amending it (a `stale` one is still in force) and those reference files, numbered by line. Drop the candidate when that guidance or an existing rule or check already covers the finding. Otherwise decide whether the guidance is missing, unclear or ignored, and name the check that could prove you wrong and its result. A failed inspection grounds no repair: report its reason instead.
+
 <!-- when: project -->
 - **Project remedy**: read the exact target and relevant existing checks/wiring. Draft the smallest exact diff and target-specific verification: for a deterministic check, both the session's known mistake and its nearest legitimate counterpart, using temporary inputs so verification preserves user data. For a navigation/review-guidance repair, verify the actual pointer resolves or the reviewed guidance is present. Keep every target under **Project scope**; an outside path in a note is context, not authority to change scope. Information-access requests stay permission proposals until explicitly granted.
 <!-- end -->
@@ -71,7 +73,7 @@ Skill, rule and agent-guidance drafts follow `skill://writing-for-agents`: read 
 - **Compaction**: read the amendment file, `<on-read amendments directory>/<name>.md`, and its reference files. Draft the new body from the amendment's body with this pass's on-read fixes for the skill appended; the draft includes every one of them. Keep every instruction, state each once, and group them under short `## ` headings. While the body is still over 4,000 characters, move a topical section into a reference file, `<reference files directory>/<skill>/<name>.md`, and replace the section, heading included, with the one pointer line `When <condition>, read <the file's absolute path>.` The draft's reference files are the amendment's complete set, the existing ones included, each named by its absolute path in a pointer line of the body.
 <!-- end -->
 
-Done when every proposal has an exact preview, supporting evidence and target-specific verification, skill/guidance drafts pass the writing tests, every barrier has passed replay (or is set aside as Later), every stale amendment has a verdict, and every compaction holds all prior instructions within its existing size/reference contract.
+Done when every proposal has an exact preview, supporting evidence and target-specific verification, every skill-text repair rests on an inspection of its skill, skill/guidance drafts pass the writing tests, every barrier has passed replay (or is set aside as Later), every stale amendment has a verdict, and every compaction holds all prior instructions within its existing size/reference contract.
 
 ## 3. Ask
 
@@ -89,6 +91,8 @@ First call `observer_review` with `action: "prepare"` and the exact eligible can
 <!-- when: compaction -->
 - `compaction` with its `includes` (the on-read appends of this Prepare it covers, each by gist or fingerprint), compacted `body` and complete `references`.
 <!-- end -->
+
+A `direct-edit` of an installed local or managed skill, an `on-read-append` and a `rule` also carry `diagnosis`: `inspection`, the ID of this pass's inspect call of that skill; `explanation`, why the inspected guidance does not already address the finding, with the check that could prove it wrong and its result; `delta`, one sentence on what a future agent will do differently; and `citations`, each a `source` path the inspection lists with `lines` (`{ from, to }`) or a `## ` `section`. Prepare refuses a repair without them. The form shows them once beside the preview, so keep them short and cite rather than copy source text.
 
 Write every section, body and reference file with `\n` line ends: Prepare refuses a change holding a carriage return, which the Ask form cannot show.
 

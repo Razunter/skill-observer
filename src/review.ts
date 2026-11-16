@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join, sep } from "node:path";
 import {
-  compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, parseFrontmatter, readObserverRule, readOnReadAmendments,
+  compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, parseFrontmatter, readObserverRule, readObserverRules, readOnReadAmendments,
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
@@ -24,7 +24,7 @@ import {
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
-import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver } from "./provenance.js";
+import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver, skillHash, type SkillProvenance } from "./provenance.js";
 import { checkCompanionCommand, checkHookCommand } from "./project-publication.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
@@ -66,6 +66,39 @@ const INTENT_LINES: ReadonlyArray<[keyof HarnessIntent, string]> = [
 /** The check the drafting ran on the code, and its observed output. */
 export interface HarnessCheck { command: string; output: string }
 
+/** A place in an inspected guidance source: a 1-based inclusive line range or a `## ` section heading. */
+interface Citation { source: string; lines?: { from: number; to: number }; section?: string }
+
+/**
+ * Why current guidance does not already address a skill-text repair's finding
+ * and what the change would make a future agent do: `inspection` is the
+ * `observer_review` inspect call whose receipt the `citations` name.
+ */
+interface CandidateDiagnosis { inspection: string; explanation: string; delta: string; citations: Citation[] }
+
+/**
+ * One guidance source an inspection read, at the bytes it read: the skill's
+ * entry file, an observer rule amending it, or a requested reference file.
+ * `stale` is a pinned amendment whose skill's files changed since: it is still
+ * delivered or fired until the pass settles it.
+ */
+export interface GuidanceSource {
+  role: "skill" | "rule" | "reference";
+  path: string;
+  status: "active" | "stale";
+  sha256: string;
+  lines: number;
+  sections: string[];
+}
+
+/** The receipt of an inspect call: the skill's current guidance a candidate diagnosis cites, and its reference folder's files by fingerprint, read or not. */
+export interface GuidanceInspection {
+  skill: string;
+  kind: Exclude<SkillProvenance["kind"], "unknown">;
+  sources: GuidanceSource[];
+  referenceInventory: Array<{ path: string; sha256: string }>;
+}
+
 interface CandidateDraft {
   gist: string;
   priority: Priority;
@@ -75,6 +108,7 @@ interface CandidateDraft {
   fingerprint?: string;
   /** The approved on-read append or rule this candidate revises for its changed target, and the main agent's account of the revision. */
   reconciles?: Partial<ProposalReconciliation>;
+  diagnosis?: Partial<CandidateDiagnosis>;
 }
 type ReviewCandidate = CandidateDraft & TargetScope;
 
@@ -124,6 +158,8 @@ export type PreparedProposal = {
   evidence: ReviewEvidence[];
   /** A revision's link to the approved proposal it reconciles: the main agent's judgment, not the user's approval of this revision. */
   reconciles?: ProposalReconciliation;
+  /** A skill-text repair's grounding in an inspection of the skill's current guidance; the Ask form shows it once. */
+  diagnosis?: CandidateDiagnosis;
 } & (
   | { change: Exclude<PreparedChange, StaleChange>; preview: string }
   /** A stale amendment's one Keep/Update/Delete choice: each prepared answer, Update before Delete. */
@@ -135,7 +171,9 @@ export interface PreparedEntry { reference: PreparedProposalRef; proposal: Prepa
 
 interface Ranking { id: string; score: number; confidence: number; consistent: boolean }
 interface ReviewParams {
-  action: "prepare" | "select";
+  action: "inspect" | "prepare" | "select";
+  skill?: string;
+  references?: string[];
   candidates?: ReviewCandidate[];
   proposals?: PreparedProposalRef[];
   rankings?: Ranking[];
@@ -156,6 +194,7 @@ interface ReviewDetails {
   deferred: PreparedEntry[];
   fallback?: string;
   failures: string[];
+  inspection?: GuidanceInspection;
 }
 
 interface PrepareContext {
@@ -215,12 +254,25 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
       reason: z.string().describe("Why this revision of the approved section or rule: what the user's note asked for, the target's change, or both."),
       preserved: z.string().describe("Why the revision keeps the approved intent and the target's unrelated content."),
     }).optional().describe("On-read append or rule only: revises an approved proposal, in the same pass, by the note the user attached to its Apply (read from the Ask; a section, or a rule's body, pattern and samples, not its name), for a target that changed after its Prepare, or both. The main agent's reconciliation, not the user's approval: a change that would drop or rewrite the target's new content, or delete a target, needs a new proposal and Ask."),
+    diagnosis: z.object({
+      inspection: z.string().describe("The ID of this pass's observer_review inspect call of the candidate's skill, whose receipt the citations name."),
+      explanation: z.string().describe("Why the inspected guidance does not already address the finding (missing, unclear or ignored), with the check that could have shown otherwise and its result."),
+      delta: z.string().describe("One sentence: what a future agent will do differently."),
+      citations: z.array(z.object({
+        source: z.string().describe("A source `path` the inspection receipt lists."),
+        lines: z.object({ from: z.number(), to: z.number() }).optional().describe("1-based inclusive lines of that source as inspected."),
+        section: z.string().optional().describe("A `## ` heading of that source as inspected."),
+      })).describe("The inspected guidance the explanation rests on, each by `lines`, `section` or both."),
+    }).optional().describe("The candidate diagnosis: required for a direct edit of a local or managed skill, an on-read append and a rule; omitted for a new skill, a project or harness remedy, stale answers, withdrawals and compactions."),
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither asks, approves nor publishes and never calls a model.",
+    description: "Inspect a skill's current guidance before drafting a repair to it: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force), and the reference files requested from its observer reference folder, each with line numbers, `sha256` and `## ` sections, plus the folder's inventory by fingerprint; the successful result is the receipt a candidate `diagnosis` cites by its call ID. Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. Prepare refuses a direct edit of a local or managed skill, an on-read append or a rule without a `diagnosis` naming a successful inspect receipt of its skill, its explanation, its behavior delta and citations of places that receipt inspected. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither writes, asks, approves nor publishes and never calls a model.",
     parameters: z.object({
-      action: z.enum(["prepare", "select"]),
+      action: z.enum(["inspect", "prepare", "select"]),
+      skill: z.string().optional().describe("Inspect only: the installed skill whose current guidance to read."),
+      references: z.array(z.string()).optional()
+        .describe("Inspect only: file names in the skill's observer reference folder to read too; the others are only listed by fingerprint and are not inspected."),
       candidates: z.array(z.union([
         z.object({ ...draft, kind: z.enum(PROPOSAL_KINDS), skill: z.string() }),
         z.object({ ...draft, kind: z.enum(["project"]), target: z.object({
@@ -238,10 +290,11 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
       rankingFailure: z.string().optional().describe("Select only: exact unavailable/failed host ranking reason. Do not retry the batch."),
     }),
     async execute(toolCallId, params, signal, _update, ctx) {
+      signal?.throwIfAborted();
+      if (params?.action === "inspect") return inspectResult(params, files, ctx.cwd);
       const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
       const amendmentSections = new Map<string, string[]>();
       try {
-        signal?.throwIfAborted();
         const ledger = readLedger(files.ledgerFile());
         if (params?.action === "prepare") {
           if (!Array.isArray(params.candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
@@ -262,7 +315,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
             throw new Error("the code of a hook or companion change is asked in its own Select and Ask, apart from every other question");
           }
         } else {
-          throw new Error("review needs prepare/select");
+          throw new Error("review needs inspect/prepare/select");
         }
         const classCounts: Record<Priority, number> = { stale: 0, note: 0, evidence: 0, compaction: 0 };
         for (const { proposal } of details.eligible) classCounts[proposal.priority]++;
@@ -310,6 +363,82 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
   });
 }
 
+/** The inspect action: the receipt in `details.inspection`, and each source's text numbered by line for citing; any unreadable, missing or malformed required source fails it. */
+function inspectResult(params: ReviewParams, files: ObserverFiles, cwd: string) {
+  const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
+  try {
+    if (params.candidates !== undefined || params.proposals !== undefined) throw new Error("Inspect takes a `skill` and optional `references`, not candidates or proposal references");
+    const { inspection, text } = inspectGuidance(params.skill, params.references,
+      { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, files.referencesDir(), createProvenanceResolver(defaultSkillRoots(cwd)));
+    details.inspection = inspection;
+    return { content: [{ type: "text" as const, text }], details, isError: false };
+  } catch (error) {
+    details.failures.push(error instanceof Error ? error.message : String(error));
+    return { content: [{ type: "text" as const, text: JSON.stringify({ failures: details.failures }) }], details, isError: true };
+  }
+}
+
+function inspectGuidance(skill: unknown, requested: unknown, dirs: RuleDirs, referencesDir: string, provenance: ProvenanceResolver): { inspection: GuidanceInspection; text: string } {
+  if (typeof skill !== "string" || !skill.trim()) throw new Error("Inspect needs the `skill` whose guidance to read");
+  if (requested !== undefined && (!Array.isArray(requested) || requested.some((name) => typeof name !== "string"))) {
+    throw new Error("`references` lists file names in the skill's observer reference folder");
+  }
+  const names: string[] = requested ?? [];
+  checkReferenceFiles(names.map((name) => ({ name, body: "" })));
+  const installed = provenance.byName(skill);
+  if (installed.kind === "unknown") throw new Error(`no installed skill is named \`${skill}\``);
+  const read: Array<{ source: GuidanceSource; numbered: string }> = [];
+  const skillBytes = readGuidance(installed.path);
+  if (!parseFrontmatter(skillBytes.toString("utf8"))) throw new Error(`\`${installed.path}\` has no frontmatter block, so its guidance can't be read as a skill`);
+  read.push(guidanceSource("skill", installed.path, "active", skillBytes));
+
+  const rules = readObserverRules(dirs).filter((rule) => rule.amends === skill);
+  const amendmentFile = join(dirs.amendmentsDir, `${skillAmendmentName(skill)}.md`);
+  if (existsSync(amendmentFile) && !rules.some((rule) => rule.path === amendmentFile)) {
+    throw new Error(`\`${amendmentFile}\` is no on-read amendment skill-observer can read: its frontmatter is missing, malformed or another author's`);
+  }
+  const pin = rules.some(isPinned) ? skillHash(installed) : undefined;
+  for (const rule of rules) read.push(guidanceSource("rule", rule.path, isPinned(rule) && rule.skillHash !== pin ? "stale" : "active", readGuidance(rule.path)));
+
+  const folder = referenceFolder(referencesDir, skill);
+  const inventory = existsSync(folder)
+    ? readdirSync(folder, { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => join(folder, entry.name)).sort()
+      .map((path) => ({ path, bytes: readGuidance(path) }))
+    : [];
+  for (const name of names) {
+    const file = inventory.find(({ path }) => basename(path) === name);
+    if (!file) throw new Error(`the requested reference file \`${name}\` is not in \`${folder}\``);
+    read.push(guidanceSource("reference", file.path, "active", file.bytes));
+  }
+
+  const sources = read.map(({ source }) => source);
+  const unread = inventory.filter(({ path }) => !sources.some((source) => source.path === path)).map(({ path }) => `\`${basename(path)}\``);
+  const text = [
+    `Current guidance of \`${skill}\` (${installed.kind}). Cite this call's ID as the diagnosis \`inspection\`, and each source by its path with \`lines\` or a \`section\`.`,
+    `Reference folder \`${folder}\`: ${inventory.length} file(s)${unread.length > 0 ? `; not inspected: ${unread.join(", ")}` : ""}.`,
+    ...read.map(({ source, numbered }) => `\n### ${source.role} \`${source.path}\` (${source.status}, ${source.lines} lines)\n${numbered}`),
+  ].join("\n");
+  return { inspection: { skill, kind: installed.kind, sources, referenceInventory: inventory.map(({ path, bytes }) => ({ path, sha256: snapshot(path, bytes).sha256! })) }, text };
+}
+
+function readGuidance(path: string): Buffer<ArrayBuffer> {
+  try {
+    return readFileSync(path);
+  } catch (error) {
+    throw new Error(`\`${path}\` could not be read: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function guidanceSource(role: GuidanceSource["role"], path: string, status: GuidanceSource["status"], bytes: Buffer<ArrayBuffer>): { source: GuidanceSource; numbered: string } {
+  const text = bytes.toString("utf8");
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return {
+    source: { role, path, status, sha256: snapshot(path, bytes).sha256!, lines: lines.length, sections: sectionHeadings(text) },
+    numbered: lines.map((line, i) => `${i + 1}| ${line}`).join("\n"),
+  };
+}
+
 /** What the model needs of a prepared proposal to rank, ask and answer it; its change and evidence stay in the saved details. */
 function preparedSummary({ reference, proposal }: PreparedEntry, amendmentSections: ReadonlyMap<string, string[]>) {
   const sections = "change" in proposal && proposal.change.operation === "on-read-append" ? amendmentSections.get(proposal.candidateId) : undefined;
@@ -351,6 +480,7 @@ function renderFieldset(proposal: PreparedProposal): string {
     "<fieldset>",
     `<legend>${escapeHtml(`${targetLabel(proposal)}: ${proposal.gist}`)}</legend>`,
     `<p>${escapeHtml(proposal.remedy)}</p>`,
+    ...(proposal.diagnosis ? renderDiagnosis(proposal.diagnosis) : []),
     ...(evidence.length > 0 ? ["<ul>", ...evidence, "</ul>"] : []),
     ...previews,
     ...(notedAsksAgain ? [`<p>${notedAsksAgain}</p>`] : []),
@@ -360,6 +490,16 @@ function renderFieldset(proposal: PreparedProposal): string {
     ...labels.map((label) => `<label><input type="radio" name="${name}" value="${name}=${label}" required>${label}</label>`),
     "</fieldset>",
   ].join("\n");
+}
+
+/** A candidate diagnosis shown once beside its proposal: the explanation, the behavior delta and where each cited source was inspected, never the sources' text. */
+function renderDiagnosis({ inspection, explanation, delta, citations }: CandidateDiagnosis): string[] {
+  const place = ({ source, lines, section }: Citation) => `${source}${lines ? ` lines ${lines.from}–${lines.to}` : ""}${section ? ` § ${section}` : ""}`;
+  return [
+    `<p>${escapeHtml(`Diagnosis: ${explanation}`)}</p>`,
+    `<p>${escapeHtml(`Behavior change: ${delta}`)}</p>`,
+    `<p>${escapeHtml(`Cited guidance, inspection ${inspection}: ${citations.map(place).join("; ")}`)}</p>`,
+  ];
 }
 
 /** Marks the whitespace of a preview line that the host's form would hide: `·` per space of an indent, a trailing run or a run of two or more, `→` per tab. */
@@ -403,12 +543,70 @@ function prepareProposals(candidates: readonly ReviewCandidate[], context: Prepa
   // A compaction's `includes` resolve to this Prepare's on-read appends, so it is prepared after them.
   const ordered = checked.toSorted((a, b) => Number(a.change.operation === "compaction") - Number(b.change.operation === "compaction"));
   for (const candidate of ordered) {
-    const proposal = preparedProposal(candidate, scoped, declined, [...grouped.values()], context);
-    if (!proposal) continue;
+    const prepared = preparedProposal(candidate, scoped, declined, [...grouped.values()], context);
+    if (!prepared) continue;
+    const proposal = isSkillTextRepair(candidate)
+      ? { ...prepared, diagnosis: candidateDiagnosis(candidate.skill, candidate.diagnosis, context.branch) } : prepared;
     const previous = grouped.get(proposal.candidateId);
     grouped.set(proposal.candidateId, previous ? joined(previous, proposal) : proposal);
   }
   return [...grouped.values()];
+}
+
+const SKILL_TEXT_OPERATIONS: ReadonlyArray<ChangeDraft["operation"]> = ["direct-edit", "on-read-append", "rule"];
+
+/** A change to an installed skill's guidance, which needs a candidate diagnosis; a new skill, project and harness remedies and maintenance keep their own evidence. */
+function isSkillTextRepair(candidate: ReviewCandidate): candidate is Extract<ReviewCandidate, { skill: string }> {
+  return candidate.kind !== "project" && candidate.kind !== "harness" && candidate.kind !== "new" && SKILL_TEXT_OPERATIONS.includes(candidate.change.operation);
+}
+
+/** The candidate diagnosis of a repair to `skill`, its citations checked against the inspection receipt it names on this branch. */
+function candidateDiagnosis(skill: string, draft: Partial<CandidateDiagnosis> | undefined, branch: readonly SessionEntry[]): CandidateDiagnosis {
+  const text = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
+  const [inspection, explanation, delta] = [text(draft?.inspection), text(draft?.explanation), text(draft?.delta)];
+  const citations = Array.isArray(draft?.citations) && draft.citations.length > 0 ? draft.citations : undefined;
+  const missing = [
+    !inspection && "`inspection`, the ID of the observer_review inspect call of the skill whose receipt it cites",
+    !explanation && "`explanation`, why current guidance does not already address the finding, with the check that could have shown otherwise and its result",
+    !delta && "`delta`, one sentence on what a future agent will do differently",
+    !citations && "`citations` of the inspected guidance",
+  ].filter((part) => typeof part === "string");
+  if (!inspection || !explanation || !delta || !citations) {
+    throw new Error(`the repair of \`${skill}\` needs its candidate diagnosis ${missing.join("; ")}: inspect the skill with observer_review \`action: "inspect"\` and cite that receipt`);
+  }
+  const receipt = inspectionReceipt(inspection, branch);
+  if (receipt.skill !== skill) throw new Error(`inspection \`${inspection}\` read \`${receipt.skill}\`, not \`${skill}\`: inspect \`${skill}\` and cite that receipt`);
+  return { inspection, explanation, delta, citations: citations.map((citation) => checkedCitation(citation, receipt, inspection)) };
+}
+
+/** The receipt of the successful inspect call `id` on this branch. */
+function inspectionReceipt(id: string, branch: readonly SessionEntry[]): GuidanceInspection {
+  const label = `inspection \`${id}\``;
+  let completed;
+  try {
+    completed = sessionToolEvidence(branch).completedCall(id);
+  } catch {
+    throw new Error(`${label}: this branch holds no completed observer_review call with that ID; inspect the skill and cite that call`);
+  }
+  const { call, result } = completed;
+  if (call.name !== REVIEW_TOOL_NAME || call.args.action !== "inspect") throw new Error(`${label}: that call is not an observer_review inspect`);
+  const inspection = (result.details as { inspection?: GuidanceInspection } | undefined)?.inspection;
+  if (result.isError !== false || !inspection) throw new Error(`${label}: that inspection failed; inspect the skill again`);
+  return inspection;
+}
+
+/** A citation naming a source the receipt lists, at lines or a section present in the version it inspected. */
+function checkedCitation(citation: Partial<Citation> | undefined, receipt: GuidanceInspection, inspection: string): Citation {
+  const source = receipt.sources.find(({ path }) => path === citation?.source);
+  if (!citation || !source) throw new Error(`a citation names \`${citation?.source}\`, which inspection \`${inspection}\` did not read; cite a source path its receipt lists`);
+  const { lines, section } = citation;
+  const label = `the citation of \`${source.path}\``;
+  if (lines === undefined && section === undefined) throw new Error(`${label} needs \`lines\` or a \`section\``);
+  if (lines !== undefined && !(Number.isInteger(lines?.from) && Number.isInteger(lines?.to) && lines.from >= 1 && lines.from <= lines.to && lines.to <= source.lines)) {
+    throw new Error(`${label} gives lines ${lines?.from}–${lines?.to}, but inspection \`${inspection}\` read lines 1–${source.lines}`);
+  }
+  if (section !== undefined && !source.sections.includes(section)) throw new Error(`${label} names section ${JSON.stringify(section)}, which inspection \`${inspection}\` did not read there`);
+  return { source: source.path, ...optional("lines", lines && { from: lines.from, to: lines.to }), ...optional("section", section) };
 }
 
 /** One proposal from two candidates with the same identity: their evidence merged, and for a stale question each answer drafted. */

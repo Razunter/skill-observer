@@ -27,6 +27,7 @@ import type { PatternDraft } from "../src/replay.js";
 import * as amendments from "../src/amendments.js";
 import { type Gate, HOOK_CHECK_PATH, HOOKS_AND_COMPANION_PATH, INSTRUCTIONS_PATH, parseFragments, type ToolResultCondition, toolResultGuidance } from "../src/payload.js";
 import { entries as fx } from "./fixtures.js";
+import { groundRepairs } from "./grounding.js";
 import { CE_PLUGIN, copySkillEntry, installPlugin, makeSkillHome, uninstallPlugin, writeSkill } from "./skill-home.js";
 
 /** The environment `omp` runs under, taken before tests point HOME at a temp skill home; `test/setup.ts` already pointed the agent dir at a temp one. */
@@ -177,6 +178,27 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     return current;
   };
 
+  const callTool = async (name: string, params: unknown, signal?: AbortSignal): Promise<ToolResult<unknown>> => {
+    const tool = tools[name];
+    if (!tool) throw new Error(`${name} is not registered`);
+    const review = params as { action?: unknown; candidates?: unknown } | undefined;
+    if (name === "observer_review" && review?.action === "prepare" && Array.isArray(review.candidates)) {
+      const inspect = async (skill: string) => {
+        const result = await callTool("observer_review", { action: "inspect", skill });
+        return { id: String(branch.at(-1)?.message?.toolCallId), isError: result.isError, details: result.details };
+      };
+      params = { ...review, candidates: await groundRepairs(review.candidates, inspect) };
+    }
+    const id = `${name}-call-${++calls}`;
+    const result = await tool.execute(id, params, signal, undefined, ctx);
+    branch = [...branch,
+      { type: "message", id: `assistant-${id}`, message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: structuredClone(params) as ToolArguments }] } },
+      { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: name, content: result.content,
+        details: structuredClone(result.details) as ToolResultDetails, isError: result.isError ?? false } },
+    ];
+    return result;
+  };
+
   return {
     getBranch: () => branch,
     toolCall: async (toolName: string, input: Record<string, unknown>, toolCallId: string) => {
@@ -199,19 +221,11 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
       if (!command) throw new Error(`/${name} is not registered`);
       await command(args, ctx);
     },
-    /** Runs a registered tool under a fresh call ID, then saves its native call and result on the branch, as OMP does once the call completes. */
-    callTool: async (name: string, params: unknown, signal?: AbortSignal): Promise<ToolResult<unknown>> => {
-      const tool = tools[name];
-      if (!tool) throw new Error(`${name} is not registered`);
-      const id = `${name}-call-${++calls}`;
-      const result = await tool.execute(id, params, signal, undefined, ctx);
-      branch = [...branch,
-        { type: "message", id: `assistant-${id}`, message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: structuredClone(params) as ToolArguments }] } },
-        { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: name, content: result.content,
-          details: structuredClone(result.details) as ToolResultDetails, isError: result.isError ?? false } },
-      ];
-      return result;
-    },
+    /**
+     * Runs a registered tool under a fresh call ID, then saves its native call and result on the branch, as OMP does once the call completes.
+     * A Prepare's skill-text repair drafts are grounded first, as {@link groundRepairs} describes.
+     */
+    callTool,
     ledgerFile: join(skillHome.home, ".omp/agent/skill-observer/ledger.jsonl"),
     observationsFile: join(skillHome.home, ".omp/agent/skill-observer/observations.jsonl"),
     rulesDir: join(skillHome.home, ".omp/agent/rules"),
@@ -1301,7 +1315,7 @@ describe("observer_review prepared proposals", () => {
     expect(entry?.reference.contentHash).toBe(createHash("sha256").update(json).digest("hex"));
     // Pins the hash, with the temp home masked: Prepare keeps amendment sections out of the proposal.
     expect(createHash("sha256").update(json.replaceAll(host.skillHome.home, "<home>")).digest("hex"))
-      .toBe("2a28432a71f68a87a569dfa199446d9be99a8c14222f88f02976b4f5bd111706");
+      .toBe("da916d9e8a3ec0e442f6b9d6e9f5ff64c32a4c0862a5e90a9f619075c18e7f89");
   });
 
   it("returns one Ask form showing each selected proposal's preview whole, escaped and with hidden whitespace marked, with no option preselected", async () => {
@@ -1315,6 +1329,9 @@ describe("observer_review prepared proposals", () => {
       "<form>", "<fieldset>",
       "<legend>`ce-commit-jj` (local): Use &lt;jj&gt; &amp; not git</legend>",
       "<p>Edit the skill</p>",
+      "<p>Diagnosis: The inspected guidance does not cover this; its sections hold no such step.</p>",
+      "<p>Behavior change: A future agent takes the drafted step.</p>",
+      `<p>Cited guidance, inspection observer_review-call-1: ${join(host.skillHome.roots.skillsDir, "ce-commit-jj/SKILL.md")} lines 1–1</p>`,
       "<ul>", '<li>"git commit &lt;again&gt;" (×2, user)</li>', "</ul>",
       `<p>- if (a &lt; b &amp;&amp; c &gt; d)<br>····x··y→<br>a→b c·<br><br>${long}</p>`,
       "<p><b>Apply this change?</b></p>",
@@ -6840,3 +6857,178 @@ describe("observations", () => {
     expect(resultText(result)).toBe("Observation recorded. 2 observations are pending for this project; the user's `/observe` reviews them.");
   });
 });
+
+describe("observer_review inspect and grounded repairs", () => {
+  const GUIDE = "sample-guide";
+  const GUIDE_TEXT = "---\nname: sample-guide\ndescription: Fixture guide.\n---\n\n## Seams\n\nName the seam before the first test.\n";
+  const guideRule: PatternRule = { name: "guide-no-todo", body: "Ask instead of leaving TODO markers.", pattern: "\\bTODO\\b",
+    matches: ["Left a TODO for the naming."], spares: ["Asked about the naming instead."] };
+  const sha256 = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
+  const guidePath = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.roots.skillsDir, GUIDE, "SKILL.md");
+  const guideReferences = (host: ReturnType<typeof loadExtension>) => join(referencesDir(host), GUIDE);
+
+  /** Installs the fixture upstream skill `sample-guide`, tracked in the skills lock. */
+  function installGuide(host: ReturnType<typeof loadExtension>) {
+    mkdirSync(dirname(guidePath(host)), { recursive: true });
+    writeFileSync(guidePath(host), GUIDE_TEXT);
+    setLockHash(host, GUIDE, "fixture-lock-hash");
+  }
+
+  /** Runs the registered inspect action; returns its result and call ID. */
+  async function inspect(host: ReturnType<typeof loadExtension>, params: Record<string, unknown> = {}) {
+    const result = await host.callTool("observer_review", { action: "inspect", skill: GUIDE, ...params });
+    return { result, id: lastCallId(host) };
+  }
+  type Inspection = { skill: string; kind: string; sources: Array<{ role: string; path: string; status: string; sha256: string; lines: number; sections: string[] }>; referenceInventory: Array<{ path: string; sha256: string }> };
+  const inspectionOf = (result: ToolResult<unknown>) => (result.details as { inspection?: Inspection }).inspection;
+
+  it("reports each current guidance source with its status and fingerprint, a stale pin still active, and leaves unrequested references uninspected", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    await addOnReadFix(host, GUIDE, "Name seams.", "## Seam names\n\nName the seam in the test title.");
+    await amend(host, GUIDE, guideRule);
+    changeSkillFile(host, GUIDE);
+    mkdirSync(guideReferences(host), { recursive: true });
+    writeFileSync(join(guideReferences(host), "requested.md"), "## Requested\n\nRequested reference text.\n");
+    writeFileSync(join(guideReferences(host), "unrequested.md"), "Unrequested reference text.\n");
+    const before = observerBytes(host);
+
+    startPass(host);
+    const { result } = await inspect(host, { references: ["requested.md"] });
+
+    expect(result.isError).toBeFalsy();
+    const amendment = join(host.amendmentsDir, `${GUIDE}-amendment.md`);
+    const rule = join(host.rulesDir, "guide-no-todo.md");
+    const requested = join(guideReferences(host), "requested.md");
+    const unrequested = join(guideReferences(host), "unrequested.md");
+    expect(inspectionOf(result)).toEqual({
+      skill: GUIDE, kind: "upstream",
+      sources: expect.arrayContaining([
+        { role: "skill", path: guidePath(host), status: "active", sha256: sha256(guidePath(host)), lines: 9, sections: ["Seams"] },
+        expect.objectContaining({ role: "rule", path: amendment, status: "stale", sha256: sha256(amendment), sections: ["Seam names"] }),
+        expect.objectContaining({ role: "rule", path: rule, status: "stale", sha256: sha256(rule) }),
+        { role: "reference", path: requested, status: "active", sha256: sha256(requested), lines: 3, sections: ["Requested"] },
+      ]),
+      referenceInventory: [{ path: requested, sha256: sha256(requested) }, { path: unrequested, sha256: sha256(unrequested) }],
+    });
+    expect(inspectionOf(result)?.sources).toHaveLength(4);
+    const text = resultText(result);
+    expect(text).toContain("8| Name the seam before the first test.");
+    expect(text).toContain("Name the seam in the test title.");
+    expect(text).toContain("Requested reference text.");
+    expect(text).not.toContain("Unrequested reference text.");
+    expect(text).not.toMatch(/disabled/i);
+    expect(observerBytes(host)).toEqual(before);
+  });
+
+  it("refuses an inspection whose required source is missing, unreadable or malformed instead of returning an empty document", async () => {
+    const cases: Array<[string, (host: ReturnType<typeof loadExtension>) => void, Record<string, unknown>, string]> = [
+      ["an unknown skill", () => {}, { skill: "absent-guide" }, "absent-guide"],
+      ["a missing requested reference", () => {}, { references: ["absent.md"] }, "absent.md"],
+      ["an unreadable skill file", (host) => { rmSync(guidePath(host)); mkdirSync(guidePath(host)); }, {}, "SKILL.md"],
+      ["a skill file without frontmatter", (host) => writeFileSync(guidePath(host), "## Seams\n\nNo frontmatter.\n"), {}, "frontmatter"],
+      ["a malformed on-read amendment", (host) => { mkdirSync(host.amendmentsDir, { recursive: true }); writeFileSync(join(host.amendmentsDir, `${GUIDE}-amendment.md`), "not a rule\n"); }, {}, `${GUIDE}-amendment.md`],
+    ];
+    for (const [label, breakIt, params, named] of cases) {
+      const host = loadExtension();
+      installGuide(host);
+      breakIt(host);
+      startPass(host);
+      const { result } = await inspect(host, params);
+      expect(result.isError, label).toBe(true);
+      expect(inspectionOf(result), label).toBeUndefined();
+      expect(failures(result).join("\n"), label).toContain(named);
+    }
+  });
+
+  it("carries a repair citing its inspection receipt through Prepare, Select, the Ask preview and publication, writing nothing before Apply", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    await addOnReadFix(host, GUIDE, "Name seams.", "## Seam names\n\nName the seam in the test title.");
+    const before = observerBytes(host);
+    const amendment = join(host.amendmentsDir, `${GUIDE}-amendment.md`);
+
+    startPass(host);
+    const { id: inspection } = await inspect(host);
+    const diagnosis = {
+      inspection, explanation: "The guide names seams but says nothing on fixtures; checked its Seams section and the amendment: neither covers fixtures.",
+      delta: "A future agent builds one fixture per seam.",
+      citations: [{ source: guidePath(host), lines: { from: 6, to: 8 } }, { source: amendment, section: "Seam names" }],
+    };
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{
+      ...onReadCandidate({ skill: GUIDE, gist: "One fixture per seam.", section: "## Fixtures\n\nBuild one fixture per seam." }), diagnosis }] });
+    expect(failures(prepared)).toEqual([]);
+    const [entry] = reviewEntries(prepared);
+    expect(entry?.proposal).toMatchObject({ diagnosis });
+    expect(observerBytes(host)).toEqual(before);
+
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+    const selectionToolCallId = lastCallId(host);
+    const { askHtml } = JSON.parse(resultText(selection));
+    expect(askHtml).toContain(escapeHtmlText(diagnosis.explanation));
+    expect(askHtml).toContain(diagnosis.delta);
+    expect(askHtml).toContain(`${guidePath(host)} lines 6–8`);
+    expect(askHtml).toContain(`${amendment} § Seam names`);
+    expect(askHtml.split(diagnosis.delta)).toHaveLength(2);
+    expect(askHtml).not.toContain("Name the seam before the first test.");
+    expect(observerBytes(host)).toEqual(before);
+    expect(readFileSync(guidePath(host), "utf8")).toBe(GUIDE_TEXT);
+
+    const askToolCallId = askUser(host, selection);
+    const { skill, kind, fingerprint, gist } = entry!.proposal;
+    const resolved = await resolve(host, [{ skill, kind, gist, fingerprint, outcome: "applied", approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } }]);
+    expect(failures(resolved)).toEqual([]);
+    expect(readFileSync(amendment, "utf8")).toContain("Build one fixture per seam.");
+    expect(readLedger(host.ledgerFile).at(-1)).toMatchObject({ fingerprint, outcome: "applied" });
+  });
+
+  it("refuses a skill-text repair whose candidate diagnosis lacks its receipt, explanation or behavior delta, naming what is missing", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    writeSkill(join(host.skillHome.roots.skillsDir, "sample-local"), "sample-local");
+    startPass(host);
+    const { id: inspection } = await inspect(host);
+    const complete = { inspection, explanation: "Checked the Seams section: it has no fixture step.", delta: "A future agent builds fixtures per seam.",
+      citations: [{ source: guidePath(host), section: "Seams" }] };
+    const drafts = [
+      onReadCandidate({ skill: GUIDE, gist: "Fixtures per seam.", section: "## Fixtures\n\nOne per seam." }),
+      ruleCandidate({ skill: GUIDE, kind: "upstream", gist: "No TODO markers.", rule: guideRule }),
+      { kind: "local", skill: "sample-local", gist: "Edit the local skill.", priority: "evidence", remedy: "Edit it", change: { operation: "direct-edit", preview: "+ step" } },
+    ];
+    const cases: Array<[unknown, string[]]> = [
+      [undefined, ["inspection", "explanation", "delta"]],
+      [{ ...complete, inspection: undefined }, ["inspection"]],
+      [{ ...complete, explanation: " " }, ["explanation"]],
+      [{ ...complete, delta: undefined }, ["delta"]],
+    ];
+    for (const draft of drafts) {
+      for (const [diagnosis, missing] of cases) {
+        const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...draft, diagnosis }] });
+        expect(prepared.isError).toBe(true);
+        expect(reviewEntries(prepared)).toEqual([]);
+        const reason = failures(prepared).join("\n");
+        for (const name of missing) expect(reason).toContain(`\`${name}\``);
+      }
+    }
+    const outOfRange = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...drafts[0], diagnosis: { ...complete, citations: [{ source: guidePath(host), lines: { from: 1, to: 99 } }] } }] });
+    expect(failures(outOfRange).join("\n")).toContain("lines 1–99");
+  });
+
+  it("prepares project, harness and new-skill proposals without inspection evidence", async () => {
+    const host = loadExtension();
+    writeFileSync(join(host.skillHome.roots.cwd, "AGENTS.md"), "Guidance.\n");
+    startPass(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
+      { kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path: "AGENTS.md", mechanism: "navigation" }, gist: "Point at the check.",
+        priority: "evidence", remedy: "Add a pointer", change: { operation: "direct-edit", preview: "+ Run bun run check." } },
+      { kind: "new", skill: "sample-new", gist: "Capture the workflow.", priority: "evidence", remedy: "New skill", change: { operation: "direct-edit", preview: "name: sample-new" } },
+    ] });
+    expect(failures(prepared)).toEqual([]);
+    expect(reviewEntries(prepared).map(({ proposal }) => proposal)).toEqual([
+      expect.not.objectContaining({ diagnosis: expect.anything() }), expect.not.objectContaining({ diagnosis: expect.anything() }),
+    ]);
+    expect(host.getBranch().some((entry) => entry.message?.role === "assistant" && JSON.stringify(entry.message.content).includes('"inspect"'))).toBe(false);
+  });
+});
+
+const escapeHtmlText = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

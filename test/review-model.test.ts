@@ -11,7 +11,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 const schema: Schema = { optional: () => schema, describe: () => schema };
 const model = { provider: "fixture", id: "explicit-judge" };
 const candidate = (gist: string, quote: string, count: number, remedy = "Other fix") =>
-  ({ kind: "local", skill: "test", gist, priority: "evidence", remedy, change: { operation: "direct-edit", preview: `Exact ${gist} diff` }, evidence: [{ quote, count }] });
+  ({ kind: "new", skill: "test", gist, priority: "evidence", remedy, change: { operation: "direct-edit", preview: `Exact ${gist} diff` }, evidence: [{ quote, count }] });
 const candidates = [
   candidate("Weak", "Weak support", 1, "Fix weak"),
   candidate("Strong", "Strong support", 4, "Fix strong"),

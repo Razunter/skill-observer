@@ -15,6 +15,7 @@ import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
 import { remedyOutcomes } from "../src/outcomes.js";
 import { INSTRUCTIONS_PATH, toolResultGuidance } from "../src/payload.js";
 import { createProvenanceResolver, skillHash } from "../src/provenance.js";
+import { groundRepairs } from "./grounding.js";
 import { makeSkillHome } from "./skill-home.js";
 
 const renameFault = vi.hoisted(() => ({ check: undefined as ((from: PathLike, to: PathLike) => void) | undefined }));
@@ -81,7 +82,8 @@ function fixture() {
    * each selected proposal's approval, in selection order.
    */
   const approve = async (candidates: unknown[], select = "Apply") => {
-    const prepared = await call("observer_review", { action: "prepare", candidates });
+    const grounded = await groundRepairs(candidates, (skill) => call("observer_review", { action: "inspect", skill }));
+    const prepared = await call("observer_review", { action: "prepare", candidates: grounded });
     if (prepared.isError) throw new Error(prepared.details.failures.join("; "));
     const selection = await call("observer_review", { action: "select", proposals: (prepared.details as unknown as { eligible: Selected[] }).eligible.map((entry) => entry.reference) });
     const { askHtml } = JSON.parse(selection.content[0]!.text) as { askHtml: string };

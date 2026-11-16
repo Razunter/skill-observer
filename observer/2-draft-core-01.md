@@ -1,3 +1,5 @@
 ## 2. Draft
 
 Skill, rule and agent-guidance drafts follow `skill://writing-for-agents`: read it before drafting those texts, then apply its no-op and negation tests. If unavailable, say so and delete instructions the agent would obey untold; state the positive behavior, keeping prohibitions only as hard guardrails. Project code/configuration repairs follow the target's existing conventions.
+
+**Inspect before a skill-text repair.** Before drafting an edit to an installed local or managed skill, an on-read fix or a barrier rule, call `observer_review` with `action: "inspect"`, the `skill` and, in `references`, the reference files of its on-read amendment the finding touches. It returns the skill file, every rule amending it (a `stale` one is still in force) and those reference files, numbered by line. Drop the candidate when that guidance or an existing rule or check already covers the finding. Otherwise decide whether the guidance is missing, unclear or ignored, and name the check that could prove you wrong and its result. A failed inspection grounds no repair: report its reason instead.
