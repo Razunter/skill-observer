@@ -324,7 +324,8 @@ export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry
     const latest = scope.findLast(({ catalog }) => catalog.promptIndex <= point);
     const latestIndex = latest?.catalog.index ?? -1;
     gaps = gaps.filter(({ after, through }) => after < point && through > latestIndex);
-    scope = latest ? [{ catalog: latest.catalog, end: Math.min(latest.end, point + 1) }] : [];
+    // Only the next prompt's notices can lie between this observation's scope and the point, and they were in context there.
+    scope = latest ? [{ catalog: latest.catalog, end: point + 1 }] : [];
   }
   const describes = (match: CatalogMatch) => terms.every((term) => match.description?.toLowerCase().includes(term));
   const all = scope.flatMap(({ catalog, end }) => (name ? [name] : skillNames(branch, catalog, end))

@@ -7798,8 +7798,8 @@ async function observeCatalog(host: ReturnType<typeof loadExtension>, skills: Re
 const catalogEntries = (host: ReturnType<typeof loadExtension>) =>
   host.getBranch().filter((entry) => entry.type === "custom" && entry.customType?.startsWith("skill-observer-catalog"));
 
-async function lookUp(host: ReturnType<typeof loadExtension>, skill: string) {
-  const result = await host.callTool("observer_review", { action: "catalog", skill });
+async function lookUp(host: ReturnType<typeof loadExtension>, skill: string, at?: string) {
+  const result = await host.callTool("observer_review", { action: "catalog", skill, ...(at !== undefined && { at }) });
   const { catalog } = result.details as { catalog: { matches: Array<Record<string, unknown>>; gaps: string[] } };
   return { result, text: resultText(result), matches: catalog.matches, gaps: catalog.gaps };
 }
@@ -7942,8 +7942,8 @@ describe("qualified skill catalog capture", () => {
   const compaction = (id: string, firstKeptEntryId: string, extra: Record<string, unknown> = {}) =>
     ({ type: "compaction", id, firstKeptEntryId, summary: "Earlier work.", ...extra }) as SessionEntry;
   const append = (host: Host, ...entries: SessionEntry[]) => host.setBranch([...host.getBranch(), ...entries]);
-  const states = async (host: Host, skill: string) =>
-    (await lookUp(host, skill)).matches.map(({ at, via, status, description }) => ({ at, via, status, ...(description !== undefined && { description }) }));
+  const states = async (host: Host, skill: string, at?: string) =>
+    (await lookUp(host, skill, at)).matches.map(({ at, via, status, description }) => ({ at, via, status, ...(description !== undefined && { description }) }));
 
   it("preserves a custom-prompt skills block's descriptions as rendered, including host shortening", async () => {
     const host = loadExtension();
@@ -8020,6 +8020,13 @@ describe("qualified skill catalog capture", () => {
       { at: "user-1", via: "catalog", status: "not-listed" },
       { at: "notice-0", via: "skill-notice", status: "listed", description: NOTES[1] },
       { at: second, via: "catalog", status: "not-listed" },
+      { at: "notice-1", via: "skill-notice", status: "not-listed" },
+    ]);
+    // A point lookup resolves to the latest observation made at or before it, so the addition saved before the first prompt has none.
+    expect(await states(host, NOTES[0], "notice-0")).toEqual([]);
+    expect(await states(host, NOTES[0], "notice-1")).toEqual([
+      { at: "user-1", via: "catalog", status: "not-listed" },
+      { at: "notice-0", via: "skill-notice", status: "listed", description: NOTES[1] },
       { at: "notice-1", via: "skill-notice", status: "not-listed" },
     ]);
   });
