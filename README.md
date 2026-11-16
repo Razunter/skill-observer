@@ -4,7 +4,7 @@ An [OMP](https://github.com/can1357/oh-my-pi) extension for adjusting upstream s
 
 Your adjustments live in separate **amendments** that survive skill updates. The extension delivers them when you invoke `/skill:<name>` or the agent reads the skill's `SKILL.md`.
 
-Run `/observe` to review session corrections and proposed fixes. After an upstream skill changes, the next `/observe` checks whether its amendments still apply. It can also propose local skill improvements and project checks. Every skill-text fix must cite an inspection of the skill's current guidance, and a new skill a search of existing ones. To diagnose a skill the agent may have missed, the extension notes which skills the system prompt listed at each prompt, kept in the session only. As a last resort, it writes a hook or changes one companion extension after two approvals, and it reports problems in other extensions instead of editing them.
+Run `/observe` to review session corrections and proposed fixes. After an upstream skill changes, the next `/observe` checks whether its amendments still apply. It can also propose local skill improvements and project checks. Every skill-text fix must cite an inspection of the skill's current guidance, and every new skill must cite a search of existing ones. To diagnose a skill the agent may have missed, the extension records in the session which skills the system prompt listed at each prompt. As a last resort, it writes a hook or changes one companion extension after two approvals, and it reports problems in other extensions instead of editing them.
 
 **Status:** vibe-coded experiment.
 

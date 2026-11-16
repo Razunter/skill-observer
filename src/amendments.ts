@@ -164,8 +164,8 @@ export function readObserverRules(dirs: RuleDirs): ObserverRule[] {
 }
 
 /**
- * The rules this extension wrote that amend `skill`, for an inspection, which
- * must not pass over one: a missing directory holds none, but a directory that
+ * The rules this extension wrote that amend `skill`, read for an inspection,
+ * which must not miss one. A missing directory holds none; a directory that
  * can't be listed, or a file marked as ours for `skill` whose frontmatter
  * can't be read, throws.
  */

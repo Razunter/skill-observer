@@ -4,7 +4,7 @@
  * form, when `before_agent_start` saw it, kept in non-model custom entries for
  * missed-trigger diagnosis. A definition holds each distinct catalog once per
  * session; a binding marks where a branch observed it. Lookup applies OMP's
- * own persisted skill notices on top without copying them. An observation is
+ * persisted skill notices after an observation without copying them. An observation is
  * the hook's view, never proof of what the model received: a later handler or
  * provider hook may change the request.
  */

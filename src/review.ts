@@ -487,7 +487,7 @@ function guidanceReceipt(skill: unknown, requested: unknown, { dirs, referencesD
   const rules = readSkillRules(dirs, skill);
   const amendmentFile = join(dirs.amendmentsDir, `${skillAmendmentName(skill)}.md`);
   if (existsSync(amendmentFile) && !rules.some((rule) => rule.path === amendmentFile)) {
-    throw new Error(`\`${amendmentFile}\` is no on-read amendment skill-observer can read: its frontmatter is missing, malformed or another author's`);
+    throw new Error(`\`${amendmentFile}\` is not an on-read amendment skill-observer can read: its frontmatter is missing, malformed or another author's`);
   }
   const pin = rules.some(isPinned) ? skillHash(installed) : undefined;
   for (const rule of rules) read.push(guidanceSource("rule", rule.path, isPinned(rule) && rule.skillHash !== pin ? "stale" : "active", readGuidance(rule.path)));
