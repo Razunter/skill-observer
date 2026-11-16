@@ -235,7 +235,7 @@ interface PrepareContext extends ReceiptContext {
 }
 
 /** The model uses installed host judge helpers between Prepare and Select; this tool never calls a provider. */
-export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catalogGap: () => string | undefined): void {
+export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catalogGap: (branch: readonly SessionEntry[]) => string | undefined): void {
   const z = pi.zod;
   const referenceFiles = z.array(z.object({ name: z.string(), body: z.string() }));
   const change = z.union([
@@ -318,7 +318,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
     }),
     async execute(toolCallId, params, signal, _update, ctx) {
       signal?.throwIfAborted();
-      if (params?.action === "inspect" || params?.action === "catalog") return readOnlyActionResult(params, files, ctx, catalogGap());
+      if (params?.action === "inspect" || params?.action === "catalog") return readOnlyActionResult(params, files, ctx, catalogGap(ctx.sessionManager.getBranch()));
       const details = emptyDetails();
       const amendmentSections = new Map<string, string[]>();
       try {

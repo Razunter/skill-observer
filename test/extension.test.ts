@@ -8236,7 +8236,7 @@ describe("catalog history across the session tree", () => {
     expect((await lookUp(lacking, SEAMS[0])).matches).toEqual([expect.objectContaining({ status: "listed", observedAt: next })]);
   });
 
-  it.each(["session_switch", "session_branch", "session_tree"])("leaks no staged observation or capture gap across %s", async (event) => {
+  it.each(["session_switch", "session_branch", "session_tree"])("leaks no staged observation, nor a capture gap onto another branch, across %s", async (event) => {
     const host = loadExtension();
     await observeCatalog(host, [SEAMS]);
     host.failAppend(new Error("disk full"));
@@ -8250,6 +8250,31 @@ describe("catalog history across the session tree", () => {
     expect(await lookUp(host, SEAMS[0])).toMatchObject({ matches: [], gaps: [] });
     await host.runCommand("observe-report");
     expect(host.notices.at(-1)).not.toContain("disk full");
+  });
+
+  it.each([["session_branch", true], ["session_tree", true], ["session_switch", false]] as const)("after %s away and back, keeps the capture gap of the failed prompt's branch: %s", async (event, kept) => {
+    const host = loadExtension();
+    host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage, ...fx.skillUrlRead]);
+    await observeCatalog(host, [SEAMS]);
+    const fork = host.getBranch();
+    host.failAppend(new Error("disk full"));
+    await observeCatalog(host, [SEAMS, NOTES]);
+    const failed = host.getBranch();
+    host.setBranch([...fork, reply("sibling-reply")]);
+    await host.emit(event);
+    expect((await lookUp(host, SEAMS[0])).gaps).toEqual([]);
+
+    host.setBranch(failed);
+    await host.emit(event);
+    expect((await lookUp(host, SEAMS[0])).gaps).toEqual(kept ? [expect.stringContaining("disk full")] : []);
+    await observeCatalog(host, [SEAMS]);
+    if (!kept) {
+      expect(catalogEntries(host)).toHaveLength(2);
+      return;
+    }
+    expect(catalogEntries(host).at(-1)).toMatchObject({ customType: "skill-observer-catalog-binding", data: { afterGap: expect.stringContaining("disk full") } });
+    await host.runCommand("observe");
+    expect(String(host.sent.at(-1)?.message.content)).toMatch(/## Skill catalog observations[\s\S]*capture failed[^\n]*disk full/);
   });
 
   it("reports unknown, with no durability claim, when appended entries are missing after a restore", async () => {

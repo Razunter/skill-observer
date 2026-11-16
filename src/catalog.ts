@@ -111,29 +111,40 @@ const errorText = (error: unknown) => (error instanceof Error ? error.message : 
  * Stages the main agent's catalog at `before_agent_start` and records it once
  * that prompt's user message is on the branch: OMP may discard or re-run a
  * preparation, and a re-run replaces the staged one. Never changes the prompt,
- * returns a result or lets a failure reach the user's work. Returns the
- * observable capture failure since the branch's last recorded observation,
- * which the next observation records and is bound for even when unchanged.
+ * returns a result or lets a failure reach the user's work. Returns, for a
+ * branch, the observable capture failure since its last recorded observation,
+ * which the next observation there records and is bound for even when
+ * unchanged.
  */
-export function registerCatalogCapture(pi: ExtensionAPI, isObservable: (ctx: ExtensionContext) => boolean): () => string | undefined {
+export function registerCatalogCapture(pi: ExtensionAPI, isObservable: (ctx: ExtensionContext) => boolean): (branch: readonly SessionEntry[]) => string | undefined {
   let staged: { definition: CatalogDefinition; prompt: string; after: string | undefined } | undefined;
-  let gap: string | undefined;
+  // Each failure applies to the branches holding its anchor: the failed prompt's entry, else the branch tip when it failed.
+  let gaps: Array<{ anchor: string | undefined; text: string }> = [];
+  const gapsOn = (branch: readonly SessionEntry[]) => {
+    const ids = new Set(branch.map(({ id }) => id));
+    return gaps.filter(({ anchor }) => anchor === undefined || ids.has(anchor));
+  };
   pi.on("before_agent_start", (event, ctx) => {
     staged = undefined;
+    let after: string | undefined;
     try {
       // A revived subagent fires this hook too; its catalog is not the main agent's.
       if (event.reason === "revive" || !event.systemPrompt || !isObservable(ctx)) return;
-      staged = { definition: catalogDefinition(event.systemPrompt), prompt: event.prompt, after: ctx.sessionManager.getBranch().at(-1)?.id };
+      after = ctx.sessionManager.getBranch().at(-1)?.id;
+      staged = { definition: catalogDefinition(event.systemPrompt), prompt: event.prompt, after };
     } catch (error) {
-      gap = `capture failed while staging a prompt's catalog: ${errorText(error)}`;
+      // shortcut: anchored before the prompt's user message exists, so a sibling forked at that tip shares the gap; anchor it to the prompt's entry if that misleads.
+      gaps.push({ anchor: after, text: `capture failed while staging a prompt's catalog: ${errorText(error)}` });
       console.error("skill-observer: staging the skill catalog failed:", error);
     }
   });
   pi.on("message_end", (_event, ctx) => {
     if (!staged) return;
+    let anchor: string | undefined;
     let observedAt: string | undefined;
     try {
       const branch = ctx.sessionManager.getBranch();
+      anchor = branch.at(-1)?.id;
       const afterIndex = staged.after === undefined ? -1 : branch.findIndex((entry) => entry.id === staged!.after);
       if (staged.after !== undefined && afterIndex < 0) {
         staged = undefined;
@@ -142,30 +153,31 @@ export function registerCatalogCapture(pi: ExtensionAPI, isObservable: (ctx: Ext
       // Tied to its prompt's text, so a user message from another attempt never takes a discarded preparation.
       const prompt = branch.slice(afterIndex + 1).find((entry) => isPromptMessage(entry, staged!.prompt));
       if (!prompt?.id) return;
-      observedAt = prompt.id;
+      observedAt = anchor = prompt.id;
       const { definition } = staged;
       staged = undefined;
       const { bound, definitions } = catalogBindings(branch);
       const latest = bound.at(-1);
+      const recovered = gapsOn(branch);
+      const gap = recovered.at(-1)?.text;
       // After a /clear OMP rebuilds the system prompt, so the next observation is bound again even when unchanged.
       const cleared = branch.findLastIndex((entry) => entry.type === "reset_boundary") > (latest?.index ?? -1);
       if (!gap && !cleared && latest?.binding.catalogId === definition.catalogId) return;
       if (!definitions.has(definition.catalogId)) pi.appendEntry(CATALOG_DEFINITION_TYPE, definition);
       pi.appendEntry(CATALOG_BINDING_TYPE, { catalogId: definition.catalogId, observedAt, boundary: "before_agent_start", ...(gap && { afterGap: gap }) } satisfies CatalogBinding);
-      gap = undefined;
+      gaps = gaps.filter((pending) => !recovered.includes(pending));
     } catch (error) {
       staged = undefined;
-      gap = `capture failed while recording the catalog${observedAt ? ` for the prompt at entry \`${observedAt}\`` : ""}: ${errorText(error)}`;
+      gaps.push({ anchor, text: `capture failed while recording the catalog${observedAt ? ` for the prompt at entry \`${observedAt}\`` : ""}: ${errorText(error)}` });
       console.error("skill-observer: recording the skill catalog failed:", error);
     }
   });
-  for (const event of ["session_switch", "session_branch", "session_tree"] as const) {
-    pi.on(event, () => {
-      staged = undefined;
-      gap = undefined;
-    });
-  }
-  return () => gap;
+  for (const event of ["session_branch", "session_tree"] as const) pi.on(event, () => { staged = undefined; });
+  pi.on("session_switch", () => {
+    staged = undefined;
+    gaps = [];
+  });
+  return (branch) => gapsOn(branch).at(-1)?.text;
 }
 
 /**
