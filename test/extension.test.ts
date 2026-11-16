@@ -2015,7 +2015,7 @@ describe("observer_resolve", () => {
     const host = loadExtension();
     const result = await host.callTool("observer_resolve", {
       outcomes: [
-        outcome("grill-with-docs", "local", "Ask one question at a time.", "applied"),
+        outcome("ce-commit-jj", "local", "Ask one question at a time.", "applied"),
         outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later"),
         outcome("deploy-notes", "new", "Draft release notes from the jj log.", "declined"),
       ],
@@ -2033,7 +2033,7 @@ describe("observer_resolve", () => {
         sessionId: "fixture-session",
       });
     expect(ledgerRecords(host.ledgerFile)).toEqual([
-      record("grill-with-docs", "local", "applied"),
+      record("ce-commit-jj", "local", "applied"),
       record("implement-spec", "managed", "later"),
       record("deploy-notes", "new", "declined"),
     ]);
@@ -2043,11 +2043,11 @@ describe("observer_resolve", () => {
     const host = loadExtension();
     await host.callTool("observer_resolve", {
       outcomes: [
-        outcome("tdd", "local", "Re-run the seam's test first.", "later"),
-        outcome("tdd", "local", "re-run  the seam's test, FIRST", "later"),
-        outcome("tdd", "local", "Rerun the seams test first", "later"),
-        outcome("grill-with-docs", "local", "Re-run the seam's test first.", "later"),
-        outcome("tdd", "local", "Re-run the seam's test last.", "later"),
+        outcome("tdd", "upstream", "Re-run the seam's test first.", "later"),
+        outcome("tdd", "upstream", "re-run  the seam's test, FIRST", "later"),
+        outcome("tdd", "upstream", "Rerun the seams test first", "later"),
+        outcome("grill-with-docs", "upstream", "Re-run the seam's test first.", "later"),
+        outcome("tdd", "upstream", "Re-run the seam's test last.", "later"),
       ],
     });
 
@@ -2067,7 +2067,7 @@ describe("observer_resolve", () => {
     const result = await host.callTool("observer_resolve", {
       outcomes: [
         { ...outcome("tdd", "upstream", "Run the one failing test first.", "later"), evidence },
-        outcome("grill-with-docs", "local", "Ask one question at a time.", "declined"),
+        outcome("grill-with-docs", "upstream", "Ask one question at a time.", "declined"),
       ],
     });
 
@@ -2085,14 +2085,14 @@ describe("observer_resolve", () => {
     await host.callTool("observer_resolve", {
       outcomes: [
         { ...outcome("tdd", "upstream", "Run the one failing test first.", "later"), evidence: earlier },
-        { ...outcome("grill-with-docs", "local", "Ask one question at a time.", "later"), evidence: earlier },
+        { ...outcome("grill-with-docs", "upstream", "Ask one question at a time.", "later"), evidence: earlier },
       ],
     });
     const [tdd, grill] = ledgerRecords(host.ledgerFile);
     await host.callTool("observer_resolve", {
       outcomes: [
         { ...outcome("tdd", "upstream", "Run the one failing test first.", "declined"), fingerprint: tdd?.fingerprint },
-        { ...outcome("grill-with-docs", "local", "Ask one question at a time.", "declined"), fingerprint: grill?.fingerprint, evidence: fresh },
+        { ...outcome("grill-with-docs", "upstream", "Ask one question at a time.", "declined"), fingerprint: grill?.fingerprint, evidence: fresh },
       ],
     });
 
@@ -3293,13 +3293,13 @@ describe("/observe with answers from earlier passes", () => {
     const host = loadExtension();
     await host.callTool("observer_resolve", {
       outcomes: [
-        outcome("tdd", "local", "Name the seam before the first test.", "declined"),
+        outcome("tdd", "upstream", "Name the seam before the first test.", "declined"),
         outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later"),
       ],
     });
     await host.callTool("observer_resolve", {
       outcomes: [
-        outcome("tdd", "local", "Name the seam before the first test.", "later"),
+        outcome("tdd", "upstream", "Name the seam before the first test.", "later"),
         outcome("implement-spec", "managed", "Run the typecheck before each commit.", "applied"),
       ],
     });
@@ -3565,14 +3565,14 @@ describe("observer_resolve with upstream fixes", () => {
     writeFileSync(foreign, "---\ncondition: \"x\"\n---\n\nThe user's own rule.\n");
 
     const result = await host.callTool("observer_resolve", {
-      outcomes: [fix, outcome("grill-with-docs", "local", "Ask one question at a time.", "applied")],
+      outcomes: [fix, outcome("ce-commit-jj", "local", "Ask one question at a time.", "applied")],
     });
 
     expect(readFileSync(foreign, "utf8")).toBe("---\ncondition: \"x\"\n---\n\nThe user's own rule.\n");
     expect(rulesWritten(host)).toEqual(["tdd-amendment.md"]);
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain(foreign);
-    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ skill: "grill-with-docs" })]);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ skill: "ce-commit-jj" })]);
   });
 
   it("prepares no pattern amendment under the name of another skill's on-read amendment", async () => {
@@ -6357,7 +6357,7 @@ describe("re-offer conditions on Later entries", () => {
     const result = await resolve(host, [
       { ...outcome("tdd", "upstream", "Run the one failing test first.", "later"), reoffer },
       { ...projectLater(root), reoffer },
-      outcome("grill-with-docs", "local", "Ask one question at a time.", "later"),
+      outcome("grill-with-docs", "upstream", "Ask one question at a time.", "later"),
     ]);
     expect(failures(result)).toEqual([]);
     const byGist = new Map(ledgerRecords(host.ledgerFile).map((record) => [record.gist, record]));
@@ -6376,7 +6376,7 @@ describe("re-offer conditions on Later entries", () => {
     const host = loadExtension();
     const result = await resolve(host, [
       { ...outcome("implement-spec", "managed", "Run the typecheck before each commit.", "applied"), reoffer },
-      { ...outcome("grill-with-docs", "local", "Ask one question at a time.", "declined"), reoffer },
+      { ...outcome("grill-with-docs", "upstream", "Ask one question at a time.", "declined"), reoffer },
     ]);
     expect(failures(result)).toEqual([]);
     const records = ledgerRecords(host.ledgerFile);
@@ -7332,6 +7332,23 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(readLedger(host.ledgerFile)).toEqual([]);
     expect(observerBytes(host)).toEqual(before);
     expect(readFileSync(guidePath(host), "utf8")).toBe(GUIDE_TEXT);
+  });
+
+  it("records no uncited answer that labels an installed upstream or plugin skill with another kind", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    for (const [skill, kind] of [[GUIDE, "local"], [GUIDE, "managed"], ["ce-code-review", "local"], ["ce-code-review", "managed"]] as const) {
+      for (const outcome of ["applied", "declined", "later"] as const) {
+        const label = `${skill} as ${kind}, ${outcome}`;
+        const recorded = await resolve(host, [{ skill, kind, gist: "Name the request in the description.", outcome }]);
+        expect(recorded.isError, label).toBe(true);
+        expect(failures(recorded).join("\n"), label).toMatch(/installed as an? (upstream|plugin) skill/);
+      }
+    }
+    expect(readLedger(host.ledgerFile)).toEqual([]);
+    const declined = await resolve(host, [{ skill: GUIDE, kind: "upstream", gist: "Name the request in the description.", outcome: "declined" }]);
+    expect(failures(declined)).toEqual([]);
+    expect(readLedger(host.ledgerFile)).toEqual([expect.objectContaining({ skill: GUIDE, kind: "upstream", outcome: "declined" })]);
   });
 
   it("asks about a local or managed description fix with its inspection-backed diagnosis and disclosed uncertainty, and records it once applied", async () => {

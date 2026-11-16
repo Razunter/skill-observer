@@ -382,6 +382,10 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           if ("target" in answer || "publication" in answer || latest.get(answer.fingerprint ?? "")?.target !== undefined) {
             throw new Error("a project or harness identity cannot be submitted as a global skill answer");
           }
+          const installed = sent.proposal === undefined && sent.approval === undefined && answer.kind !== "new" ? provenance.byName(answer.skill).kind : "unknown";
+          if (installed !== "unknown" && installed !== answer.kind) {
+            throw new Error(`\`${answer.skill}\` is installed as ${installed === "upstream" ? "an" : "a"} ${installed} skill, not ${answer.kind}: answer it as the ${installed} skill it is`);
+          }
           const withdraws = answer.outcome === "withdrawn";
           laterReoffer(answer); // refuses a blank `reoffer` before anything is written
           if ((answer.outcome === "applied" || withdraws) && "rule" in answer) {
