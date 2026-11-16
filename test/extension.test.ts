@@ -6973,6 +6973,40 @@ describe("observer_review inspect and grounded repairs", () => {
     }
   });
 
+  it("refuses an inspection whose existing rules or amendments directory can't be listed, or whose associated rule is malformed, but reads none when the directories are missing", async () => {
+    const missing = loadExtension();
+    installGuide(missing);
+    startPass(missing);
+    expect(existsSync(missing.rulesDir) || existsSync(missing.amendmentsDir)).toBe(false);
+    expect((await inspect(missing)).result.isError).toBeFalsy();
+
+    for (const dir of ["rulesDir", "amendmentsDir"] as const) {
+      const host = loadExtension();
+      installGuide(host);
+      mkdirSync(host[dir], { recursive: true });
+      chmodSync(host[dir], 0o000);
+      try {
+        startPass(host);
+        const { result } = await inspect(host);
+        expect(result.isError, dir).toBe(true);
+        expect(failures(result).join("\n"), dir).toContain(host[dir]);
+      } finally {
+        chmodSync(host[dir], 0o755);
+      }
+    }
+
+    const malformed = loadExtension();
+    installGuide(malformed);
+    mkdirSync(malformed.rulesDir, { recursive: true });
+    writeFileSync(join(malformed.rulesDir, "guide-broken.md"), `---\ngeneratedBy: skill-observer\namends: ${GUIDE}\ndescription: Never closed.\n`);
+    writeFileSync(join(malformed.rulesDir, "hand-written.md"), "Someone else's notes.\n");
+    startPass(malformed);
+    const { result } = await inspect(malformed);
+    expect(result.isError).toBe(true);
+    expect(failures(result).join("\n")).toContain("guide-broken.md");
+    expect(failures(result).join("\n")).not.toContain("hand-written.md");
+  });
+
   it("carries a repair citing its inspection receipt through Prepare, Select, the Ask preview and publication, writing nothing before Apply", async () => {
     const host = loadExtension();
     installGuide(host);

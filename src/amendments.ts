@@ -163,6 +163,33 @@ export function readObserverRules(dirs: RuleDirs): ObserverRule[] {
   return [...rulesIn(dirs.rulesDir), ...rulesIn(dirs.amendmentsDir)];
 }
 
+/**
+ * The rules this extension wrote that amend `skill`, for an inspection, which
+ * must not pass over one: a missing directory holds none, but a directory that
+ * can't be listed, or a file marked as ours for `skill` whose frontmatter
+ * can't be read, throws.
+ */
+export function readSkillRules(dirs: RuleDirs, skill: string): ObserverRule[] {
+  const claimsSkill = (text: string) =>
+    [["generatedBy", MARKER], ["amends", skill]].every(([key, value]) => text.split(/\r?\n/).some((line) => line.trim().replace(/["']/g, "") === `${key}: ${value}`));
+  return [dirs.rulesDir, dirs.amendmentsDir].flatMap((dir) => {
+    if (!existsSync(dir)) return [];
+    let files: string[];
+    try {
+      files = readdirSync(dir).filter((file) => file.endsWith(".md")).sort();
+    } catch (error) {
+      throw new Error(`\`${dir}\` could not be listed: ${(error as Error).message}`);
+    }
+    return files.flatMap((file) => {
+      const path = join(dir, file);
+      const rule = readOwnRule(path, file.slice(0, -".md".length));
+      if (rule) return rule.amends === skill ? [rule] : [];
+      if (claimsSkill(readFileSync(path, "utf8"))) throw new Error(`\`${path}\` is marked as skill-observer's rule for \`${skill}\`, but its frontmatter can't be read`);
+      return [];
+    });
+  });
+}
+
 /** A rule the user wrote by hand: a rule file without this extension's marker. */
 export interface HandWrittenRule {
   name: string;

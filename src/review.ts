@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, join, sep } from "node:path";
 import {
-  compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, parseFrontmatter, readObserverRule, readObserverRules, readOnReadAmendments,
+  compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, parseFrontmatter, readObserverRule, readOnReadAmendments, readSkillRules,
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
@@ -484,7 +484,7 @@ function guidanceReceipt(skill: unknown, requested: unknown, { dirs, referencesD
   if (!parseFrontmatter(skillBytes.toString("utf8"))) throw new Error(`\`${installed.path}\` has no frontmatter block, so its guidance can't be read as a skill`);
   read.push(guidanceSource("skill", installed.path, "active", skillBytes));
 
-  const rules = readObserverRules(dirs).filter((rule) => rule.amends === skill);
+  const rules = readSkillRules(dirs, skill);
   const amendmentFile = join(dirs.amendmentsDir, `${skillAmendmentName(skill)}.md`);
   if (existsSync(amendmentFile) && !rules.some((rule) => rule.path === amendmentFile)) {
     throw new Error(`\`${amendmentFile}\` is no on-read amendment skill-observer can read: its frontmatter is missing, malformed or another author's`);
