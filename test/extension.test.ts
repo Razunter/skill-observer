@@ -145,7 +145,6 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     for (const handler of handlers[event] ?? []) await handler({ type: event }, ctx);
   };
 
-  /** What each `before_agent_start` handler returned on the latest `startAgent`. */
   let startResults: unknown[] = [];
 
   /** Runs `before_agent_start` for a submitted prompt and returns the messages the handlers add to it. */
@@ -227,9 +226,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
       branch = skillHome.relocate(entries);
     },
     endTurn: () => emit("agent_end"),
-    /** Registers another extension's handler after this one's, as a later-loaded extension would. */
     on: pi.on,
-    /** Makes the next `appendEntry` throw `error`, as an observable persistence failure. */
     failAppend: (error: Error) => { appendFailures.push(error); },
     emit,
     startAgent,
@@ -1333,15 +1330,22 @@ describe("observer_review prepared proposals", () => {
     const host = loadExtension();
     await addOnReadFix(host, "tdd", "Name the seam first.", SEAMS);
     startPass(host);
+    const inspected = await host.callTool("observer_review", { action: "inspect", skill: "tdd" });
+    const [source] = (inspected.details as { inspection: { sources: Array<{ path: string }> } }).inspection.sources;
+    const diagnosis = {
+      inspection: lastCallId(host), explanation: "The inspected guidance names no first step.", delta: "A future agent takes the first step.",
+      citations: [{ source: source!.path, lines: { from: 1, to: 1 } }],
+    };
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
-      { ...onReadCandidate({ gist: "First", section: "## First\n\nText for First." }), evidence: [{ quote: "First", count: 2, source: "signal for First" }] },
+      { ...onReadCandidate({ gist: "First", section: "## First\n\nText for First." }), evidence: [{ quote: "First", count: 2, source: "signal for First" }], diagnosis },
     ] });
     const [entry] = reviewEntries(prepared);
     const json = JSON.stringify(entry?.proposal);
     expect(entry?.reference.contentHash).toBe(createHash("sha256").update(json).digest("hex"));
+    expect(json).not.toContain("Seams");
     // Pins the hash, with the temp home masked: Prepare keeps amendment sections out of the proposal.
     expect(createHash("sha256").update(json.replaceAll(host.skillHome.home, "<home>")).digest("hex"))
-      .toBe("da916d9e8a3ec0e442f6b9d6e9f5ff64c32a4c0862a5e90a9f619075c18e7f89");
+      .toBe("3e72a9cf4d3594e1e03b1cd80a36740037905b977ba53865ff32a622d9f2560a");
   });
 
   it("returns one Ask form showing each selected proposal's preview whole, escaped and with hidden whitespace marked, with no option preselected", async () => {
@@ -6897,14 +6901,12 @@ describe("observer_review inspect and grounded repairs", () => {
   const guidePath = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.roots.skillsDir, GUIDE, "SKILL.md");
   const guideReferences = (host: ReturnType<typeof loadExtension>) => join(referencesDir(host), GUIDE);
 
-  /** Installs the fixture upstream skill `sample-guide`, tracked in the skills lock. */
   function installGuide(host: ReturnType<typeof loadExtension>) {
     mkdirSync(dirname(guidePath(host)), { recursive: true });
     writeFileSync(guidePath(host), GUIDE_TEXT);
     setLockHash(host, GUIDE, "fixture-lock-hash");
   }
 
-  /** Runs the registered inspect action; returns its result and call ID. */
   async function inspect(host: ReturnType<typeof loadExtension>, params: Record<string, unknown> = {}) {
     const result = await host.callTool("observer_review", { action: "inspect", skill: GUIDE, ...params });
     return { result, id: lastCallId(host) };
@@ -7120,7 +7122,6 @@ describe("observer_review inspect and grounded repairs", () => {
   });
 
   const stashed = new Map<ReturnType<typeof loadExtension>, Buffer>();
-  /** Each change to the guidance an inspection read: `before` runs ahead of the inspection, `change` after it, and the refusal names `named`. */
   const guidanceChanges: Array<{ label: string; before?: (host: ReturnType<typeof loadExtension>) => void; change: (host: ReturnType<typeof loadExtension>) => void; named: string }> = [
     { label: "a changed skill file", change: (host) => appendFileSync(guidePath(host), "\n## Fixtures\n\nOne per seam.\n"), named: "SKILL.md" },
     { label: "an added amendment", before: (host) => {
@@ -7134,7 +7135,6 @@ describe("observer_review inspect and grounded repairs", () => {
     { label: "a changed reference inventory", change: (host) => writeFileSync(join(guideReferences(host), "unrequested.md"), "Unrequested.\n"), named: "unrequested.md" },
   ];
 
-  /** The guide with a barrier rule and a requested reference file, inspected in a new pass after `before`. */
   async function inspectedGuide(before?: (host: ReturnType<typeof loadExtension>) => void) {
     const host = loadExtension();
     installGuide(host);
@@ -7232,7 +7232,6 @@ describe("observer_review inspect and grounded repairs", () => {
     }
   });
 
-  /** A description fix for `skill` drafted as a direct edit, citing the inspection `inspection` of its first source. */
   const descriptionFix = (skill: string, kind: string, inspection: string, source: string, explanation = "The description names reviews but not the session's request; checked lines 1–3.") => ({
     kind, skill, gist: "Name the request in the description.", priority: "evidence", remedy: "Edit the description so the skill is selected for this request",
     evidence: [{ quote: "review this diff", count: 1 }],
@@ -7305,7 +7304,6 @@ describe("observer_review new-skill search", () => {
   const pluginInstall = (host: ReturnType<typeof loadExtension>): string =>
     JSON.parse(readFileSync(host.skillHome.roots.pluginsRegistry, "utf8")).plugins[CE_PLUGIN][0].installPath;
 
-  /** A host with a local skill whose description holds the search term, in a started observation pass. */
   function passHost(options: Parameters<typeof loadExtension>[0] = {}) {
     const host = loadExtension(options);
     mkdirSync(dirname(deployPath(host)), { recursive: true });
@@ -7421,7 +7419,6 @@ describe("observer_review new-skill search", () => {
     }
   });
 
-  /** Each change after a search that leaves the search stale, and what the refusal names. */
   const staleChanges: Array<[string, (host: ReturnType<typeof loadExtension>) => void, string]> = [
     ["an unrelated skill added", (host) => writeSkill(join(host.skillHome.roots.skillsDir, "sample-other"), "sample-other"), "changed"],
     ["an unmatched skill's file edited", (host) => appendFileSync(join(host.skillHome.roots.skillsDir, "tdd", "SKILL.md"), "More.\n"), "changed"],
@@ -7466,7 +7463,6 @@ describe("observer_review new-skill search", () => {
     const { id: other } = await search(host, { skill: "sample-other" });
     writeSkill(join(host.skillHome.roots.skillsDir, "sample-local"), "sample-local");
     const { id: inspection } = await search(host, { skill: "sample-local", terms: undefined });
-    // A search changes nothing, so the receipts above stay current for each case.
     const { id: fresh } = await search(host);
     const cases: Array<[unknown, string]> = [
       [undefined, "`inspection`"],
@@ -7490,12 +7486,6 @@ describe("approval compatibility under the evidence gate", () => {
   const DIAGNOSIS_LINE = /<p>(?:Diagnosis: |Behavior change: |Cited guidance, inspection )[^\n]*\n/g;
   const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 
-  /**
-   * Rewrites the branch as a pass before the evidence gate saved it: no
-   * Prepare draft or saved proposal holds a diagnosis, each reference carries
-   * the content hash of the proposal without one, and each Ask shows the form
-   * without one. Returns `ref` under its rewritten content hash.
-   */
   function savedBeforeGate(host: ReturnType<typeof loadExtension>) {
     const lists = ["eligible", "selected", "deferred"] as const;
     const savedEntries = (entry: SessionEntry) => entry.message?.role === "toolResult" && entry.message.toolName === "observer_review"
@@ -7693,7 +7683,6 @@ function skillNotice(id: string, change: { added?: ReadonlyArray<readonly [strin
   return { type: "custom_message", id, customType: "skill-notice", content, details: details ?? { announced, removed } } as unknown as SessionEntry;
 }
 
-/** Submits a prompt whose system prompt lists `skills` (or is `systemPrompt`) and commits its user message, as OMP does. */
 async function observeCatalog(host: ReturnType<typeof loadExtension>, skills: ReadonlyArray<readonly [string, string]>, systemPrompt = catalogPrompt(skills)) {
   await host.startAgent("Write the tests.", { systemPrompt });
   await host.commitPrompt("Write the tests.");
@@ -7705,7 +7694,7 @@ const catalogEntries = (host: ReturnType<typeof loadExtension>) =>
 async function lookUp(host: ReturnType<typeof loadExtension>, skill: string) {
   const result = await host.callTool("observer_review", { action: "catalog", skill });
   const { catalog } = result.details as { catalog: { matches: Array<Record<string, unknown>>; gaps: string[] } };
-  return { result, text: result.content.map((block) => block.text ?? "").join("\n"), matches: catalog.matches, gaps: catalog.gaps };
+  return { result, text: resultText(result), matches: catalog.matches, gaps: catalog.gaps };
 }
 
 describe("skill catalog observations", () => {
@@ -7754,7 +7743,6 @@ describe("skill catalog observations", () => {
     expect(catalogEntries(host).map(({ customType }) => customType)).toEqual(["skill-observer-catalog", "skill-observer-catalog-binding", "skill-observer-catalog", "skill-observer-catalog-binding"]);
     const ids = catalogEntries(host).filter(({ customType }) => customType === "skill-observer-catalog").map(({ data }) => (data as { catalogId: string }).catalogId);
     expect(new Set(ids).size).toBe(2);
-    // Back to the first catalog: a new binding to the definition already on the branch.
     await observeCatalog(host, [SEAMS, NOTES]);
     expect(catalogEntries(host).at(-1)?.customType).toBe("skill-observer-catalog-binding");
     expect(catalogEntries(host)).toHaveLength(5);
@@ -7830,6 +7818,13 @@ describe("skill catalog observations", () => {
     expect(content).not.toContain(NOTES[0]);
     expect(host.notices.at(-1)).toMatch(/catalog \d+/);
   });
+
+  it("leaves a branch whose only evidence is a catalog observation with no skill evidence in /observe-report", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS, NOTES]);
+    await host.runCommand("observe-report");
+    expect(host.notices.at(-1)).toBe("No skill evidence on this branch.");
+  });
 });
 
 describe("qualified skill catalog capture", () => {
@@ -7840,7 +7835,6 @@ describe("qualified skill catalog capture", () => {
   const compaction = (id: string, firstKeptEntryId: string, extra: Record<string, unknown> = {}) =>
     ({ type: "compaction", id, firstKeptEntryId, summary: "Earlier work.", ...extra }) as SessionEntry;
   const append = (host: Host, ...entries: SessionEntry[]) => host.setBranch([...host.getBranch(), ...entries]);
-  /** Each state the lookup reports: where it took effect, through what, and what it says. */
   const states = async (host: Host, skill: string) =>
     (await lookUp(host, skill)).matches.map(({ at, via, status, description }) => ({ at, via, status, ...(description !== undefined && { description }) }));
 
@@ -8041,7 +8035,6 @@ describe("catalog history across the session tree", () => {
     await observeCatalog(host, [SEAMS, NOTES]);
     await observeCatalog(host, [SEAMS]);
     const fork = host.getBranch();
-    // The first branch observes the shared ancestor's definition again.
     await observeCatalog(host, [SEAMS, NOTES]);
     const first = host.getBranch();
     const firstBinding = catalogEntries(host).at(-1)!;
@@ -8055,7 +8048,6 @@ describe("catalog history across the session tree", () => {
     expect(sibling.matches.map(({ status }) => status)).toEqual(["listed", "not-listed"]);
     expect(sibling.text).not.toContain(firstBinding.id!);
 
-    // Rewinding before the shared definition: the sibling stores its own copy rather than borrowing the first branch's.
     host.setBranch([reply("rewound-reply")]);
     await host.emit("session_branch");
     expect((await lookUp(host, NOTES[0])).matches).toEqual([]);
@@ -8132,7 +8124,6 @@ describe("catalog history across the session tree", () => {
     expect(unknown.text).toContain(`whether \`${NOTES[0]}\` was listed is unknown, not absent`);
     expect(unknown.text).not.toMatch(/durab|persisted|saved/i);
 
-    // Only the later definition lost: its binding is unavailable, the earlier observation stays as it was.
     const laterDefinition = saved.filter((entry) => entry.customType === "skill-observer-catalog").at(-1)!;
     const partial = await lookUp(await restore(saved.filter((entry) => entry !== laterDefinition)), NOTES[0]);
     expect(partial.matches).toEqual([expect.objectContaining({ observedAt: "user-0", status: "not-listed" })]);

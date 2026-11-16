@@ -138,7 +138,7 @@ async function observationPayload(
     observations,
     rankingAvailable: (await rankingModelUnavailable(pi, ctx).catch(() => "unreadable")) === undefined,
     onReadAmendmentFor: (skill) => onReadAmendments.some((rule) => rule.amends === skill),
-    catalogEvidence: catalog.latest !== undefined || catalog.gaps.length > 0,
+    catalog,
   });
   const retro = gates.has("project") ? retroReference(provenance) : undefined;
   const sections: PayloadSection[] = [
@@ -284,7 +284,8 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const note = args.trim();
       const roots = defaultSkillRoots(ctx.cwd);
       const provenance = createProvenanceResolver(roots);
-      const digest = buildDigest(ctx.sessionManager.getBranch(), { provenance });
+      const branch = ctx.sessionManager.getBranch();
+      const digest = buildDigest(branch, { provenance });
       const stale = findStaleAmendments(ruleDirs(), provenance);
       let observations: Observation[];
       let payload: ObservationPayload;
@@ -294,7 +295,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
           ctx.ui.notify("Nothing to observe: no skill signals, stale amendments or pending observations, and no note.", "info");
           return;
         }
-        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, roots, provenance, catalog: catalogSummary(ctx.sessionManager.getBranch(), catalogGap()) });
+        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, roots, provenance, catalog: catalogSummary(branch, catalogGap()) });
       } catch (error) {
         ctx.ui.notify(`Observation pass not started: ${error instanceof Error ? error.message : String(error)}`, "error");
         return;
@@ -324,11 +325,12 @@ export default function skillObserver(pi: ExtensionAPI): void {
       if (!isObservable(ctx)) return;
       const roots = defaultSkillRoots(ctx.cwd);
       const provenance = createProvenanceResolver(roots);
-      const digest = buildDigest(ctx.sessionManager.getBranch(), { provenance });
+      const branch = ctx.sessionManager.getBranch();
+      const digest = buildDigest(branch, { provenance });
       const stale = findStaleAmendments(ruleDirs(), provenance);
       try {
         const observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
-        const catalog = catalogSummary(ctx.sessionManager.getBranch(), catalogGap());
+        const catalog = catalogSummary(branch, catalogGap());
         const report = evidenceReport({
           digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale, observations: observations.length, catalog,
         });

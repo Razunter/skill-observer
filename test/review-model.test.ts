@@ -10,13 +10,12 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const schema: Schema = { optional: () => schema, describe: () => schema };
 const model = { provider: "fixture", id: "explicit-judge" };
-// Project repairs need no inspection receipt, so ranking is exercised without a skill home.
-const candidate = (gist: string, quote: string, count: number, remedy = "Other fix") =>
+const projectRepair = (gist: string, quote: string, count: number, remedy = "Other fix") =>
   ({ kind: "project", gist, priority: "evidence", remedy, change: { operation: "direct-edit", preview: `Exact ${gist} diff` }, evidence: [{ quote, count }] });
 const drafts = [
-  candidate("Weak", "Weak support", 1, "Fix weak"),
-  candidate("Strong", "Strong support", 4, "Fix strong"),
-  ...Array.from({ length: 4 }, (_, i) => candidate(`Other ${i}`, "Other support", 1)),
+  projectRepair("Weak", "Weak support", 1, "Fix weak"),
+  projectRepair("Strong", "Strong support", 4, "Fix strong"),
+  ...Array.from({ length: 4 }, (_, i) => projectRepair(`Other ${i}`, "Other support", 1)),
 ];
 /** The fixture candidates as repairs of distinct mechanisms of one file in the project `root`. */
 const candidatesIn = (root: string) => drafts.map((draft) => ({ ...draft, target: { scope: "project" as const, root, path: "AGENTS.md", mechanism: draft.gist } }));

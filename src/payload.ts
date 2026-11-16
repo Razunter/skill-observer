@@ -5,6 +5,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import type { ObserverRule } from "./amendments.js";
+import type { CatalogSummary } from "./catalog.js";
 import type { SessionDigest } from "./digest.js";
 import type { Observation } from "./observations.js";
 import type { SkillRulesInForce } from "./rules-in-force.js";
@@ -127,8 +128,7 @@ export interface GateInput {
   observations: readonly Observation[];
   /** Whether the skill has an on-read amendment in the amendments directory. */
   onReadAmendmentFor(skill: string): boolean;
-  /** Whether the branch has a skill catalog observation or a known capture gap. */
-  catalogEvidence: boolean;
+  catalog: CatalogSummary;
 }
 
 const GATE_EVIDENCE: Record<Exclude<Gate, "tool-result">, (input: GateInput) => boolean> = {
@@ -141,7 +141,7 @@ const GATE_EVIDENCE: Record<Exclude<Gate, "tool-result">, (input: GateInput) => 
   ranking: ({ rankingAvailable }) => rankingAvailable,
   note: ({ note }) => note !== "",
   observations: ({ observations }) => observations.length > 0,
-  catalog: ({ catalogEvidence }) => catalogEvidence,
+  catalog: ({ catalog }) => catalog.latest !== undefined || catalog.gaps.length > 0,
 };
 
 /** The gates whose evidence is present; never `tool-result`. */

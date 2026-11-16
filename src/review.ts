@@ -26,7 +26,7 @@ import { type CatalogLookup, type CatalogSkill, lookupCatalog, parseSkillsBlock 
 import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, observationPassStart, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import {
-  createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver, scanInstalledSkills, skillHash, type SkillProvenance, type SkillRoots, type SourceCoverage,
+  createProvenanceResolver, defaultSkillRoots, type InstalledSkillScan, ompAgentDir, type ProvenanceResolver, scanInstalledSkills, skillHash, type SkillProvenance, type SkillRoots, type SourceCoverage,
 } from "./provenance.js";
 import { checkCompanionCommand, checkHookCommand } from "./project-publication.js";
 import { fixRule } from "./publication.js";
@@ -69,24 +69,10 @@ const INTENT_LINES: ReadonlyArray<[keyof HarnessIntent, string]> = [
 /** The check the drafting ran on the code, and its observed output. */
 export interface HarnessCheck { command: string; output: string }
 
-/** A place in an inspected guidance source: a 1-based inclusive line range or a `## ` section heading. */
 interface Citation { source: string; lines?: { from: number; to: number }; section?: string }
 
-/**
- * Why current guidance does not already address a skill-text repair's finding
- * and what the change would make a future agent do: `inspection` is the
- * `observer_review` inspect call whose receipt the `citations` name. A new
- * skill's diagnosis cites a new-skill search instead: `search` holds its terms
- * and the names it matched, which `explanation` says do not fit.
- */
 interface CandidateDiagnosis { inspection: string; explanation: string; delta: string; citations: Citation[]; search?: { terms: string[]; matches: string[] } }
 
-/**
- * One guidance source an inspection read, at the bytes it read: the skill's
- * entry file, an observer rule amending it, or a requested reference file.
- * `stale` is a pinned amendment whose skill's files changed since: it is still
- * delivered or fired until the pass settles it.
- */
 export interface GuidanceSource {
   role: "skill" | "rule" | "reference";
   path: string;
@@ -96,7 +82,6 @@ export interface GuidanceSource {
   sections: string[];
 }
 
-/** The receipt of an inspect call: the skill's current guidance a candidate diagnosis cites, and its reference folder's files by fingerprint, read or not. */
 export interface GuidanceInspection {
   skill: string;
   kind: Exclude<SkillProvenance["kind"], "unknown">;
@@ -104,15 +89,8 @@ export interface GuidanceInspection {
   referenceInventory: Array<{ path: string; sha256: string }>;
 }
 
-/** A skill a new-skill search compared against its terms, by identity: its source and, for an installed one, its entry file. */
 interface SearchedSkill { name: string; description: string; source: string; path?: string }
 
-/**
- * The receipt of a new-skill inspect: no current skill is named `skill`, and
- * which skills of every searched source matched `terms`. `fingerprint` covers
- * the whole searched inventory and every entry file's bytes, matched or not.
- * A `supplemental` source is reported but neither blocks nor is fingerprinted.
- */
 export interface GuidanceSearch {
   skill: string;
   terms: string[];
@@ -180,7 +158,6 @@ export type PreparedProposal = {
   evidence: ReviewEvidence[];
   /** A revision's link to the approved proposal it reconciles: the main agent's judgment, not the user's approval of this revision. */
   reconciles?: ProposalReconciliation;
-  /** A skill-text repair's grounding in an inspection of the skill's current guidance; the Ask form shows it once. */
   diagnosis?: CandidateDiagnosis;
 } & (
   | { change: Exclude<PreparedChange, StaleChange>; preview: string }
@@ -225,21 +202,33 @@ interface ReviewDetails {
   catalog?: CatalogLookup;
 }
 
-interface PrepareContext {
+interface GuidanceContext {
+  dirs: RuleDirs;
+  referencesDir: string;
+  provenance: ProvenanceResolver;
+  roots: SkillRoots;
+  branch: readonly SessionEntry[];
+  systemPrompt?: string[];
+}
+
+interface SearchInventory { installed: InstalledSkillScan; created: string[] }
+
+/** What Prepare and Select check receipts against, each built once per call. */
+interface ReceiptContext extends GuidanceContext {
+  evidence: SessionToolEvidence;
+  passStart: number | undefined;
+  /** Scanned on first use. */
+  inventory: () => SearchInventory;
+  /** Each inspection's currency by ID: its refusal, or `undefined` while current. */
+  currency: Map<string, string | undefined>;
+}
+
+interface PrepareContext extends ReceiptContext {
   cwd: string;
   /** The agent directory, which holds the global hooks directory and the companion extension. */
   agentDir: string;
-  dirs: RuleDirs;
-  referencesDir: string;
   /** The whole ledger: a withdrawal cites a fix wherever it was recorded. */
   ledger: readonly LedgerRecord[];
-  provenance: ProvenanceResolver;
-  /** Where the installed skills a new-skill search covers live. */
-  roots: SkillRoots;
-  /** The session branch, where a reconciliation's approval is saved and inspections and created skills are found. */
-  branch: readonly SessionEntry[];
-  /** The host's current system prompt, when it exposes one: a supplemental skill catalog. */
-  systemPrompt?: string[];
   /** Filled by Prepare: the `## ` headings of each on-read append's target amendment at the bytes it read, by candidate ID, kept out of the proposal so its content hash ignores them. */
   amendmentSections: Map<string, string[]>;
 }
@@ -328,18 +317,15 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
     }),
     async execute(toolCallId, params, signal, _update, ctx) {
       signal?.throwIfAborted();
-      if (params?.action === "inspect" || params?.action === "catalog") return inspectResult(params, files, ctx, catalogGap());
-      const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
+      if (params?.action === "inspect" || params?.action === "catalog") return readOnlyActionResult(params, files, ctx, catalogGap());
+      const details = emptyDetails();
       const amendmentSections = new Map<string, string[]>();
       try {
         const ledger = readLedger(files.ledgerFile());
+        const guidance = receiptContext(ctx, files);
         if (params?.action === "prepare") {
           if (!Array.isArray(params.candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
-          const roots = defaultSkillRoots(ctx.cwd);
-          const context: PrepareContext = {
-            cwd: ctx.cwd, agentDir: ompAgentDir(), dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
-            ledger, provenance: createProvenanceResolver(roots), roots, branch: ctx.sessionManager.getBranch(), systemPrompt: ctx.getSystemPrompt?.(), amendmentSections,
-          };
+          const context: PrepareContext = { ...guidance, cwd: ctx.cwd, agentDir: ompAgentDir(), ledger, amendmentSections };
           details.eligible = prepareProposals(params.candidates, context).map((proposal) => ({
             reference: { reviewToolCallId: toolCallId, candidateId: proposal.candidateId, contentHash: contentHash(proposal) },
             proposal,
@@ -347,13 +333,13 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
         } else if (params?.action === "select") {
           if (params.candidates !== undefined) throw new Error("Select takes `proposals`, the references a successful Prepare returned, not candidate drafts");
           const declined = declinedFingerprints(ledgerForProject(ledger, ctx.cwd));
-          details.eligible = preparedEntries(params.proposals, ctx.sessionManager.getBranch())
+          details.eligible = preparedEntries(params.proposals, guidance.evidence, guidance.branch)
             .filter((entry) => !declined.has(entry.proposal.fingerprint));
           if (details.eligible.length > 1 && details.eligible.some(({ proposal }) => "change" in proposal && proposal.change.operation === "harness" && proposal.change.stage === "code")) {
             throw new Error("the code of a hook or companion change is asked in its own Select and Ask, apart from every other question");
           }
         } else {
-          throw new Error("review needs inspect/prepare/select");
+          throw new Error("review needs inspect/catalog/prepare/select");
         }
         const classCounts: Record<Priority, number> = { stale: 0, note: 0, evidence: 0, compaction: 0 };
         for (const { proposal } of details.eligible) classCounts[proposal.priority]++;
@@ -378,12 +364,6 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
         } else {
           const selection = selectCandidates(details.eligible, compared, params.rankings, modelUnavailable ?? params.rankingFailure);
           const selected = selection.ordered.slice(0, 5);
-          const roots = defaultSkillRoots(ctx.cwd);
-          const branch = ctx.sessionManager.getBranch();
-          const guidance = {
-            dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
-            provenance: createProvenanceResolver(roots), roots, branch, systemPrompt: ctx.getSystemPrompt?.(),
-          };
           for (const { reference, proposal } of selected) {
             const { diagnosis } = proposal;
             if (!diagnosis) {
@@ -395,8 +375,8 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
               continue;
             }
             try {
-              if (proposal.kind === "new") checkSearchCurrent(diagnosis.inspection, searchReceipt(diagnosis.inspection, branch), guidance);
-              else checkCurrent(diagnosis.inspection, inspectionReceipt(diagnosis.inspection, branch), guidance);
+              if (proposal.kind === "new") checkSearchCurrent(diagnosis.inspection, searchReceipt(diagnosis.inspection, guidance), guidance);
+              else checkCurrent(diagnosis.inspection, inspectionReceipt(diagnosis.inspection, guidance), guidance);
             } catch (error) {
               throw new Error(`proposal \`${reference.candidateId}\`: ${error instanceof Error ? error.message : String(error)}, then prepare it again`);
             }
@@ -425,9 +405,31 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
   });
 }
 
-/** The inspect action: the receipt in `details.inspection`, and each source's text numbered by line for citing; any unreadable, missing or malformed required source fails it. With `terms`, the new-skill search's receipt in `details.search`. The catalog action: one page of the branch's skill catalog observations matching the query and the known capture gaps, the unrecovered `catalogGap` among them, in `details.catalog`. */
-function inspectResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext, catalogGap: string | undefined) {
-  const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
+const emptyDetails = (): ReviewDetails => ({ eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] });
+
+function guidanceContext(ctx: ExtensionContext, files: ObserverFiles): GuidanceContext {
+  const roots = defaultSkillRoots(ctx.cwd);
+  return {
+    dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
+    provenance: createProvenanceResolver(roots), roots, branch: ctx.sessionManager.getBranch(), systemPrompt: ctx.getSystemPrompt?.(),
+  };
+}
+
+function receiptContext(ctx: ExtensionContext, files: ObserverFiles): ReceiptContext {
+  const guidance = guidanceContext(ctx, files);
+  const evidence = sessionToolEvidence(guidance.branch);
+  let inventory: SearchInventory | undefined;
+  return {
+    ...guidance, evidence, passStart: observationPassStart(guidance.branch), currency: new Map(),
+    inventory: () => (inventory ??= searchInventory(guidance.roots, evidence)),
+  };
+}
+
+const searchInventory = (roots: SkillRoots, evidence: SessionToolEvidence): SearchInventory => ({ installed: scanInstalledSkills(roots), created: createdSkills(evidence) });
+
+function readOnlyActionResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext, catalogGap: string | undefined) {
+  const details = emptyDetails();
+  const ok = (text: string) => ({ content: [{ type: "text" as const, text }], details, isError: false });
   try {
     if (params.action === "catalog") {
       if (params.candidates !== undefined || params.proposals !== undefined || params.references !== undefined) {
@@ -435,26 +437,39 @@ function inspectResult(params: ReviewParams, files: ObserverFiles, ctx: Extensio
       }
       const { lookup, text } = lookupCatalog(params, ctx.sessionManager.getBranch(), catalogGap);
       details.catalog = lookup;
-      return { content: [{ type: "text" as const, text }], details, isError: false };
+      return ok(text);
     }
     if (params.candidates !== undefined || params.proposals !== undefined) throw new Error("Inspect takes a `skill` and optional `references`, not candidates or proposal references");
     if (params.terms !== undefined) {
       if (params.references !== undefined) throw new Error("A new-skill search takes `skill` and `terms`; a new skill has no reference files yet");
-      const { search, text } = searchGuidance(params.skill, params.terms, defaultSkillRoots(ctx.cwd), ctx.sessionManager.getBranch(), ctx.getSystemPrompt?.());
+      const { roots, branch, systemPrompt } = guidanceContext(ctx, files);
+      const { search, text } = searchGuidance(params.skill, params.terms, () => searchInventory(roots, sessionToolEvidence(branch)), systemPrompt);
       details.search = search;
-      return { content: [{ type: "text" as const, text }], details, isError: false };
+      return ok(text);
     }
-    const { inspection, text } = inspectGuidance(params.skill, params.references,
-      { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, files.referencesDir(), createProvenanceResolver(defaultSkillRoots(ctx.cwd)));
+    const { inspection, text } = inspectGuidance(params.skill, params.references, guidanceContext(ctx, files));
     details.inspection = inspection;
-    return { content: [{ type: "text" as const, text }], details, isError: false };
+    return ok(text);
   } catch (error) {
     details.failures.push(error instanceof Error ? error.message : String(error));
     return { content: [{ type: "text" as const, text: JSON.stringify({ failures: details.failures }) }], details, isError: true };
   }
 }
 
-function inspectGuidance(skill: unknown, requested: unknown, dirs: RuleDirs, referencesDir: string, provenance: ProvenanceResolver): { inspection: GuidanceInspection; text: string } {
+function inspectGuidance(skill: unknown, requested: unknown, context: GuidanceContext): { inspection: GuidanceInspection; text: string } {
+  const { inspection, folder, texts } = guidanceReceipt(skill, requested, context);
+  const { sources, referenceInventory } = inspection;
+  const unread = referenceInventory.filter(({ path }) => !sources.some((source) => source.path === path)).map(({ path }) => `\`${basename(path)}\``);
+  const text = [
+    `Current guidance of \`${inspection.skill}\` (${inspection.kind}). Cite this call's ID as the diagnosis \`inspection\`, and each source by its path with \`lines\` or a \`section\`.`,
+    `Reference folder \`${folder}\`: ${referenceInventory.length} file(s)${unread.length > 0 ? `; not inspected: ${unread.join(", ")}` : ""}.`,
+    ...sources.map((source, i) => `\n### ${source.role} \`${source.path}\` (${source.status}, ${source.lines} lines)\n${sourceLines(texts[i]!).map((line, n) => `${n + 1}| ${line}`).join("\n")}`),
+  ].join("\n");
+  return { inspection, text };
+}
+
+function guidanceReceipt(skill: unknown, requested: unknown, { dirs, referencesDir, provenance }: Pick<GuidanceContext, "dirs" | "referencesDir" | "provenance">):
+  { inspection: GuidanceInspection; folder: string; texts: string[] } {
   if (typeof skill !== "string" || !skill.trim()) throw new Error("Inspect needs the `skill` whose guidance to read");
   if (requested !== undefined && (!Array.isArray(requested) || requested.some((name) => typeof name !== "string"))) {
     throw new Error("`references` lists file names in the skill's observer reference folder");
@@ -463,7 +478,7 @@ function inspectGuidance(skill: unknown, requested: unknown, dirs: RuleDirs, ref
   checkReferenceFiles(names.map((name) => ({ name, body: "" })));
   const installed = provenance.byName(skill);
   if (installed.kind === "unknown") throw new Error(`no installed skill is named \`${skill}\``);
-  const read: Array<{ source: GuidanceSource; numbered: string }> = [];
+  const read: Array<{ source: GuidanceSource; text: string }> = [];
   const skillBytes = readGuidance(installed.path);
   if (!parseFrontmatter(skillBytes.toString("utf8"))) throw new Error(`\`${installed.path}\` has no frontmatter block, so its guidance can't be read as a skill`);
   read.push(guidanceSource("skill", installed.path, "active", skillBytes));
@@ -486,15 +501,10 @@ function inspectGuidance(skill: unknown, requested: unknown, dirs: RuleDirs, ref
     if (!file) throw new Error(`the requested reference file \`${name}\` is not in \`${folder}\``);
     read.push(guidanceSource("reference", file.path, "active", file.bytes));
   }
-
-  const sources = read.map(({ source }) => source);
-  const unread = inventory.filter(({ path }) => !sources.some((source) => source.path === path)).map(({ path }) => `\`${basename(path)}\``);
-  const text = [
-    `Current guidance of \`${skill}\` (${installed.kind}). Cite this call's ID as the diagnosis \`inspection\`, and each source by its path with \`lines\` or a \`section\`.`,
-    `Reference folder \`${folder}\`: ${inventory.length} file(s)${unread.length > 0 ? `; not inspected: ${unread.join(", ")}` : ""}.`,
-    ...read.map(({ source, numbered }) => `\n### ${source.role} \`${source.path}\` (${source.status}, ${source.lines} lines)\n${numbered}`),
-  ].join("\n");
-  return { inspection: { skill, kind: installed.kind, sources, referenceInventory: inventory.map(({ path, bytes }) => ({ path, sha256: snapshot(path, bytes).sha256! })) }, text };
+  const inspection = {
+    skill, kind: installed.kind, sources: read.map(({ source }) => source), referenceInventory: inventory.map(({ path, bytes }) => ({ path, sha256: sha256Hex(bytes) })),
+  };
+  return { inspection, folder, texts: read.map(({ text }) => text) };
 }
 
 function readGuidance(path: string): Buffer<ArrayBuffer> {
@@ -505,31 +515,27 @@ function readGuidance(path: string): Buffer<ArrayBuffer> {
   }
 }
 
-function guidanceSource(role: GuidanceSource["role"], path: string, status: GuidanceSource["status"], bytes: Buffer<ArrayBuffer>): { source: GuidanceSource; numbered: string } {
+function guidanceSource(role: GuidanceSource["role"], path: string, status: GuidanceSource["status"], bytes: Buffer<ArrayBuffer>): { source: GuidanceSource; text: string } {
   const text = bytes.toString("utf8");
-  const lines = text.split("\n");
-  if (lines.at(-1) === "") lines.pop();
-  return {
-    source: { role, path, status, sha256: snapshot(path, bytes).sha256!, lines: lines.length, sections: sectionHeadings(text) },
-    numbered: lines.map((line, i) => `${i + 1}| ${line}`).join("\n"),
-  };
+  return { source: { role, path, status, sha256: sha256Hex(bytes), lines: sourceLines(text).length, sections: sectionHeadings(text) }, text };
 }
 
-/**
- * Searches every current skill's name and description for a proposed new
- * skill's `terms`: the installed skills, the managed skills created on this
- * branch, and the host's prompt catalog as supplemental evidence. Throws when
- * a skill already has the name, or a required source exists but can't be read.
- */
-function searchGuidance(skill: unknown, terms: unknown, roots: SkillRoots, branch: readonly SessionEntry[], systemPrompt: string[] | undefined): { search: GuidanceSearch; text: string } {
+function sourceLines(text: string): string[] {
+  const lines = text.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  return lines;
+}
+
+const sha256Hex = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+
+function searchGuidance(skill: unknown, terms: unknown, inventory: () => SearchInventory, systemPrompt: string[] | undefined): { search: GuidanceSearch; text: string } {
   if (typeof skill !== "string" || !skill.trim()) throw new Error("A new-skill search needs the proposed skill's name in `skill`");
   if (!Array.isArray(terms) || terms.length === 0 || terms.some((term) => typeof term !== "string" || !term.trim())) {
     throw new Error("A new-skill search needs `terms`: the words of its workflow to look for in current skill names and descriptions");
   }
   const name = skill.trim();
   const words = terms.map((term: string) => term.trim());
-  const installed = scanInstalledSkills(roots);
-  const created = createdSkills(branch);
+  const { installed, created } = inventory();
   const prompt = promptCatalog(systemPrompt);
   const coverage: GuidanceSearch["coverage"] = [
     ...installed.coverage, { source: "skills created this session", path: "session branch", status: created.length > 0 ? "present" : "absent" },
@@ -560,7 +566,7 @@ function searchGuidance(skill: unknown, terms: unknown, roots: SkillRoots, branc
   // Optional sources that are absent still count: one appearing later changes the searched inventory.
   const fingerprint = createHash("sha256").update(JSON.stringify([
     installed.coverage.map(({ source, path, status }) => [source, path, status]),
-    installed.skills.map(({ provenance, bytes }) => [provenance.path, createHash("sha256").update(bytes).digest("hex")]),
+    installed.skills.map(({ provenance, bytes }) => [provenance.path, sha256Hex(bytes)]),
     created.toSorted(),
   ])).digest("hex");
   const text = [
@@ -574,19 +580,13 @@ function searchGuidance(skill: unknown, terms: unknown, roots: SkillRoots, branc
   return { search: { skill: name, terms: words, coverage, matches, fingerprint }, text };
 }
 
-/** The managed skills a successful `manage_skill` create on this branch named. */
-function createdSkills(branch: readonly SessionEntry[]): string[] {
-  return sessionToolEvidence(branch).completedCalls("manage_skill").flatMap(({ result }) => {
+function createdSkills(evidence: SessionToolEvidence): string[] {
+  return evidence.completedCalls("manage_skill").flatMap(({ result }) => {
     const details = result.details as { action?: unknown; name?: unknown } | undefined;
     return !result.isError && details?.action === "create" && typeof details.name === "string" ? [details.name] : [];
   });
 }
 
-/**
- * The skills the host's standard or bundled custom-prompt `<skills>` block
- * lists. Any other form or no prompt getter is reported as coverage the search
- * lacks, not as an empty catalog.
- */
 function promptCatalog(systemPrompt: string[] | undefined): { coverage: SourceCoverage; skills: CatalogSkill[] } {
   const base = { source: "prompt catalog", path: "system prompt" };
   if (!systemPrompt) return { coverage: { ...base, status: "unavailable", reason: "the host exposes no system prompt" }, skills: [] };
@@ -649,7 +649,6 @@ function renderFieldset(proposal: PreparedProposal): string {
   ].join("\n");
 }
 
-/** A candidate diagnosis shown once beside its proposal: the explanation, the behavior delta and where each cited source was inspected, or what a new skill's search looked for and found, never the sources' text. */
 function renderDiagnosis({ inspection, explanation, delta, citations, search }: CandidateDiagnosis): string[] {
   const place = ({ source, lines, section }: Citation) => `${source}${lines ? ` lines ${lines.from}–${lines.to}` : ""}${section ? ` § ${section}` : ""}`;
   const grounds = search
@@ -715,17 +714,14 @@ function prepareProposals(candidates: readonly ReviewCandidate[], context: Prepa
 
 const SKILL_TEXT_OPERATIONS: ReadonlyArray<string> = ["direct-edit", "on-read-append", "rule"];
 
-/** A change to an installed skill's guidance, which needs a candidate diagnosis; a new skill, project and harness remedies and maintenance keep their own evidence. */
 function isSkillTextRepair<T extends { kind: string; change?: { operation: string } }>(subject: T): subject is T & { skill: string } {
   return subject.kind !== "project" && subject.kind !== "harness" && subject.kind !== "new" && subject.change !== undefined && SKILL_TEXT_OPERATIONS.includes(subject.change.operation);
 }
 
-/** A proposed new skill, which needs a candidate diagnosis citing a new-skill search. */
 function isNewSkill<T extends { kind: string; change?: { operation: string } }>(subject: T): subject is T & { skill: string } {
   return subject.kind === "new" && subject.change?.operation === "direct-edit";
 }
 
-/** The candidate diagnosis of a repair to, or a new, `skill`: its citations checked against the current inspection receipt it names on this branch, or its search still current. */
 function candidateDiagnosis({ skill, kind, diagnosis: draft }: ReviewCandidate & { skill: string }, context: PrepareContext): CandidateDiagnosis {
   const isNew = kind === "new";
   const text = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
@@ -743,12 +739,12 @@ function candidateDiagnosis({ skill, kind, diagnosis: draft }: ReviewCandidate &
       : `the repair of \`${skill}\` needs its candidate diagnosis ${missing.join("; ")}: inspect the skill with observer_review \`action: "inspect"\` and cite that receipt`);
   }
   if (isNew) {
-    const search = searchReceipt(inspection, context.branch);
+    const search = searchReceipt(inspection, context);
     if (search.skill !== skill) throw new Error(`inspection \`${inspection}\` searched for \`${search.skill}\`, not \`${skill}\`: search for \`${skill}\` and cite that receipt`);
     checkSearchCurrent(inspection, search, context);
     return { inspection, explanation, delta, citations: [], search: { terms: search.terms, matches: [...new Set(search.matches.map(({ name }) => name))] } };
   }
-  const receipt = inspectionReceipt(inspection, context.branch);
+  const receipt = inspectionReceipt(inspection, context);
   if (receipt.skill !== skill) throw new Error(`inspection \`${inspection}\` read \`${receipt.skill}\`, not \`${skill}\`: inspect \`${skill}\` and cite that receipt`);
   if (receipt.kind !== kind) {
     const owner = isPinKind(receipt.kind) ? ", whose fixes are amendment rules, never a direct edit" : "";
@@ -758,26 +754,23 @@ function candidateDiagnosis({ skill, kind, diagnosis: draft }: ReviewCandidate &
   return { inspection, explanation, delta, citations: citations!.map((citation) => checkedCitation(citation, receipt, inspection)) };
 }
 
-/** The receipt of the successful existing-skill inspect call `id` of the current observation pass on this branch. */
-function inspectionReceipt(id: string, branch: readonly SessionEntry[]): GuidanceInspection {
-  const { inspection } = inspectDetails(id, branch);
+function inspectionReceipt(id: string, context: Pick<ReceiptContext, "evidence" | "passStart">): GuidanceInspection {
+  const { inspection } = inspectDetails(id, context);
   if (!inspection) throw new Error(`inspection \`${id}\` is a new-skill search, not a reading of a skill's guidance; inspect the skill without \`terms\` and cite that receipt`);
   return inspection;
 }
 
-/** The receipt of the successful new-skill search `id` of the current observation pass on this branch. */
-function searchReceipt(id: string, branch: readonly SessionEntry[]): GuidanceSearch {
-  const { search } = inspectDetails(id, branch);
+function searchReceipt(id: string, context: Pick<ReceiptContext, "evidence" | "passStart">): GuidanceSearch {
+  const { search } = inspectDetails(id, context);
   if (!search) throw new Error(`inspection \`${id}\` read an existing skill's guidance, not a new-skill search; search with \`skill\` and \`terms\` and cite that receipt`);
   return search;
 }
 
-/** The details of the successful inspect call `id` of the current observation pass on this branch. */
-function inspectDetails(id: string, branch: readonly SessionEntry[]): Pick<ReviewDetails, "inspection" | "search"> {
+function inspectDetails(id: string, { evidence, passStart }: Pick<ReceiptContext, "evidence" | "passStart">): Pick<ReviewDetails, "inspection" | "search"> {
   const label = `inspection \`${id}\``;
   let completed;
   try {
-    completed = sessionToolEvidence(branch).completedCall(id);
+    completed = evidence.completedCall(id);
   } catch {
     throw new Error(`${label}: this branch holds no completed observer_review call with that ID; inspect the skill and cite that call`);
   }
@@ -785,41 +778,45 @@ function inspectDetails(id: string, branch: readonly SessionEntry[]): Pick<Revie
   if (call.name !== REVIEW_TOOL_NAME || call.args.action !== "inspect") throw new Error(`${label}: that call is not an observer_review inspect`);
   const details = result.details as Pick<ReviewDetails, "inspection" | "search"> | undefined;
   if (result.isError !== false || !(details?.inspection || details?.search)) throw new Error(`${label}: that inspection failed; inspect the skill again`);
-  const passStart = observationPassStart(branch);
   if (passStart === undefined) throw new Error(`${label}: no observation pass is current on this branch, so no inspection grounds a repair`);
   if (call.position < passStart) throw new Error(`${label} is from an earlier observation pass; inspect the skill again in this pass`);
   return details;
 }
 
-/**
- * Throws unless the guidance `receipt` read is still current: re-inspected
- * the same way, with the same reference files, every source and the reference
- * folder's inventory hold the same bytes and status.
- */
-function checkCurrent(id: string, receipt: GuidanceInspection, { dirs, referencesDir, provenance }: Pick<PrepareContext, "dirs" | "referencesDir" | "provenance">): void {
-  const requested = receipt.sources.filter(({ role }) => role === "reference").map(({ path }) => basename(path));
-  let changes: string[];
-  try {
-    changes = guidanceChanges(receipt, inspectGuidance(receipt.skill, requested, dirs, referencesDir, provenance).inspection);
-  } catch (error) {
-    changes = [error instanceof Error ? error.message : String(error)];
-  }
-  if (changes.length > 0) {
-    throw new Error(`inspection \`${id}\` of \`${receipt.skill}\` is no longer current: ${changes.join("; ")}; inspect \`${receipt.skill}\` again and cite the new receipt`);
-  }
+function checkCurrent(id: string, receipt: GuidanceInspection, context: ReceiptContext): void {
+  failIfStale(id, context, () => {
+    const requested = receipt.sources.filter(({ role }) => role === "reference").map(({ path }) => basename(path));
+    let changes: string[];
+    try {
+      changes = guidanceChanges(receipt, guidanceReceipt(receipt.skill, requested, context).inspection);
+    } catch (error) {
+      changes = [error instanceof Error ? error.message : String(error)];
+    }
+    return changes.length > 0
+      ? `inspection \`${id}\` of \`${receipt.skill}\` is no longer current: ${changes.join("; ")}; inspect \`${receipt.skill}\` again and cite the new receipt`
+      : undefined;
+  });
 }
 
-/** Throws unless the new-skill search `receipt` is still current: no skill has taken its name, and the searched inventory and every searched entry file are unchanged. */
-function checkSearchCurrent(id: string, receipt: GuidanceSearch, { roots, branch, systemPrompt }: Pick<PrepareContext, "roots" | "branch" | "systemPrompt">): void {
-  let change: string | undefined;
-  try {
-    if (searchGuidance(receipt.skill, receipt.terms, roots, branch, systemPrompt).search.fingerprint !== receipt.fingerprint) {
-      change = "the searched skill inventory or a searched skill file changed";
+function checkSearchCurrent(id: string, receipt: GuidanceSearch, context: ReceiptContext): void {
+  failIfStale(id, context, () => {
+    let change: string | undefined;
+    try {
+      if (searchGuidance(receipt.skill, receipt.terms, context.inventory, context.systemPrompt).search.fingerprint !== receipt.fingerprint) {
+        change = "the searched skill inventory or a searched skill file changed";
+      }
+    } catch (error) {
+      change = error instanceof Error ? error.message : String(error);
     }
-  } catch (error) {
-    change = error instanceof Error ? error.message : String(error);
-  }
-  if (change) throw new Error(`inspection \`${id}\`, the search for new skill \`${receipt.skill}\`, is no longer current: ${change}; search again with its \`terms\` and cite the new receipt`);
+    return change ? `inspection \`${id}\`, the search for new skill \`${receipt.skill}\`, is no longer current: ${change}; search again with its \`terms\` and cite the new receipt` : undefined;
+  });
+}
+
+/** Checks inspection `id` once per call; each later candidate citing it gets the same refusal. */
+function failIfStale(id: string, { currency }: Pick<ReceiptContext, "currency">, staleness: () => string | undefined): void {
+  if (!currency.has(id)) currency.set(id, staleness());
+  const refusal = currency.get(id);
+  if (refusal !== undefined) throw new Error(refusal);
 }
 
 function guidanceChanges(inspected: GuidanceInspection, current: GuidanceInspection): string[] {
@@ -835,7 +832,6 @@ function guidanceChanges(inspected: GuidanceInspection, current: GuidanceInspect
   return [...diff("source", inspected.sources, current.sources), ...statuses, ...diff("reference folder file", inspected.referenceInventory, current.referenceInventory)];
 }
 
-/** A citation naming a source the receipt lists, at lines or a section present in the version it inspected. */
 function checkedCitation(citation: Partial<Citation> | undefined, receipt: GuidanceInspection, inspection: string): Citation {
   const source = receipt.sources.find(({ path }) => path === citation?.source);
   if (!citation || !source) throw new Error(`a citation names \`${citation?.source}\`, which inspection \`${inspection}\` did not read; cite a source path its receipt lists`);
@@ -1214,7 +1210,7 @@ function ruleIdentity(rule: ObserverRule): RuleIdentity {
 }
 
 export function snapshot(path: string, bytes = existsSync(path) ? readFileSync(path) : null): FileSnapshot {
-  return { path, sha256: bytes && createHash("sha256").update(bytes).digest("hex") };
+  return { path, sha256: bytes && sha256Hex(bytes) };
 }
 
 /** The skill's reference folder replaced by exactly `files`, trimmed as written; a folder holding more than plain files can't be previewed, so it's refused. */
@@ -1290,9 +1286,8 @@ function contentHash(proposal: PreparedProposal): string {
  * is shown whose answers could approve nothing. Throws on a reference without
  * exactly one matching saved proposal and content hash.
  */
-function preparedEntries(references: unknown, branch: readonly SessionEntry[]): PreparedEntry[] {
+function preparedEntries(references: unknown, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): PreparedEntry[] {
   if (!Array.isArray(references)) throw new Error("Select needs `proposals`: the references a successful Prepare returned");
-  const evidence = sessionToolEvidence(branch);
   const seen = new Set<string>();
   return references.map((reference: Partial<PreparedProposalRef> | undefined) => {
     if (!isProposalRef(reference)) throw new Error("each proposal reference needs reviewToolCallId, candidateId and contentHash");

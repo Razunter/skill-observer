@@ -28,7 +28,6 @@ export interface EvidenceReport {
   later: number;
   /** The project's pending observations, counted; their text stays out of the report. */
   observations: number;
-  /** Availability only; catalog presence alone never makes the report non-empty. */
   catalog: CatalogSummary;
   /** The payload `/observe` would send now; absent on an empty report. */
   payload?: PayloadEstimate;

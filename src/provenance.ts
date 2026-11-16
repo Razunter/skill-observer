@@ -93,11 +93,33 @@ const FRONTMATTER_NAME = /^---\r?\n(?:[^\n]*\r?\n)*?name:[ \t]*["']?([^"'\r\n]+?
 /** The skill's frontmatter `name`, or its folder name when it has none. */
 function skillName(skillFile: string): string {
   try {
-    const head = readFileSync(skillFile, "utf8").slice(0, 4096);
-    return FRONTMATTER_NAME.exec(head)?.[1] ?? basename(dirname(skillFile));
+    return nameIn(skillFile, readFileSync(skillFile, "utf8"));
   } catch {
     return basename(dirname(skillFile));
   }
+}
+
+const nameIn = (skillFile: string, text: string) => FRONTMATTER_NAME.exec(text.slice(0, 4096))?.[1] ?? basename(dirname(skillFile));
+
+type InstalledProvenance = Exclude<SkillProvenance, { kind: "unknown" }>;
+
+const pluginSkill = (skillFile: string, plugin: InstalledPlugin, name = skillName(skillFile)): InstalledProvenance => ({
+  kind: "plugin",
+  name,
+  folder: basename(dirname(skillFile)),
+  path: skillFile,
+  plugin: plugin.id,
+  version: plugin.version,
+});
+
+/** A skill of the user's skills directory or the managed-skills directory; the lock tells an upstream skill from a local one. */
+function rootSkill(skillFile: string, roots: SkillRoots, lockHashes: () => Map<string, string>, name = skillName(skillFile)): InstalledProvenance {
+  const skill: InstalledSkill = { name, folder: basename(dirname(skillFile)), path: skillFile };
+  if (dirname(dirname(skillFile)) === roots.managedDir) return { kind: "managed", ...skill };
+  const skillFolderHash = lockHashes().get(skill.folder);
+  return skillFolderHash === undefined
+    ? { kind: "local", ...skill }
+    : { kind: "upstream", ...skill, skillFolderHash };
 }
 
 function readLockHashes(lockFile: string): Map<string, string> {
@@ -128,7 +150,6 @@ function readPlugins(registryFile: string): InstalledPlugin[] {
   }
 }
 
-/** The enabled plugins a registry's text lists; throws when it is no registry. */
 function parsePlugins(text: string): InstalledPlugin[] {
   const registry = JSON.parse(text) as { plugins?: unknown } | null;
   const plugins = registry?.plugins ?? {};
@@ -144,21 +165,23 @@ function parsePlugins(text: string): InstalledPlugin[] {
   );
 }
 
+function skillFiles(root: string): string[] {
+  return readdirSync(root).map((folder) => join(root, folder, "SKILL.md")).filter((file) => existsSync(file));
+}
+
 function listSkillFiles(root: string): string[] {
   try {
-    return readdirSync(root)
-      .map((folder) => join(root, folder, "SKILL.md"))
-      .filter((file) => existsSync(file));
+    return skillFiles(root);
   } catch {
     return [];
   }
 }
 
-/** A searched skill source: `absent` when it does not exist, `unavailable` when it exists but could not be read. */
 export interface SourceCoverage { source: string; path: string; status: "present" | "absent" | "unavailable"; reason?: string }
 
-/** An installed skill as a scan read it: where it comes from and its entry file's bytes. */
-export interface ScannedSkill { provenance: Exclude<SkillProvenance, { kind: "unknown" }>; bytes: Buffer }
+export interface ScannedSkill { provenance: InstalledProvenance; bytes: Buffer }
+
+export interface InstalledSkillScan { coverage: SourceCoverage[]; skills: ScannedSkill[] }
 
 /**
  * Every installed skill of the user's skills directory, the managed-skills
@@ -166,24 +189,27 @@ export interface ScannedSkill { provenance: Exclude<SkillProvenance, { kind: "un
  * resolver, which reads such a source as empty, a root or registry that exists
  * but can't be read is `unavailable`.
  */
-export function scanInstalledSkills(roots: SkillRoots): { coverage: SourceCoverage[]; skills: ScannedSkill[] } {
-  const resolver = createProvenanceResolver(roots);
+export function scanInstalledSkills(roots: SkillRoots): InstalledSkillScan {
   const coverage: SourceCoverage[] = [];
   const skills: ScannedSkill[] = [];
+  let lockHashes: Map<string, string> | undefined;
+  const inRoot = (file: string, name: string) => rootSkill(file, roots, () => (lockHashes ??= readLockHashes(roots.lockFile)), name);
   const failure = (error: unknown) => (error instanceof Error ? error.message : String(error));
-  const scan = (source: string, root: string) => {
+  const scan = (source: string, root: string, provenance: (file: string, name: string) => InstalledProvenance) => {
     if (!existsSync(root)) return void coverage.push({ source, path: root, status: "absent" });
     try {
-      const found = readdirSync(root).map((folder) => join(root, folder, "SKILL.md")).filter((file) => existsSync(file)).sort()
-        .map((file) => ({ provenance: resolver.byPath(file), bytes: readFileSync(file) }));
-      for (const { provenance, bytes } of found) if (provenance.kind !== "unknown") skills.push({ provenance, bytes });
+      const found = skillFiles(root).sort().map((file) => {
+        const bytes = readFileSync(file);
+        return { provenance: provenance(file, nameIn(file, bytes.toString("utf8"))), bytes };
+      });
+      skills.push(...found);
       coverage.push({ source, path: root, status: "present" });
     } catch (error) {
       coverage.push({ source, path: root, status: "unavailable", reason: failure(error) });
     }
   };
-  scan("skills directory", roots.skillsDir);
-  scan("managed skills", roots.managedDir);
+  scan("skills directory", roots.skillsDir, inRoot);
+  scan("managed skills", roots.managedDir, inRoot);
   const registry = { source: "plugin registry", path: roots.pluginsRegistry };
   if (!existsSync(roots.pluginsRegistry)) {
     coverage.push({ ...registry, status: "absent" });
@@ -197,7 +223,7 @@ export function scanInstalledSkills(roots: SkillRoots): { coverage: SourceCovera
     return { coverage, skills };
   }
   coverage.push({ ...registry, status: "present" });
-  for (const plugin of plugins) scan(`plugin ${plugin.id}`, join(plugin.installPath, "skills"));
+  for (const plugin of plugins) scan(`plugin ${plugin.id}`, join(plugin.installPath, "skills"), (file, name) => pluginSkill(file, plugin, name));
   return { coverage, skills };
 }
 
@@ -212,29 +238,7 @@ export function createProvenanceResolver(roots: SkillRoots): ProvenanceResolver 
   let plugins: InstalledPlugin[] | undefined;
 
   const installedPlugins = () => (plugins ??= readPlugins(roots.pluginsRegistry));
-  const pluginSkill = (skillFile: string, plugin: InstalledPlugin): SkillProvenance => ({
-    kind: "plugin",
-    name: skillName(skillFile),
-    folder: basename(dirname(skillFile)),
-    path: skillFile,
-    plugin: plugin.id,
-    version: plugin.version,
-  });
-
-  const installed = (skillFile: string): SkillProvenance => {
-    const skill: InstalledSkill = {
-      name: skillName(skillFile),
-      folder: basename(dirname(skillFile)),
-      path: skillFile,
-    };
-    const root = dirname(dirname(skillFile));
-    if (root === roots.managedDir) return { kind: "managed", ...skill };
-    lockHashes ??= readLockHashes(roots.lockFile);
-    const skillFolderHash = lockHashes.get(skill.folder);
-    return skillFolderHash === undefined
-      ? { kind: "local", ...skill }
-      : { kind: "upstream", ...skill, skillFolderHash };
-  };
+  const installed = (skillFile: string) => rootSkill(skillFile, roots, () => (lockHashes ??= readLockHashes(roots.lockFile)));
 
   const index = (): Map<string, SkillProvenance> => {
     if (byNameIndex) return byNameIndex;
@@ -268,7 +272,7 @@ export function createProvenanceResolver(roots: SkillRoots): ProvenanceResolver 
       // A byte-identical copy of an installed skill's entry file loads the same instructions; a path that cannot be read is no copy.
       try {
         const copy = readFileSync(skillFile);
-        const named = index().get(FRONTMATTER_NAME.exec(copy.toString("utf8").slice(0, 4096))?.[1] ?? unknown.name);
+        const named = index().get(nameIn(skillFile, copy.toString("utf8")));
         return named && named.kind !== "unknown" && readFileSync(named.path).equals(copy) ? named : unknown;
       } catch {
         return unknown;

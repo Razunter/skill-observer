@@ -21,27 +21,18 @@ export interface CatalogSkill { name: string; description: string }
 /** `standard`: `- name: description` lines; `custom`: the bundled custom-prompt template's `<skill name="…">` elements. */
 export type CatalogFormat = "standard" | "custom";
 
-/**
- * What a skills block yielded: its recognized skills, with the count of
- * non-blank lines outside the recognized entries; no block at all; or a block
- * with no entry in either form.
- */
 export type SkillsBlock =
   | { status: "listed"; format: CatalogFormat; skills: CatalogSkill[]; unrecognizedLines: number }
   | { status: "no-block" }
   | { status: "unsupported" };
 
-/**
- * `observed`: every line of the block was recognized; `partial`: some were not, so an unrecognized skill is unknown;
- * `no-block` and `unsupported` leave which skills were listed unknown.
- */
-export type CatalogCoverage = "observed" | "partial" | "no-block" | "unsupported";
+const COVERAGES = ["observed", "partial", "no-block", "unsupported"] as const;
+export type CatalogCoverage = (typeof COVERAGES)[number];
 
 export interface CatalogDefinition {
   catalogId: string;
   format: CatalogFormat | "unknown";
   coverage: CatalogCoverage;
-  /** As rendered, including any host shortening; never re-read from skill files. */
   entries: CatalogSkill[];
   limitations: string[];
 }
@@ -57,8 +48,8 @@ export interface CatalogBinding {
 
 const STANDARD_ENTRY = /^- ([^\s:]+): (.*)$/;
 const CUSTOM_ENTRY = /^<skill name="([^"\n]+)">\n([^\n]*)\n<\/skill>$/gm;
+const CUSTOM_ENTRY_LINES = 3;
 
-/** The skills the system prompt's `<skills>` block lists, in whichever host form recognizes more of its entries. */
 export function parseSkillsBlock(systemPrompt: readonly string[]): SkillsBlock {
   const block = /<skills>\n([\s\S]*?)\n<\/skills>/.exec(systemPrompt.join("\n"))?.[1];
   if (block === undefined) return { status: "no-block" };
@@ -68,9 +59,8 @@ export function parseSkillsBlock(systemPrompt: readonly string[]): SkillsBlock {
     return entry ? [{ name: entry[1]!, description: entry[2]! }] : [];
   });
   const custom = [...block.matchAll(CUSTOM_ENTRY)].map(([, name, description]) => ({ name: name!, description: description! }));
-  // A custom-prompt entry spans three lines: its opening tag, its description and its closing tag.
   const parsed = custom.length > standard.length
-    ? { format: "custom" as const, skills: custom, lines: custom.length * 3 }
+    ? { format: "custom" as const, skills: custom, lines: custom.length * CUSTOM_ENTRY_LINES }
     : { format: "standard" as const, skills: standard, lines: standard.length };
   if (parsed.skills.length === 0) return { status: "unsupported" };
   return { status: "listed", format: parsed.format, skills: parsed.skills, unrecognizedLines: lines.length - parsed.lines };
@@ -92,7 +82,7 @@ function catalogDefinition(systemPrompt: readonly string[]): CatalogDefinition {
   const format = block.status === "listed" ? block.format : "unknown";
   const coverage: CatalogCoverage = block.status !== "listed" ? block.status : block.unrecognizedLines > 0 ? "partial" : "observed";
   const entries = block.status === "listed" ? block.skills : [];
-  const catalogId = createHash("sha256").update(JSON.stringify([format === "unknown" ? "standard" : format, coverage, entries])).digest("hex").slice(0, 16);
+  const catalogId = digest([format === "unknown" ? "standard" : format, coverage, entries]);
   const limitation = coverageLimitation(block);
   return { catalogId, format, coverage, entries, limitations: [HOOK_LIMITATION, ...(limitation ? [limitation] : [])] };
 }
@@ -174,18 +164,11 @@ export function registerCatalogCapture(pi: ExtensionAPI, isObservable: (ctx: Ext
   return () => gap;
 }
 
-/** `position` is where the observation was made: its prompt's user message, or the binding itself when that message isn't on the branch. */
-interface BoundCatalog { index: number; position: number; bindingId: string; binding: CatalogBinding; definitionId: string; definition: CatalogDefinition }
+/** `promptIndex` is where the observation was made: its prompt's user message, or the binding itself when that message isn't on the branch. */
+interface BoundCatalog { index: number; promptIndex: number; bindingId: string; binding: CatalogBinding; definitionId: string; definition: CatalogDefinition }
 
 interface CatalogHistory { bound: BoundCatalog[]; definitions: Map<string, { id: string; definition: CatalogDefinition }>; unavailable: Array<{ index: number; text: string }> }
 
-/**
- * The active branch's catalog history: its bindings in order, each with the
- * definition before it on the same branch, the definitions it reaches, and
- * why any of the extension's entries are unavailable evidence: malformed, or
- * a binding whose definition isn't on this branch (lost, or a copy that left
- * it behind), never resolved from another branch or session.
- */
 function catalogBindings(branch: readonly SessionEntry[]): CatalogHistory {
   const definitions: CatalogHistory["definitions"] = new Map();
   const bound: BoundCatalog[] = [];
@@ -204,7 +187,7 @@ function catalogBindings(branch: readonly SessionEntry[]): CatalogHistory {
         continue;
       }
       const found = definitions.get(binding.catalogId);
-      if (found) bound.push({ index, position: positions.get(binding.observedAt) ?? index, bindingId: entry.id, binding, definitionId: found.id, definition: found.definition });
+      if (found) bound.push({ index, promptIndex: positions.get(binding.observedAt) ?? index, bindingId: entry.id, binding, definitionId: found.id, definition: found.definition });
       else unavailable.push({ index, text: `the observation at entry \`${binding.observedAt}\` (binding \`${entry.id}\`) refers to catalog \`${binding.catalogId}\`, whose definition is not on this branch, so that observation is unavailable` });
     }
   }
@@ -212,32 +195,30 @@ function catalogBindings(branch: readonly SessionEntry[]): CatalogHistory {
 }
 
 const isCatalogDefinition = (data: unknown): data is CatalogDefinition =>
-  isRecord(data) && typeof data.catalogId === "string" && ["observed", "partial", "no-block", "unsupported"].includes(data.coverage as string) &&
+  isRecord(data) && typeof data.catalogId === "string" && COVERAGES.includes(data.coverage as CatalogCoverage) &&
   Array.isArray(data.entries) && data.entries.every((entry) => isRecord(entry) && typeof entry.name === "string" && typeof entry.description === "string") &&
   Array.isArray(data.limitations) && data.limitations.every((limitation) => typeof limitation === "string");
 
 const isCatalogBinding = (data: unknown): data is CatalogBinding =>
   isRecord(data) && typeof data.catalogId === "string" && typeof data.observedAt === "string" && (data.afterGap === undefined || typeof data.afterGap === "string");
 
-/** A known gap and the branch indexes it may cover: after `from`, up to and including `to`. */
-interface KnownGap { text: string; from: number; to: number }
+/** A known gap and the branch indexes it may cover. */
+interface KnownGap { text: string; after: number; through: number }
 
 /** The known gaps: unavailable entries, each capture failure recorded before a later observation, then one not yet followed by an observation. */
 function captureGaps({ bound, unavailable }: CatalogHistory, pending: string | undefined): KnownGap[] {
   return [
-    ...unavailable.map(({ index, text }) => ({ text, from: index - 1, to: index })),
+    ...unavailable.map(({ index, text }) => ({ text, after: index - 1, through: index })),
     ...bound.flatMap(({ binding, index }, at) => binding.afterGap
-      ? [{ text: `${binding.afterGap}; what the system prompt listed before the observation at entry \`${binding.observedAt}\` is unknown back to the previous one`, from: bound[at - 1]?.index ?? -1, to: index }]
+      ? [{ text: `${binding.afterGap}; what the system prompt listed before the observation at entry \`${binding.observedAt}\` is unknown back to the previous one`, after: bound[at - 1]?.index ?? -1, through: index }]
       : []),
-    ...(pending ? [{ text: `${pending}; what the system prompt listed since the latest observation is unknown until the next one`, from: bound.at(-1)?.index ?? -1, to: Infinity }] : []),
+    ...(pending ? [{ text: `${pending}; what the system prompt listed since the latest observation is unknown until the next one`, after: bound.at(-1)?.index ?? -1, through: Infinity }] : []),
   ];
 }
 
 export interface CatalogSummary {
   observations: number;
-  /** The latest observation; `skills` is absent when its coverage leaves the listed skills unknown. */
   latest?: { observedAt: string; skills?: number };
-  /** Known capture gaps on this branch, including an unrecovered failure. */
   gaps: string[];
 }
 
@@ -254,7 +235,6 @@ export function catalogSummary(branch: readonly SessionEntry[], pendingGap?: str
 const describeLatest = ({ observedAt, skills }: NonNullable<CatalogSummary["latest"]>) =>
   `the latest, at entry \`${observedAt}\`, ${skills === undefined ? "left the listed skills unknown" : `listed ${skills} skill${skills === 1 ? "" : "s"}`}`;
 
-/** The payload section: availability, known gaps and lookup instructions, never the entries; empty without either. */
 export function renderCatalogSummary(summary: CatalogSummary): string {
   if (!summary.latest && summary.gaps.length === 0) return "";
   return [
@@ -262,17 +242,17 @@ export function renderCatalogSummary(summary: CatalogSummary): string {
     "",
     `${summary.latest ? `${summary.observations} skill catalog observation${summary.observations === 1 ? "" : "s"} on this branch; ${describeLatest(summary.latest)}.` : "No skill catalog observation on this branch."} ` +
       "Look a skill up with `observer_review` `action: \"catalog\"`: by its exact name in `skill`, or by words its description must all contain in `terms`; `at` narrows it to the latest observation at or before an entry, and results come in pages with a `cursor`. An observation is what the system prompt listed when the `before_agent_start` hook ran, with OMP's later skill notices applied while they stayed in context, not proof of what the model received.",
-    ...summary.gaps.map((gap) => `- Known gap: ${gap}.`),
+    ...summary.gaps.map(gapLine),
   ].join("\n");
 }
 
-/** The evidence report's one line. */
+const gapLine = (gap: string) => `- Known gap: ${gap}.`;
+
 export function describeCatalogSummary(summary: CatalogSummary): string {
   const observed = summary.latest ? `${summary.observations} on this branch; ${describeLatest(summary.latest)}` : "none on this branch (unknown)";
   return [observed, ...summary.gaps].join("; ");
 }
 
-/** What the model could see of one skill at a point: listed with a description, not listed, or unknown and why. */
 interface SkillState {
   status: "listed" | "not-listed" | "unknown";
   description?: string;
@@ -285,33 +265,20 @@ export interface CatalogMatch {
   bindingId: string;
   definitionId: string;
   coverage: CatalogCoverage;
-  /** Where this state took effect: the observation's prompt entry, a later skill notice, a compaction or a `/clear` reset boundary. */
   at: string;
   via: "catalog" | "skill-notice" | "compaction" | "reset";
-  /** `listed` with the rendered description, `not-listed`, or `unknown`, with any rendered description kept. */
   status: SkillState["status"];
   description?: string;
-  /** Why the state is unknown or not listed, when the observation alone doesn't say. */
   reason?: string;
   limitations: string[];
 }
 
-/** Exact `skill` name or all-term description `terms`, optionally at session point `at`; `limit` and `cursor` page the results. */
 export interface CatalogQuery { skill?: string; terms?: string[]; at?: string; limit?: number; cursor?: string }
 
-/** One page of matches; `total` counts them all and `next` continues the same query while the catalog evidence is unchanged. */
 export interface CatalogLookup { skill?: string; terms?: string[]; at?: string; matches: CatalogMatch[]; gaps: string[]; total: number; next?: string }
 
 const PAGE_SIZE = 20;
 
-/**
- * Each observation on the branch as it bears on the skill named exactly
- * `skill`, or on each skill whose rendered description contains every term,
- * followed by each later change OMP's persisted skill notices and compactions
- * made to what the context advertised about it; ordered by observation, then
- * skill name. With `at`, only the latest observation at or before that entry,
- * with the changes up to it and the gaps between.
- */
 export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry[], pendingGap?: string): { lookup: CatalogLookup; text: string } {
   const name = query.skill?.trim() ?? "";
   const terms = (query.terms ?? []).map((term) => term.trim().toLowerCase()).filter(Boolean);
@@ -325,9 +292,9 @@ export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry
   if (query.at !== undefined) {
     const point = branch.findIndex((entry) => entry.id === query.at);
     if (point < 0) throw new Error(`Entry \`${query.at}\` is not on the active branch; \`at\` takes the exact ID of an entry on this branch`);
-    const latest = scope.findLast(({ catalog }) => catalog.position <= point);
-    const after = latest?.catalog.index ?? -1;
-    gaps = gaps.filter(({ from, to }) => from < point && to > after);
+    const latest = scope.findLast(({ catalog }) => catalog.promptIndex <= point);
+    const latestIndex = latest?.catalog.index ?? -1;
+    gaps = gaps.filter(({ after, through }) => after < point && through > latestIndex);
     scope = latest ? [{ catalog: latest.catalog, end: Math.min(latest.end, point + 1) }] : [];
   }
   const describes = (match: CatalogMatch) => terms.every((term) => match.description?.toLowerCase().includes(term));
@@ -343,7 +310,7 @@ export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry
   const next = remaining > 0 ? `${offset + matches.length}.${queryKey}.${revision}` : undefined;
   const lookup: CatalogLookup = { ...(name ? { skill: name } : { terms }), ...(query.at !== undefined && { at: query.at }), matches, gaps: gaps.map(({ text }) => text), total: all.length, ...(next && { next }) };
 
-  const gapLines = lookup.gaps.map((gap) => `- Known gap: ${gap}.`);
+  const gapLines = lookup.gaps.map(gapLine);
   const where = query.at === undefined ? "on this branch" : `on this branch at or before entry \`${query.at}\``;
   const wanted = terms.map((term) => `"${term}"`).join(", ");
   if (all.length === 0) {
@@ -366,7 +333,6 @@ export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry
 
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex").slice(0, 16);
 
-/** The entries a lookup's results depend on, which a continuation must find unchanged; tool calls and replies are not among them. */
 const isCatalogEvidence = (entry: SessionEntry) =>
   (entry.type === "custom" && (entry.customType === CATALOG_DEFINITION_TYPE || entry.customType === CATALOG_BINDING_TYPE)) ||
   (entry.type === "custom_message" && entry.customType === SKILL_NOTICE_TYPE) || entry.type === "compaction" || entry.type === "reset_boundary";
@@ -380,7 +346,6 @@ function cursorOffset(cursor: string, queryKey: string, revision: string, total:
   return start;
 }
 
-/** The skills an observation lists and its later skill notices name up to `end`, sorted by name. */
 function skillNames(branch: readonly SessionEntry[], catalog: BoundCatalog, end: number): string[] {
   const names = new Set(catalog.definition.entries.map(({ name }) => name));
   for (const entry of branch.slice(catalog.index + 1, end)) {
@@ -402,7 +367,6 @@ function describeMatch(match: CatalogMatch): string {
   return `- \`${match.skill}\` ${where}: ${state}`;
 }
 
-/** What the observation said of `name`, then each change the notices and compactions after it made, up to the next observation at `end`. */
 function skillHistory(name: string, branch: readonly SessionEntry[], catalog: BoundCatalog, end: number): CatalogMatch[] {
   const { binding, bindingId, definitionId, definition } = catalog;
   const match = (at: string, via: CatalogMatch["via"], state: SkillState): CatalogMatch =>
@@ -410,26 +374,25 @@ function skillHistory(name: string, branch: readonly SessionEntry[], catalog: Bo
   let base = catalogState(definition, name);
   const history = [match(binding.observedAt, "catalog", base)];
   const notices: Array<{ index: number; id: string; state: SkillState }> = [];
-  let compaction: { index: number; entry: SessionEntry } | undefined;
   let current = base;
   for (let index = catalog.index + 1; index < end; index++) {
     const entry = branch[index]!;
+    const id = entry.id ?? "(no id)";
     if (entry.type === "custom_message" && entry.customType === SKILL_NOTICE_TYPE) {
       const state = noticeState(entry, name);
       if (!state) continue;
-      notices.push({ index, id: entry.id ?? "(no id)", state });
+      notices.push({ index, id, state });
       current = state;
-      history.push(match(entry.id ?? "(no id)", "skill-notice", state));
+      history.push(match(id, "skill-notice", state));
     } else if (entry.type === "reset_boundary") {
       // OMP's context build starts after the latest /clear boundary and the system prompt is rebuilt, so earlier notices are gone.
       notices.length = 0;
       base = { status: "unknown", reason: "a `/clear` dropped the context and OMP rebuilt the system prompt, so what it lists is unknown until the next observation" };
       current = base;
-      history.push(match(entry.id ?? "(no id)", "reset", base));
+      history.push(match(id, "reset", base));
     } else if (entry.type === "compaction") {
-      compaction = { index, entry };
-      const next = stateAfterCompaction(base, notices, compaction, branch);
-      if (!sameState(next, current)) history.push(match(entry.id ?? "(no id)", "compaction", next));
+      const next = stateAfterCompaction(base, notices, { index, entry }, branch);
+      if (!sameState(next, current)) history.push(match(id, "compaction", next));
       current = next;
     }
   }
@@ -495,18 +458,12 @@ const NOTICE_SECTIONS: Record<string, "announced" | "removed"> = {
 };
 const REMOVED_ENTRY = /^- `([^`]+)`$/;
 
-/** What a persisted skill notice said of `name`; `undefined` when it plainly didn't name it. */
 function noticeState(entry: SessionEntry, name: string): SkillState | undefined {
   const notice = parseNotice(entry);
   if ("opaque" in notice) return { status: "unknown", reason: `the skill notice ${notice.opaque}, so whether it named the skill is unknown` };
   return notice.states.get(name);
 }
 
-/**
- * A skill notice as rendered, which is what the model read, checked against
- * its structured `details`: a skill they disagree on keeps only its rendered
- * description and an unknown attribution.
- */
 function parseNotice(entry: SessionEntry): { states: Map<string, SkillState> } | { opaque: string } {
   const content: unknown = entry.content;
   const text = typeof content === "string" ? content
