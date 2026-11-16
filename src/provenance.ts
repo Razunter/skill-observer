@@ -122,18 +122,26 @@ interface InstalledPlugin {
 /** The enabled plugins in OMP's registry; none when it is missing or unreadable. */
 function readPlugins(registryFile: string): InstalledPlugin[] {
   try {
-    const registry = JSON.parse(readFileSync(registryFile, "utf8")) as {
-      plugins?: Record<string, Array<{ installPath?: string; version?: string; enabled?: boolean }>>;
-    };
-    return Object.entries(registry.plugins ?? {}).flatMap(([id, entries]) =>
-      entries
-        // OMP skips a disabled entry, so its skills are not loaded.
-        .filter((entry) => entry.enabled !== false && typeof entry.installPath === "string")
-        .map((entry) => ({ id, version: entry.version || "unknown", installPath: resolve(entry.installPath as string) })),
-    );
+    return parsePlugins(readFileSync(registryFile, "utf8"));
   } catch {
     return [];
   }
+}
+
+/** The enabled plugins a registry's text lists; throws when it is no registry. */
+function parsePlugins(text: string): InstalledPlugin[] {
+  const registry = JSON.parse(text) as { plugins?: unknown } | null;
+  const plugins = registry?.plugins ?? {};
+  if (typeof registry !== "object" || registry === null || typeof plugins !== "object" || plugins === null || Array.isArray(plugins) ||
+      Object.values(plugins).some((entries) => !Array.isArray(entries) || entries.some((entry) => typeof entry !== "object" || entry === null))) {
+    throw new Error("its `plugins` must map each plugin id to a list of install entries");
+  }
+  return Object.entries(plugins as Record<string, Array<{ installPath?: string; version?: string; enabled?: boolean }>>).flatMap(([id, entries]) =>
+    entries
+      // OMP skips a disabled entry, so its skills are not loaded.
+      .filter((entry) => entry.enabled !== false && typeof entry.installPath === "string")
+      .map((entry) => ({ id, version: entry.version || "unknown", installPath: resolve(entry.installPath as string) })),
+  );
 }
 
 function listSkillFiles(root: string): string[] {
@@ -144,6 +152,53 @@ function listSkillFiles(root: string): string[] {
   } catch {
     return [];
   }
+}
+
+/** A searched skill source: `absent` when it does not exist, `unavailable` when it exists but could not be read. */
+export interface SourceCoverage { source: string; path: string; status: "present" | "absent" | "unavailable"; reason?: string }
+
+/** An installed skill as a scan read it: where it comes from and its entry file's bytes. */
+export interface ScannedSkill { provenance: Exclude<SkillProvenance, { kind: "unknown" }>; bytes: Buffer }
+
+/**
+ * Every installed skill of the user's skills directory, the managed-skills
+ * directory and each enabled plugin, with each source's coverage. Unlike the
+ * resolver, which reads such a source as empty, a root or registry that exists
+ * but can't be read is `unavailable`.
+ */
+export function scanInstalledSkills(roots: SkillRoots): { coverage: SourceCoverage[]; skills: ScannedSkill[] } {
+  const resolver = createProvenanceResolver(roots);
+  const coverage: SourceCoverage[] = [];
+  const skills: ScannedSkill[] = [];
+  const failure = (error: unknown) => (error instanceof Error ? error.message : String(error));
+  const scan = (source: string, root: string) => {
+    if (!existsSync(root)) return void coverage.push({ source, path: root, status: "absent" });
+    try {
+      const found = readdirSync(root).map((folder) => join(root, folder, "SKILL.md")).filter((file) => existsSync(file)).sort()
+        .map((file) => ({ provenance: resolver.byPath(file), bytes: readFileSync(file) }));
+      for (const { provenance, bytes } of found) if (provenance.kind !== "unknown") skills.push({ provenance, bytes });
+      coverage.push({ source, path: root, status: "present" });
+    } catch (error) {
+      coverage.push({ source, path: root, status: "unavailable", reason: failure(error) });
+    }
+  };
+  scan("skills directory", roots.skillsDir);
+  scan("managed skills", roots.managedDir);
+  const registry = { source: "plugin registry", path: roots.pluginsRegistry };
+  if (!existsSync(roots.pluginsRegistry)) {
+    coverage.push({ ...registry, status: "absent" });
+    return { coverage, skills };
+  }
+  let plugins: InstalledPlugin[];
+  try {
+    plugins = parsePlugins(readFileSync(roots.pluginsRegistry, "utf8"));
+  } catch (error) {
+    coverage.push({ ...registry, status: "unavailable", reason: failure(error) });
+    return { coverage, skills };
+  }
+  coverage.push({ ...registry, status: "present" });
+  for (const plugin of plugins) scan(`plugin ${plugin.id}`, join(plugin.installPath, "skills"));
+  return { coverage, skills };
 }
 
 /**

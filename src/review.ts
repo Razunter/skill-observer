@@ -24,7 +24,9 @@ import {
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, observationPassStart, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
-import { createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver, skillHash, type SkillProvenance } from "./provenance.js";
+import {
+  createProvenanceResolver, defaultSkillRoots, ompAgentDir, type ProvenanceResolver, scanInstalledSkills, skillHash, type SkillProvenance, type SkillRoots, type SourceCoverage,
+} from "./provenance.js";
 import { checkCompanionCommand, checkHookCommand } from "./project-publication.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
@@ -72,9 +74,11 @@ interface Citation { source: string; lines?: { from: number; to: number }; secti
 /**
  * Why current guidance does not already address a skill-text repair's finding
  * and what the change would make a future agent do: `inspection` is the
- * `observer_review` inspect call whose receipt the `citations` name.
+ * `observer_review` inspect call whose receipt the `citations` name. A new
+ * skill's diagnosis cites a new-skill search instead: `search` holds its terms
+ * and the names it matched, which `explanation` says do not fit.
  */
-interface CandidateDiagnosis { inspection: string; explanation: string; delta: string; citations: Citation[] }
+interface CandidateDiagnosis { inspection: string; explanation: string; delta: string; citations: Citation[]; search?: { terms: string[]; matches: string[] } }
 
 /**
  * One guidance source an inspection read, at the bytes it read: the skill's
@@ -97,6 +101,23 @@ export interface GuidanceInspection {
   kind: Exclude<SkillProvenance["kind"], "unknown">;
   sources: GuidanceSource[];
   referenceInventory: Array<{ path: string; sha256: string }>;
+}
+
+/** A skill a new-skill search compared against its terms, by identity: its source and, for an installed one, its entry file. */
+interface SearchedSkill { name: string; description: string; source: string; path?: string }
+
+/**
+ * The receipt of a new-skill inspect: no current skill is named `skill`, and
+ * which skills of every searched source matched `terms`. `fingerprint` covers
+ * the whole searched inventory and every entry file's bytes, matched or not.
+ * A `supplemental` source is reported but neither blocks nor is fingerprinted.
+ */
+export interface GuidanceSearch {
+  skill: string;
+  terms: string[];
+  coverage: Array<SourceCoverage & { supplemental?: true }>;
+  matches: Array<SearchedSkill & { matched: string[] }>;
+  fingerprint: string;
 }
 
 interface CandidateDraft {
@@ -174,6 +195,7 @@ interface ReviewParams {
   action: "inspect" | "prepare" | "select";
   skill?: string;
   references?: string[];
+  terms?: string[];
   candidates?: ReviewCandidate[];
   proposals?: PreparedProposalRef[];
   rankings?: Ranking[];
@@ -195,6 +217,7 @@ interface ReviewDetails {
   fallback?: string;
   failures: string[];
   inspection?: GuidanceInspection;
+  search?: GuidanceSearch;
 }
 
 interface PrepareContext {
@@ -206,8 +229,12 @@ interface PrepareContext {
   /** The whole ledger: a withdrawal cites a fix wherever it was recorded. */
   ledger: readonly LedgerRecord[];
   provenance: ProvenanceResolver;
-  /** The session branch, where a reconciliation's approval is saved. */
+  /** Where the installed skills a new-skill search covers live. */
+  roots: SkillRoots;
+  /** The session branch, where a reconciliation's approval is saved and inspections and created skills are found. */
   branch: readonly SessionEntry[];
+  /** The host's current system prompt, when it exposes one: a supplemental skill catalog. */
+  systemPrompt?: string[];
   /** Filled by Prepare: the `## ` headings of each on-read append's target amendment at the bytes it read, by candidate ID, kept out of the proposal so its content hash ignores them. */
   amendmentSections: Map<string, string[]>;
 }
@@ -255,24 +282,26 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
       preserved: z.string().describe("Why the revision keeps the approved intent and the target's unrelated content."),
     }).optional().describe("On-read append or rule only: revises an approved proposal, in the same pass, by the note the user attached to its Apply (read from the Ask; a section, or a rule's body, pattern and samples, not its name), for a target that changed after its Prepare, or both. The main agent's reconciliation, not the user's approval: a change that would drop or rewrite the target's new content, or delete a target, needs a new proposal and Ask."),
     diagnosis: z.object({
-      inspection: z.string().describe("The ID of this pass's observer_review inspect call of the candidate's skill, whose receipt the citations name."),
-      explanation: z.string().describe("Why the inspected guidance does not already address the finding (missing, unclear or ignored), with the check that could have shown otherwise and its result."),
+      inspection: z.string().describe("The ID of this pass's observer_review inspect call of the candidate's skill, whose receipt the citations name; for a new skill, of its new-skill search."),
+      explanation: z.string().describe("Why the inspected guidance does not already address the finding (missing, unclear or ignored), with the check that could have shown otherwise and its result; for a new skill, why each search match does not fit."),
       delta: z.string().describe("One sentence: what a future agent will do differently."),
       citations: z.array(z.object({
         source: z.string().describe("A source `path` the inspection receipt lists."),
         lines: z.object({ from: z.number(), to: z.number() }).optional().describe("1-based inclusive lines of that source as inspected."),
         section: z.string().optional().describe("A `## ` heading of that source as inspected."),
-      })).describe("The inspected guidance the explanation rests on, each by `lines`, `section` or both."),
-    }).optional().describe("The candidate diagnosis: required for a direct edit of a local or managed skill, an on-read append and a rule; omitted for a new skill, a project or harness remedy, stale answers, withdrawals and compactions."),
+      })).optional().describe("Required for a repair, omitted for a new skill: the inspected guidance the explanation rests on, each by `lines`, `section` or both."),
+    }).optional().describe("The candidate diagnosis: required for a new skill, a direct edit of a local or managed skill, an on-read append and a rule; omitted for a project or harness remedy, stale answers, withdrawals and compactions."),
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Inspect a skill's current guidance before drafting a repair to it: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force), and the reference files requested from its observer reference folder, each with line numbers, `sha256` and `## ` sections, plus the folder's inventory by fingerprint; the successful result is the receipt a candidate `diagnosis` cites by its call ID. Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. Prepare refuses a direct edit of a local or managed skill, an on-read append or a rule without a `diagnosis` naming a successful inspect receipt of its skill from this pass on this branch, its explanation, its behavior delta and citations of places that receipt inspected; Prepare, and Select again before producing its form, refuse it once that skill's inspected sources, rules or reference folder inventory changed: inspect again and prepare again. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither writes, asks, approves nor publishes and never calls a model.",
+    description: "Inspect a skill's current guidance before drafting a repair to it: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force), and the reference files requested from its observer reference folder, each with line numbers, `sha256` and `## ` sections, plus the folder's inventory by fingerprint; the successful result is the receipt a candidate `diagnosis` cites by its call ID. With `terms`, inspect searches for a new skill instead: it fails when a skill named `skill` is installed or was created this session, or when the skills directory, managed skills, plugin registry or an enabled plugin's skills exist but can't be read; otherwise it reports each source's coverage and the skills whose name or description holds a term. A fitting match is no new skill: inspect it and repair it. Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. Prepare refuses a direct edit of a local or managed skill, an on-read append or a rule without a `diagnosis` naming a successful inspect receipt of its skill from this pass on this branch, its explanation, its behavior delta and citations of places that receipt inspected; Prepare, and Select again before producing its form, refuse it once that skill's inspected sources, rules or reference folder inventory changed: inspect again and prepare again. A new skill needs a `diagnosis` naming its new-skill search from this pass on this branch, why the matches do not fit and its behavior delta; Prepare and Select refuse it once a skill of that name exists or the searched inventory or any searched skill file changed. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither writes, asks, approves nor publishes and never calls a model.",
     parameters: z.object({
       action: z.enum(["inspect", "prepare", "select"]),
-      skill: z.string().optional().describe("Inspect only: the installed skill whose current guidance to read."),
+      skill: z.string().optional().describe("Inspect only: the installed skill whose current guidance to read; with `terms`, the name of the proposed new skill."),
       references: z.array(z.string()).optional()
         .describe("Inspect only: file names in the skill's observer reference folder to read too; the others are only listed by fingerprint and are not inspected."),
+      terms: z.array(z.string()).optional()
+        .describe("Inspect only, for a proposed new skill: the words of its workflow to look for, case-insensitively, in every current skill's name and description."),
       candidates: z.array(z.union([
         z.object({ ...draft, kind: z.enum(PROPOSAL_KINDS), skill: z.string() }),
         z.object({ ...draft, kind: z.enum(["project"]), target: z.object({
@@ -291,16 +320,17 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
     }),
     async execute(toolCallId, params, signal, _update, ctx) {
       signal?.throwIfAborted();
-      if (params?.action === "inspect") return inspectResult(params, files, ctx.cwd);
+      if (params?.action === "inspect") return inspectResult(params, files, ctx);
       const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
       const amendmentSections = new Map<string, string[]>();
       try {
         const ledger = readLedger(files.ledgerFile());
         if (params?.action === "prepare") {
           if (!Array.isArray(params.candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
+          const roots = defaultSkillRoots(ctx.cwd);
           const context: PrepareContext = {
             cwd: ctx.cwd, agentDir: ompAgentDir(), dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
-            ledger, provenance: createProvenanceResolver(defaultSkillRoots(ctx.cwd)), branch: ctx.sessionManager.getBranch(), amendmentSections,
+            ledger, provenance: createProvenanceResolver(roots), roots, branch: ctx.sessionManager.getBranch(), systemPrompt: ctx.getSystemPrompt?.(), amendmentSections,
           };
           details.eligible = prepareProposals(params.candidates, context).map((proposal) => ({
             reference: { reviewToolCallId: toolCallId, candidateId: proposal.candidateId, contentHash: contentHash(proposal) },
@@ -340,17 +370,25 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
         } else {
           const selection = selectCandidates(details.eligible, compared, params.rankings, modelUnavailable ?? params.rankingFailure);
           const selected = selection.ordered.slice(0, 5);
-          const guidance = { dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(), provenance: createProvenanceResolver(defaultSkillRoots(ctx.cwd)) };
+          const roots = defaultSkillRoots(ctx.cwd);
+          const branch = ctx.sessionManager.getBranch();
+          const guidance = {
+            dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
+            provenance: createProvenanceResolver(roots), roots, branch, systemPrompt: ctx.getSystemPrompt?.(),
+          };
           for (const { reference, proposal } of selected) {
             const { diagnosis } = proposal;
             if (!diagnosis) {
-              if (isSkillTextRepair(proposal)) {
-                throw new Error(`proposal \`${reference.candidateId}\` was prepared without a candidate diagnosis: inspect \`${proposal.skill}\` with observer_review \`action: "inspect"\`, cite that receipt, then prepare it again`);
+              if (isSkillTextRepair(proposal) || isNewSkill(proposal)) {
+                const how = proposal.kind === "new" ? `search for \`${proposal.skill}\` with observer_review \`action: "inspect"\` and its \`terms\``
+                  : `inspect \`${proposal.skill}\` with observer_review \`action: "inspect"\``;
+                throw new Error(`proposal \`${reference.candidateId}\` was prepared without a candidate diagnosis: ${how}, cite that receipt, then prepare it again`);
               }
               continue;
             }
             try {
-              checkCurrent(diagnosis.inspection, inspectionReceipt(diagnosis.inspection, ctx.sessionManager.getBranch()), guidance);
+              if (proposal.kind === "new") checkSearchCurrent(diagnosis.inspection, searchReceipt(diagnosis.inspection, branch), guidance);
+              else checkCurrent(diagnosis.inspection, inspectionReceipt(diagnosis.inspection, branch), guidance);
             } catch (error) {
               throw new Error(`proposal \`${reference.candidateId}\`: ${error instanceof Error ? error.message : String(error)}, then prepare it again`);
             }
@@ -379,13 +417,19 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
   });
 }
 
-/** The inspect action: the receipt in `details.inspection`, and each source's text numbered by line for citing; any unreadable, missing or malformed required source fails it. */
-function inspectResult(params: ReviewParams, files: ObserverFiles, cwd: string) {
+/** The inspect action: the receipt in `details.inspection`, and each source's text numbered by line for citing; any unreadable, missing or malformed required source fails it. With `terms`, the new-skill search's receipt in `details.search`. */
+function inspectResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext) {
   const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
   try {
     if (params.candidates !== undefined || params.proposals !== undefined) throw new Error("Inspect takes a `skill` and optional `references`, not candidates or proposal references");
+    if (params.terms !== undefined) {
+      if (params.references !== undefined) throw new Error("A new-skill search takes `skill` and `terms`; a new skill has no reference files yet");
+      const { search, text } = searchGuidance(params.skill, params.terms, defaultSkillRoots(ctx.cwd), ctx.sessionManager.getBranch(), ctx.getSystemPrompt?.());
+      details.search = search;
+      return { content: [{ type: "text" as const, text }], details, isError: false };
+    }
     const { inspection, text } = inspectGuidance(params.skill, params.references,
-      { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, files.referencesDir(), createProvenanceResolver(defaultSkillRoots(cwd)));
+      { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, files.referencesDir(), createProvenanceResolver(defaultSkillRoots(ctx.cwd)));
     details.inspection = inspection;
     return { content: [{ type: "text" as const, text }], details, isError: false };
   } catch (error) {
@@ -455,6 +499,88 @@ function guidanceSource(role: GuidanceSource["role"], path: string, status: Guid
   };
 }
 
+/**
+ * Searches every current skill's name and description for a proposed new
+ * skill's `terms`: the installed skills, the managed skills created on this
+ * branch, and the host's prompt catalog as supplemental evidence. Throws when
+ * a skill already has the name, or a required source exists but can't be read.
+ */
+function searchGuidance(skill: unknown, terms: unknown, roots: SkillRoots, branch: readonly SessionEntry[], systemPrompt: string[] | undefined): { search: GuidanceSearch; text: string } {
+  if (typeof skill !== "string" || !skill.trim()) throw new Error("A new-skill search needs the proposed skill's name in `skill`");
+  if (!Array.isArray(terms) || terms.length === 0 || terms.some((term) => typeof term !== "string" || !term.trim())) {
+    throw new Error("A new-skill search needs `terms`: the words of its workflow to look for in current skill names and descriptions");
+  }
+  const name = skill.trim();
+  const words = terms.map((term: string) => term.trim());
+  const installed = scanInstalledSkills(roots);
+  const created = createdSkills(branch);
+  const prompt = promptCatalog(systemPrompt);
+  const coverage: GuidanceSearch["coverage"] = [
+    ...installed.coverage, { source: "skills created this session", path: "session branch", status: created.length > 0 ? "present" : "absent" },
+    { ...prompt.coverage, supplemental: true },
+  ];
+  const unavailable = installed.coverage.filter(({ status }) => status === "unavailable");
+  if (unavailable.length > 0) {
+    throw new Error(`the search for \`${name}\` could not read ${unavailable.map(({ source, path, reason }) => `${source} \`${path}\` (${reason})`).join("; ")}, so it can't show that no skill there already covers the workflow; report the unreadable source instead of proposing the skill`);
+  }
+  const searched: SearchedSkill[] = [
+    ...installed.skills.map(({ provenance, bytes }) => ({
+      name: provenance.name, description: parseFrontmatter(bytes.toString("utf8"))?.frontmatter.description ?? "",
+      source: provenance.kind === "plugin" ? `plugin ${provenance.plugin}` : provenance.kind, path: provenance.path,
+    })),
+    ...created.map((createdName) => ({ name: createdName, description: "", source: "created this session" })),
+    ...prompt.skills.map((listed) => ({ ...listed, source: "prompt catalog" })),
+  ];
+  const identity = ({ source, path }: SearchedSkill) => (path ? `${source} \`${path}\`` : source);
+  const existing = searched.filter((entry) => entry.name === name);
+  if (existing.length > 0) {
+    throw new Error(`a skill named \`${name}\` already exists (${existing.map(identity).join("; ")}): inspect it and propose a repair to it, not a new skill`);
+  }
+  const matches = searched.flatMap((entry) => {
+    const haystack = `${entry.name}\n${entry.description}`.toLowerCase();
+    const matched = words.filter((word) => haystack.includes(word.toLowerCase()));
+    return matched.length > 0 ? [{ ...entry, matched }] : [];
+  });
+  // Optional sources that are absent still count: one appearing later changes the searched inventory.
+  const fingerprint = createHash("sha256").update(JSON.stringify([
+    installed.coverage.map(({ source, path, status }) => [source, path, status]),
+    installed.skills.map(({ provenance, bytes }) => [provenance.path, createHash("sha256").update(bytes).digest("hex")]),
+    created.toSorted(),
+  ])).digest("hex");
+  const text = [
+    `No current skill is named \`${name}\`. Cite this call's ID as the new skill's diagnosis \`inspection\` and say why each match does not fit; before dismissing a match that might fit, inspect it with \`skill\` and no \`terms\`, and propose a repair to it when it fits.`,
+    `Searched names and descriptions for: ${words.map((word) => `\`${word}\``).join(", ")}.`,
+    "Coverage:",
+    ...coverage.map(({ source, path, status, reason, supplemental }) => `- ${source} \`${path}\`: ${status}${reason ? ` (${reason})` : ""}${supplemental ? "; supplemental, never blocks" : ""}`),
+    matches.length > 0 ? `Matches (${matches.length}):` : "No skill matched.",
+    ...matches.map((match) => `- \`${match.name}\` (${identity(match)}) on ${match.matched.map((word) => `\`${word}\``).join(", ")}: ${match.description}`),
+  ].join("\n");
+  return { search: { skill: name, terms: words, coverage, matches, fingerprint }, text };
+}
+
+/** The managed skills a successful `manage_skill` create on this branch named. */
+function createdSkills(branch: readonly SessionEntry[]): string[] {
+  return sessionToolEvidence(branch).completedCalls("manage_skill").flatMap(({ result }) => {
+    const details = result.details as { action?: unknown; name?: unknown } | undefined;
+    return !result.isError && details?.action === "create" && typeof details.name === "string" ? [details.name] : [];
+  });
+}
+
+/**
+ * The skills the host's standard `<skills>` block lists as `- name: description`.
+ * Any other form, such as a custom prompt's, or no prompt getter is reported as
+ * coverage the search lacks, not as an empty catalog.
+ */
+function promptCatalog(systemPrompt: string[] | undefined): { coverage: SourceCoverage; skills: Array<{ name: string; description: string }> } {
+  const base = { source: "prompt catalog", path: "system prompt" };
+  if (!systemPrompt) return { coverage: { ...base, status: "unavailable", reason: "the host exposes no system prompt" }, skills: [] };
+  const block = /<skills>\n([\s\S]*?)\n<\/skills>/.exec(systemPrompt.join("\n"))?.[1];
+  if (block === undefined) return { coverage: { ...base, status: "absent" }, skills: [] };
+  const listed = block.split("\n").map((line) => /^- ([^\s:]+): (.*)$/.exec(line));
+  if (listed.some((line) => !line)) return { coverage: { ...base, status: "unavailable", reason: "its skills block is not the standard `- name: description` list" }, skills: [] };
+  return { coverage: { ...base, status: "present" }, skills: listed.map((line) => ({ name: line![1]!, description: line![2]! })) };
+}
+
 /** What the model needs of a prepared proposal to rank, ask and answer it; its change and evidence stay in the saved details. */
 function preparedSummary({ reference, proposal }: PreparedEntry, amendmentSections: ReadonlyMap<string, string[]>) {
   const sections = "change" in proposal && proposal.change.operation === "on-read-append" ? amendmentSections.get(proposal.candidateId) : undefined;
@@ -508,13 +634,16 @@ function renderFieldset(proposal: PreparedProposal): string {
   ].join("\n");
 }
 
-/** A candidate diagnosis shown once beside its proposal: the explanation, the behavior delta and where each cited source was inspected, never the sources' text. */
-function renderDiagnosis({ inspection, explanation, delta, citations }: CandidateDiagnosis): string[] {
+/** A candidate diagnosis shown once beside its proposal: the explanation, the behavior delta and where each cited source was inspected, or what a new skill's search looked for and found, never the sources' text. */
+function renderDiagnosis({ inspection, explanation, delta, citations, search }: CandidateDiagnosis): string[] {
   const place = ({ source, lines, section }: Citation) => `${source}${lines ? ` lines ${lines.from}–${lines.to}` : ""}${section ? ` § ${section}` : ""}`;
+  const grounds = search
+    ? `Searched current skills, inspection ${inspection}, for: ${search.terms.join(", ")}; matches: ${search.matches.join(", ") || "none"}`
+    : `Cited guidance, inspection ${inspection}: ${citations.map(place).join("; ")}`;
   return [
     `<p>${escapeHtml(`Diagnosis: ${explanation}`)}</p>`,
     `<p>${escapeHtml(`Behavior change: ${delta}`)}</p>`,
-    `<p>${escapeHtml(`Cited guidance, inspection ${inspection}: ${citations.map(place).join("; ")}`)}</p>`,
+    `<p>${escapeHtml(grounds)}</p>`,
   ];
 }
 
@@ -561,8 +690,8 @@ function prepareProposals(candidates: readonly ReviewCandidate[], context: Prepa
   for (const candidate of ordered) {
     const prepared = preparedProposal(candidate, scoped, declined, [...grouped.values()], context);
     if (!prepared) continue;
-    const proposal = isSkillTextRepair(candidate)
-      ? { ...prepared, diagnosis: candidateDiagnosis(candidate.skill, candidate.diagnosis, context) } : prepared;
+    const proposal = isSkillTextRepair(candidate) || isNewSkill(candidate)
+      ? { ...prepared, diagnosis: candidateDiagnosis(candidate, context) } : prepared;
     const previous = grouped.get(proposal.candidateId);
     grouped.set(proposal.candidateId, previous ? joined(previous, proposal) : proposal);
   }
@@ -576,28 +705,56 @@ function isSkillTextRepair<T extends { kind: string; change?: { operation: strin
   return subject.kind !== "project" && subject.kind !== "harness" && subject.kind !== "new" && subject.change !== undefined && SKILL_TEXT_OPERATIONS.includes(subject.change.operation);
 }
 
-/** The candidate diagnosis of a repair to `skill`, its citations checked against the current inspection receipt it names on this branch. */
-function candidateDiagnosis(skill: string, draft: Partial<CandidateDiagnosis> | undefined, context: PrepareContext): CandidateDiagnosis {
+/** A proposed new skill, which needs a candidate diagnosis citing a new-skill search. */
+function isNewSkill<T extends { kind: string; change?: { operation: string } }>(subject: T): subject is T & { skill: string } {
+  return subject.kind === "new" && subject.change?.operation === "direct-edit";
+}
+
+/** The candidate diagnosis of a repair to, or a new, `skill`: its citations checked against the current inspection receipt it names on this branch, or its search still current. */
+function candidateDiagnosis({ skill, kind, diagnosis: draft }: ReviewCandidate & { skill: string }, context: PrepareContext): CandidateDiagnosis {
+  const isNew = kind === "new";
   const text = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : undefined);
   const [inspection, explanation, delta] = [text(draft?.inspection), text(draft?.explanation), text(draft?.delta)];
   const citations = Array.isArray(draft?.citations) && draft.citations.length > 0 ? draft.citations : undefined;
   const missing = [
-    !inspection && "`inspection`, the ID of the observer_review inspect call of the skill whose receipt it cites",
-    !explanation && "`explanation`, why current guidance does not already address the finding, with the check that could have shown otherwise and its result",
+    !inspection && (isNew ? "`inspection`, the ID of the observer_review new-skill search whose receipt it cites" : "`inspection`, the ID of the observer_review inspect call of the skill whose receipt it cites"),
+    !explanation && (isNew ? "`explanation`, why each skill the search matched does not fit" : "`explanation`, why current guidance does not already address the finding, with the check that could have shown otherwise and its result"),
     !delta && "`delta`, one sentence on what a future agent will do differently",
-    !citations && "`citations` of the inspected guidance",
+    !isNew && !citations && "`citations` of the inspected guidance",
   ].filter((part) => typeof part === "string");
-  if (!inspection || !explanation || !delta || !citations) {
-    throw new Error(`the repair of \`${skill}\` needs its candidate diagnosis ${missing.join("; ")}: inspect the skill with observer_review \`action: "inspect"\` and cite that receipt`);
+  if (missing.length > 0 || !inspection || !explanation || !delta) {
+    throw new Error(isNew
+      ? `the new skill \`${skill}\` needs its candidate diagnosis ${missing.join("; ")}: search for it with observer_review \`action: "inspect"\`, \`skill\` and \`terms\`, and cite that receipt`
+      : `the repair of \`${skill}\` needs its candidate diagnosis ${missing.join("; ")}: inspect the skill with observer_review \`action: "inspect"\` and cite that receipt`);
+  }
+  if (isNew) {
+    const search = searchReceipt(inspection, context.branch);
+    if (search.skill !== skill) throw new Error(`inspection \`${inspection}\` searched for \`${search.skill}\`, not \`${skill}\`: search for \`${skill}\` and cite that receipt`);
+    checkSearchCurrent(inspection, search, context);
+    return { inspection, explanation, delta, citations: [], search: { terms: search.terms, matches: [...new Set(search.matches.map(({ name }) => name))] } };
   }
   const receipt = inspectionReceipt(inspection, context.branch);
   if (receipt.skill !== skill) throw new Error(`inspection \`${inspection}\` read \`${receipt.skill}\`, not \`${skill}\`: inspect \`${skill}\` and cite that receipt`);
   checkCurrent(inspection, receipt, context);
-  return { inspection, explanation, delta, citations: citations.map((citation) => checkedCitation(citation, receipt, inspection)) };
+  return { inspection, explanation, delta, citations: citations!.map((citation) => checkedCitation(citation, receipt, inspection)) };
 }
 
-/** The receipt of the successful inspect call `id` of the current observation pass on this branch. */
+/** The receipt of the successful existing-skill inspect call `id` of the current observation pass on this branch. */
 function inspectionReceipt(id: string, branch: readonly SessionEntry[]): GuidanceInspection {
+  const { inspection } = inspectDetails(id, branch);
+  if (!inspection) throw new Error(`inspection \`${id}\` is a new-skill search, not a reading of a skill's guidance; inspect the skill without \`terms\` and cite that receipt`);
+  return inspection;
+}
+
+/** The receipt of the successful new-skill search `id` of the current observation pass on this branch. */
+function searchReceipt(id: string, branch: readonly SessionEntry[]): GuidanceSearch {
+  const { search } = inspectDetails(id, branch);
+  if (!search) throw new Error(`inspection \`${id}\` read an existing skill's guidance, not a new-skill search; search with \`skill\` and \`terms\` and cite that receipt`);
+  return search;
+}
+
+/** The details of the successful inspect call `id` of the current observation pass on this branch. */
+function inspectDetails(id: string, branch: readonly SessionEntry[]): Pick<ReviewDetails, "inspection" | "search"> {
   const label = `inspection \`${id}\``;
   let completed;
   try {
@@ -607,12 +764,12 @@ function inspectionReceipt(id: string, branch: readonly SessionEntry[]): Guidanc
   }
   const { call, result } = completed;
   if (call.name !== REVIEW_TOOL_NAME || call.args.action !== "inspect") throw new Error(`${label}: that call is not an observer_review inspect`);
-  const inspection = (result.details as { inspection?: GuidanceInspection } | undefined)?.inspection;
-  if (result.isError !== false || !inspection) throw new Error(`${label}: that inspection failed; inspect the skill again`);
+  const details = result.details as Pick<ReviewDetails, "inspection" | "search"> | undefined;
+  if (result.isError !== false || !(details?.inspection || details?.search)) throw new Error(`${label}: that inspection failed; inspect the skill again`);
   const passStart = observationPassStart(branch);
   if (passStart === undefined) throw new Error(`${label}: no observation pass is current on this branch, so no inspection grounds a repair`);
   if (call.position < passStart) throw new Error(`${label} is from an earlier observation pass; inspect the skill again in this pass`);
-  return inspection;
+  return details;
 }
 
 /**
@@ -631,6 +788,19 @@ function checkCurrent(id: string, receipt: GuidanceInspection, { dirs, reference
   if (changes.length > 0) {
     throw new Error(`inspection \`${id}\` of \`${receipt.skill}\` is no longer current: ${changes.join("; ")}; inspect \`${receipt.skill}\` again and cite the new receipt`);
   }
+}
+
+/** Throws unless the new-skill search `receipt` is still current: no skill has taken its name, and the searched inventory and every searched entry file are unchanged. */
+function checkSearchCurrent(id: string, receipt: GuidanceSearch, { roots, branch, systemPrompt }: Pick<PrepareContext, "roots" | "branch" | "systemPrompt">): void {
+  let change: string | undefined;
+  try {
+    if (searchGuidance(receipt.skill, receipt.terms, roots, branch, systemPrompt).search.fingerprint !== receipt.fingerprint) {
+      change = "the searched skill inventory or a searched skill file changed";
+    }
+  } catch (error) {
+    change = error instanceof Error ? error.message : String(error);
+  }
+  if (change) throw new Error(`inspection \`${id}\`, the search for new skill \`${receipt.skill}\`, is no longer current: ${change}; search again with its \`terms\` and cite the new receipt`);
 }
 
 function guidanceChanges(inspected: GuidanceInspection, current: GuidanceInspection): string[] {

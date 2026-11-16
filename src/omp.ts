@@ -186,6 +186,8 @@ export interface ExtensionContext {
   /** Optional on older hosts; review needs authenticated models of every judge-compatible kind. */
   modelRegistry?: { getAvailable(kind: "all"): Array<{ provider: string; id: string; kind?: string }> };
   sessionManager: { getBranch(): SessionEntry[]; getSessionId(): string };
+  /** The current effective system prompt; missing on older hosts. */
+  getSystemPrompt?(): string[];
   ui: {
     setStatus(key: string, text: string | undefined): void;
     notify(message: string, type?: "info" | "warning" | "error"): void;

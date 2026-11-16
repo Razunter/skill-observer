@@ -67,7 +67,7 @@ afterEach(() => {
  * available judge role unless `judge` is false. Given another host's
  * `skillHome`, it is a second session of the same agent dir and project.
  */
-function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; allTools?: ExtensionAPI["getAllTools"] } = {}) {
+function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; allTools?: ExtensionAPI["getAllTools"]; systemPrompt?: string[] } = {}) {
   const skillHome = options.skillHome ?? makeSkillHome();
   mkdirSync(skillHome.roots.cwd, { recursive: true });
   vi.stubEnv("HOME", skillHome.home);
@@ -123,6 +123,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     agent: options.agentKind === "unknown" ? undefined : { kind: options.agentKind ?? "main" },
     cwd: skillHome.roots.cwd,
     sessionManager: { getBranch: () => branch, getSessionId: () => "fixture-session" },
+    ...(options.systemPrompt && { getSystemPrompt: () => options.systemPrompt! }),
     modelRegistry: { getAvailable: () => [{ provider: "fixture", id: "explicit-judge" }] },
     ui: {
       setStatus: (key, text) => {
@@ -7019,19 +7020,16 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(failures(outOfRange).join("\n")).toContain("lines 1–99");
   });
 
-  it("prepares project, harness and new-skill proposals without inspection evidence", async () => {
+  it("prepares project proposals without inspection evidence", async () => {
     const host = loadExtension();
     writeFileSync(join(host.skillHome.roots.cwd, "AGENTS.md"), "Guidance.\n");
     startPass(host);
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
       { kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path: "AGENTS.md", mechanism: "navigation" }, gist: "Point at the check.",
         priority: "evidence", remedy: "Add a pointer", change: { operation: "direct-edit", preview: "+ Run bun run check." } },
-      { kind: "new", skill: "sample-new", gist: "Capture the workflow.", priority: "evidence", remedy: "New skill", change: { operation: "direct-edit", preview: "name: sample-new" } },
     ] });
     expect(failures(prepared)).toEqual([]);
-    expect(reviewEntries(prepared).map(({ proposal }) => proposal)).toEqual([
-      expect.not.objectContaining({ diagnosis: expect.anything() }), expect.not.objectContaining({ diagnosis: expect.anything() }),
-    ]);
+    expect(reviewEntries(prepared).map(({ proposal }) => proposal)).toEqual([expect.not.objectContaining({ diagnosis: expect.anything() })]);
     expect(host.getBranch().some((entry) => entry.message?.role === "assistant" && JSON.stringify(entry.message.content).includes('"inspect"'))).toBe(false);
   });
 
@@ -7207,6 +7205,196 @@ describe("observer_review inspect and grounded repairs", () => {
       const refused = await host.callTool("observer_review", { action: "prepare", candidates: [broken, noteDraft] });
       expect(refused.isError).toBe(true);
       expect(reviewEntries(refused)).toEqual([]);
+    }
+  });
+});
+
+describe("observer_review new-skill search", () => {
+  const NEW = "sample-new";
+  type Search = {
+    skill: string; terms: string[]; fingerprint: string;
+    coverage: Array<{ source: string; path: string; status: string; reason?: string; supplemental?: true }>;
+    matches: Array<{ name: string; source: string; path?: string; matched: string[] }>;
+  };
+  const searchOf = (result: ToolResult<unknown>) => (result.details as { search?: Search }).search;
+  const deployPath = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.roots.skillsDir, "sample-deploy", "SKILL.md");
+  const pluginInstall = (host: ReturnType<typeof loadExtension>): string =>
+    JSON.parse(readFileSync(host.skillHome.roots.pluginsRegistry, "utf8")).plugins[CE_PLUGIN][0].installPath;
+
+  /** A host with a local skill whose description holds the search term, in a started observation pass. */
+  function passHost(options: Parameters<typeof loadExtension>[0] = {}) {
+    const host = loadExtension(options);
+    mkdirSync(dirname(deployPath(host)), { recursive: true });
+    writeFileSync(deployPath(host), "---\nname: sample-deploy\ndescription: Deploy release notes to staging.\n---\n\nBody.\n");
+    startPass(host);
+    return host;
+  }
+
+  async function search(host: ReturnType<typeof loadExtension>, params: Record<string, unknown> = {}) {
+    const result = await host.callTool("observer_review", { action: "inspect", skill: NEW, terms: ["Release Notes"], ...params });
+    return { result, id: lastCallId(host) };
+  }
+
+  const newDraft = (inspection: string, skill = NEW) => ({
+    kind: "new", skill, gist: "Draft release notes from the log.", priority: "evidence", remedy: "New skill",
+    change: { operation: "direct-edit", preview: `---\nname: ${skill}\ndescription: Draft release notes from the log.\n---\n` },
+    diagnosis: { inspection, explanation: "sample-deploy only deploys notes someone already drafted.", delta: "A future agent drafts release notes from the log with one skill." },
+  });
+  const prepare = (host: ReturnType<typeof loadExtension>, candidates: unknown[]) => host.callTool("observer_review", { action: "prepare", candidates });
+
+  /** Records a successful `manage_skill` create of `name` on the branch, as OMP saves it. */
+  function createInSession(host: ReturnType<typeof loadExtension>, name: string) {
+    const id = `manage-${host.getBranch().length}`;
+    host.getBranch().push(
+      { type: "message", id: `call-${id}`, message: { role: "assistant", content: [{ type: "toolCall", id, name: "manage_skill", arguments: { action: "create", name } }] } },
+      { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: "manage_skill", isError: false, details: { action: "create", name },
+        content: [{ type: "text", text: `Created ${name}.` }] } },
+    );
+  }
+
+  it("records an absent target, each source's coverage and identified matches, and carries the new skill through Prepare and Select to Ask", async () => {
+    const host = passHost({ systemPrompt: ["Matching skill → MUST read skill://<name> first.\n<skills>\n- sample-deploy: Deploy release notes to staging.\n- prompt-only: Publish release notes elsewhere.\n</skills>"] });
+    createInSession(host, "sample-created");
+    const before = observerBytes(host);
+    const { roots } = host.skillHome;
+
+    const { result, id } = await search(host);
+    expect(result.isError).toBe(false);
+    const receipt = searchOf(result)!;
+    expect(receipt).toMatchObject({ skill: NEW, terms: ["Release Notes"], fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(receipt.coverage).toEqual([
+      { source: "skills directory", path: roots.skillsDir, status: "present" },
+      { source: "managed skills", path: roots.managedDir, status: "present" },
+      { source: "plugin registry", path: roots.pluginsRegistry, status: "present" },
+      { source: `plugin ${CE_PLUGIN}`, path: join(pluginInstall(host), "skills"), status: "present" },
+      { source: "skills created this session", path: "session branch", status: "present" },
+      { source: "prompt catalog", path: "system prompt", status: "present", supplemental: true },
+    ]);
+    expect(receipt.matches).toEqual([
+      expect.objectContaining({ name: "sample-deploy", source: "local", path: deployPath(host), matched: ["Release Notes"] }),
+      expect.objectContaining({ name: "sample-deploy", source: "prompt catalog", matched: ["Release Notes"] }),
+      expect.objectContaining({ name: "prompt-only", source: "prompt catalog", matched: ["Release Notes"] }),
+    ]);
+    expect(resultText(result)).toContain(deployPath(host));
+
+    const prepared = await prepare(host, [newDraft(id)]);
+    expect(failures(prepared)).toEqual([]);
+    const [entry] = reviewEntries(prepared);
+    expect(entry?.proposal).toMatchObject({ kind: "new", diagnosis: { inspection: id, search: { terms: ["Release Notes"], matches: ["sample-deploy", "prompt-only"] } } });
+
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+    expect(failures(selection)).toEqual([]);
+    const { askHtml } = JSON.parse(resultText(selection));
+    expect(askHtml).toContain("sample-deploy only deploys notes someone already drafted.");
+    expect(askHtml).toContain(`Searched current skills, inspection ${id}, for: Release Notes; matches: sample-deploy, prompt-only`);
+    expect(askUser(host, selection)).toMatch(/^ask-/);
+    expect(observerBytes(host)).toEqual(before);
+  });
+
+  it("fails the search when a required source exists but can't be read, or a skill already holds the name", async () => {
+    const cases: Array<[string, (host: ReturnType<typeof loadExtension>) => void, (host: ReturnType<typeof loadExtension>) => string]> = [
+      ["an unreadable skills directory", (host) => { rmSync(host.skillHome.roots.skillsDir, { recursive: true }); writeFileSync(host.skillHome.roots.skillsDir, ""); }, (host) => host.skillHome.roots.skillsDir],
+      ["an unreadable managed-skills directory", (host) => { rmSync(host.skillHome.roots.managedDir, { recursive: true }); writeFileSync(host.skillHome.roots.managedDir, ""); }, (host) => host.skillHome.roots.managedDir],
+      ["unreadable enabled-plugin skills", (host) => { const skills = join(pluginInstall(host), "skills"); rmSync(skills, { recursive: true }); writeFileSync(skills, ""); }, (host) => join(pluginInstall(host), "skills")],
+      ["a plugin registry that is no JSON", (host) => writeFileSync(host.skillHome.roots.pluginsRegistry, "{not json"), (host) => host.skillHome.roots.pluginsRegistry],
+      ["a plugin registry of another shape", (host) => writeFileSync(host.skillHome.roots.pluginsRegistry, JSON.stringify({ plugins: { [CE_PLUGIN]: "installed" } })), (host) => host.skillHome.roots.pluginsRegistry],
+      ["an installed skill of that name", (host) => writeSkill(join(host.skillHome.roots.managedDir, NEW), NEW), () => "already exists"],
+      ["a skill of that name created this session", (host) => createInSession(host, NEW), () => "created this session"],
+    ];
+    for (const [label, breakIt, named] of cases) {
+      const host = passHost();
+      breakIt(host);
+      const { result, id } = await search(host);
+      expect(result.isError, label).toBe(true);
+      expect(searchOf(result), label).toBeUndefined();
+      expect(failures(result).join("\n"), label).toContain(named(host));
+      const prepared = await prepare(host, [newDraft(id)]);
+      expect(reviewEntries(prepared), label).toEqual([]);
+      expect(failures(prepared).join("\n"), label).toContain("failed");
+    }
+  });
+
+  it("reports a missing optional installation or prompt catalog as coverage, without blocking the new skill", async () => {
+    const cases: Array<[string, Parameters<typeof loadExtension>[0], (host: ReturnType<typeof loadExtension>) => void, Record<string, string>]> = [
+      ["no managed skills or plugin registry", {}, (host) => {
+        rmSync(host.skillHome.roots.managedDir, { recursive: true });
+        rmSync(host.skillHome.roots.pluginsRegistry);
+      }, { "managed skills": "absent", "plugin registry": "absent", "prompt catalog": "unavailable" }],
+      ["an enabled plugin whose install is gone", {}, (host) => rmSync(pluginInstall(host), { recursive: true }), { [`plugin ${CE_PLUGIN}`]: "absent" }],
+      ["a custom-format prompt catalog", { systemPrompt: ['<skills>\n<skill name="sample-deploy">\nDeploy release notes.\n</skill>\n</skills>'] }, () => {}, { "prompt catalog": "unavailable" }],
+      ["a prompt without a skills block", { systemPrompt: ["No skills here."] }, () => {}, { "prompt catalog": "absent" }],
+    ];
+    for (const [label, options, change, statuses] of cases) {
+      const host = passHost(options);
+      change(host);
+      const { result, id } = await search(host);
+      expect(result.isError, label).toBe(false);
+      const coverage = Object.fromEntries(searchOf(result)!.coverage.map(({ source, status }) => [source, status]));
+      expect(coverage, label).toMatchObject({ "skills directory": "present", ...statuses });
+      const prepared = await prepare(host, [newDraft(id)]);
+      expect(failures(prepared), label).toEqual([]);
+      expect(reviewEntries(prepared), label).toHaveLength(1);
+    }
+  });
+
+  /** Each change after a search that leaves the search stale, and what the refusal names. */
+  const staleChanges: Array<[string, (host: ReturnType<typeof loadExtension>) => void, string]> = [
+    ["an unrelated skill added", (host) => writeSkill(join(host.skillHome.roots.skillsDir, "sample-other"), "sample-other"), "changed"],
+    ["an unmatched skill's file edited", (host) => appendFileSync(join(host.skillHome.roots.skillsDir, "tdd", "SKILL.md"), "More.\n"), "changed"],
+    ["a matched skill removed", (host) => rmSync(dirname(deployPath(host)), { recursive: true }), "changed"],
+    ["an optional plugin registry appearing", (host) => writeFileSync(host.skillHome.roots.pluginsRegistry, JSON.stringify({ version: 2, plugins: {} })), "changed"],
+    ["the target installed", (host) => writeSkill(join(host.skillHome.roots.managedDir, NEW), NEW), "already exists"],
+    ["the target created this session", (host) => createInSession(host, NEW), "already exists"],
+  ];
+
+  it("refuses preparing a new skill once its search is stale or its target exists, naming the search to repeat", async () => {
+    for (const [label, change, named] of staleChanges) {
+      const host = passHost();
+      if (label === "an optional plugin registry appearing") rmSync(host.skillHome.roots.pluginsRegistry);
+      const { id } = await search(host);
+      change(host);
+      const prepared = await prepare(host, [newDraft(id)]);
+      expect(prepared.isError, label).toBe(true);
+      expect(reviewEntries(prepared), label).toEqual([]);
+      const reason = failures(prepared).join("\n");
+      expect(reason, label).toContain(named);
+      expect(reason, label).toContain("search again with its `terms`");
+    }
+  });
+
+  it("refuses selecting a prepared new skill once its search is stale or its target exists, producing no form", async () => {
+    for (const [label, change, named] of staleChanges) {
+      const host = passHost();
+      if (label === "an optional plugin registry appearing") rmSync(host.skillHome.roots.pluginsRegistry);
+      const { id } = await search(host);
+      const [entry] = reviewEntries(await prepare(host, [newDraft(id)]));
+      change(host);
+      const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+      expect(selection.isError, label).toBe(true);
+      expect(JSON.parse(resultText(selection)), label).not.toHaveProperty("askHtml");
+      expect(failures(selection).join("\n"), label).toContain(named);
+    }
+  });
+
+  it("refuses a new skill without a diagnosis citing its own search in this pass", async () => {
+    const host = passHost();
+    const { id } = await search(host);
+    const { id: other } = await search(host, { skill: "sample-other" });
+    writeSkill(join(host.skillHome.roots.skillsDir, "sample-local"), "sample-local");
+    const { id: inspection } = await search(host, { skill: "sample-local", terms: undefined });
+    // A search changes nothing, so the receipts above stay current for each case.
+    const { id: fresh } = await search(host);
+    const cases: Array<[unknown, string]> = [
+      [undefined, "`inspection`"],
+      [{ inspection: fresh, explanation: " ", delta: "A future agent drafts notes." }, "`explanation`"],
+      [{ inspection: other, explanation: "No match fits.", delta: "A future agent drafts notes." }, "sample-other"],
+      [{ inspection, explanation: "No match fits.", delta: "A future agent drafts notes." }, "not a new-skill search"],
+      [{ inspection: id, explanation: "No match fits.", delta: "A future agent drafts notes." }, "changed"],
+    ];
+    for (const [diagnosis, named] of cases) {
+      const prepared = await prepare(host, [{ ...newDraft(fresh), diagnosis }]);
+      expect(reviewEntries(prepared), named).toEqual([]);
+      expect(failures(prepared).join("\n"), named).toContain(named);
     }
   });
 });
