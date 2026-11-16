@@ -7677,7 +7677,7 @@ describe("skill catalog observations", () => {
     const [definition, binding] = catalogEntries(host);
     const { result, text, matches } = await lookUp(host, SEAMS[0]);
     expect(result.isError).toBe(false);
-    expect(matches).toEqual([{ observedAt: "user-0", bindingId: binding!.id, definitionId: definition!.id, coverage: "observed", at: "user-0", via: "catalog", status: "listed", description: SEAMS[1], limitations: expect.any(Array) }]);
+    expect(matches).toEqual([{ skill: SEAMS[0], observedAt: "user-0", bindingId: binding!.id, definitionId: definition!.id, coverage: "observed", at: "user-0", via: "catalog", status: "listed", description: SEAMS[1], limitations: expect.any(Array) }]);
     expect(text).toContain(`listed as "${SEAMS[1]}"`);
     expect(text).toContain("not proof of what the model received");
     expect(text).not.toContain("Rewritten after capture.");
@@ -8116,6 +8116,129 @@ describe("catalog history across the session tree", () => {
     const after = await lookUp(host, NOTES[0]);
     expect(after.matches.at(-1)).toMatchObject({ observedAt: next, via: "catalog", status: "not-listed" });
     expect(after.text).toMatch(/reset-1[^\n]*\/clear/);
+  });
+});
+
+describe("targeted catalog search", () => {
+  const SEAMS = ["seam-finder", "Finds test seams before writing tests."] as const;
+  const NOTES = ["release-notes", "Drafts release notes from merged changes."] as const;
+  const PLANNER = ["test-planner", "Plans TESTS before any code."] as const;
+  const RUNNER = ["tests-before-runner", "Runs the suite."] as const;
+  type Host = ReturnType<typeof loadExtension>;
+  type Match = { skill: string; observedAt: string; via: string; status: string; description?: string; definitionId: string };
+  const reply = (id: string) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }) as SessionEntry;
+  const append = (host: Host, ...entries: SessionEntry[]) => host.setBranch([...host.getBranch(), ...entries]);
+  const search = async (host: Host, params: Record<string, unknown>) => {
+    const result = await host.callTool("observer_review", { action: "catalog", ...params });
+    const catalog = (result.details as { catalog?: { matches: Match[]; gaps: string[]; total: number; next?: string } }).catalog;
+    return { result, text: result.content.map((block) => block.text ?? "").join("\n"), matches: catalog?.matches ?? [], gaps: catalog?.gaps ?? [], total: catalog?.total, next: catalog?.next };
+  };
+  const userIds = (host: Host) => host.getBranch().filter((entry) => entry.message?.role === "user").map(({ id }) => id!);
+
+  it("matches every case-insensitive term in the description only, keeping exact-name lookup separate", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS, NOTES, PLANNER, RUNNER]);
+    append(host, reply("reply-1"), skillNotice("notice-1", { added: [["coverage-check", "Checks tests BEFORE merge."]] }));
+    const found = await search(host, { terms: ["tests", " Before "] });
+    expect(found.result.isError).toBe(false);
+    expect(found.matches.map(({ skill, via, description }) => [skill, via, description])).toEqual([
+      ["coverage-check", "skill-notice", "Checks tests BEFORE merge."], ["seam-finder", "catalog", SEAMS[1]], ["test-planner", "catalog", PLANNER[1]],
+    ]);
+    expect(found.matches.every(({ description }) => /tests/i.test(description!) && /before/i.test(description!))).toBe(true);
+    expect(found.text).not.toContain(RUNNER[0]);
+    expect(found.text).not.toContain(NOTES[0]);
+
+    expect((await search(host, { skill: "test" })).matches).toEqual([expect.objectContaining({ skill: "test", status: "not-listed" })]);
+    expect((await search(host, { skill: SEAMS[0], terms: ["tests"] })).result.isError).toBe(true);
+  });
+
+  it("resolves a point to the latest observation at or before it, with its real position and only the gaps between", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS]);
+    append(host, reply("reply-1"));
+    await observeCatalog(host, [SEAMS]);
+    host.failAppend(new Error("disk full"));
+    await observeCatalog(host, [SEAMS, NOTES]);
+    append(host, reply("reply-2"));
+    await observeCatalog(host, [SEAMS, NOTES]);
+    const [first, unchanged, failed, last] = userIds(host);
+
+    const point = await search(host, { skill: SEAMS[0], at: "reply-2" });
+    expect(point.result.isError).toBe(false);
+    expect(point.matches.map(({ observedAt, status }) => [observedAt, status])).toEqual([[first, "listed"]]);
+    expect(point.gaps).toEqual([expect.stringMatching(new RegExp(`${failed}[^\\n]*disk full`))]);
+    expect(point.text).toContain(`latest observation at or before entry \`reply-2\` is at entry \`${first}\``);
+    expect(point.text).not.toContain(`\`${unchanged}\``);
+
+    expect(await search(host, { skill: SEAMS[0], at: first })).toMatchObject({ gaps: [], matches: [{ observedAt: first }] });
+    expect(await search(host, { skill: NOTES[0], at: last })).toMatchObject({ gaps: [], matches: [{ observedAt: last, status: "listed" }] });
+    expect(await search(host, { terms: ["release"], at: unchanged })).toMatchObject({ matches: [] });
+
+    const sibling = host.getBranch();
+    host.setBranch(sibling.slice(0, sibling.findIndex(({ id }) => id === "reply-1")));
+    for (const at of ["reply-2", "no-such-entry"]) {
+      const refused = await search(host, { skill: SEAMS[0], at });
+      expect(refused.result.isError).toBe(true);
+      expect(refused.text).toContain(at);
+    }
+  });
+
+  it("keeps each historical observation position without a point, even when they share a definition", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS, NOTES]);
+    await observeCatalog(host, [[SEAMS[0], "Finds seams."], NOTES]);
+    await observeCatalog(host, [SEAMS, NOTES]);
+    const found = await search(host, { terms: ["seams"] });
+    expect(found.matches.map(({ observedAt }) => observedAt)).toEqual(userIds(host));
+    expect(found.matches[0]!.definitionId).toBe(found.matches[2]!.definitionId);
+  });
+
+  it("pages through unchanged evidence in observation then name order, and refuses a continuation after the evidence changed", async () => {
+    const host = loadExtension();
+    const skills = ["delta", "alpha", "charlie", "bravo"].map((name) => [name, `Helps with tests for ${name}.`] as const);
+    await observeCatalog(host, skills);
+    await observeCatalog(host, skills.slice(1));
+    const all = await search(host, { terms: ["tests"], limit: 100 });
+    const [first, second] = userIds(host);
+    expect(all.matches.map(({ observedAt, skill }) => [observedAt, skill])).toEqual([
+      ...["alpha", "bravo", "charlie", "delta"].map((skill) => [first, skill]),
+      ...["alpha", "bravo", "charlie"].map((skill) => [second, skill]),
+    ]);
+    expect(all).toMatchObject({ total: 7, next: undefined });
+
+    const paged: Match[] = [];
+    let page = await search(host, { terms: ["tests"], limit: 3 });
+    expect(page.text).toContain("4 more");
+    paged.push(...page.matches);
+    while (page.next) {
+      append(host, reply(`reply-${paged.length}`));
+      page = await search(host, { terms: ["tests"], limit: 3, cursor: page.next });
+      expect(page.result.isError).toBe(false);
+      paged.push(...page.matches);
+    }
+    expect(paged).toEqual(all.matches);
+
+    const restart = await search(host, { terms: ["tests"], limit: 3 });
+    expect((await search(host, { terms: ["helps"], limit: 3, cursor: restart.next })).result.isError).toBe(true);
+    await observeCatalog(host, skills);
+    const stale = await search(host, { terms: ["tests"], limit: 3, cursor: restart.next });
+    expect(stale.result.isError).toBe(true);
+    expect(stale.text).toMatch(/changed[^]*without `cursor`/);
+  });
+
+  it("refuses a blank query instead of dumping the catalog, and a miss claims no global absence", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS, NOTES]);
+    for (const query of [{}, { terms: [] }, { terms: ["  ", ""] }, { skill: "  " }]) {
+      const refused = await search(host, query);
+      expect(refused.result.isError).toBe(true);
+      expect(refused.text).not.toContain(SEAMS[1]);
+    }
+    const miss = await search(host, { terms: ["deploy"] });
+    expect(miss.result.isError).toBe(false);
+    expect(miss.matches).toEqual([]);
+    expect(miss.text).toContain("not evidence");
+    expect(miss.text).toContain("observed on this branch");
   });
 });
 
