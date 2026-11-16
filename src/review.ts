@@ -86,7 +86,8 @@ export interface GuidanceInspection {
   skill: string;
   kind: Exclude<SkillProvenance["kind"], "unknown">;
   sources: GuidanceSource[];
-  referenceInventory: Array<{ path: string; sha256: string }>;
+  /** The reference folder's files by path: membership only, since an unrequested body is never inspected. */
+  referenceInventory: Array<{ path: string }>;
 }
 
 interface SearchedSkill { name: string; description: string; source: string; path?: string }
@@ -494,16 +495,13 @@ function guidanceReceipt(skill: unknown, requested: unknown, { dirs, referencesD
   const folder = referenceFolder(referencesDir, skill);
   const inventory = existsSync(folder)
     ? readdirSync(folder, { withFileTypes: true }).filter((entry) => entry.isFile()).map((entry) => join(folder, entry.name)).sort()
-      .map((path) => ({ path, bytes: readGuidance(path) }))
     : [];
   for (const name of names) {
-    const file = inventory.find(({ path }) => basename(path) === name);
-    if (!file) throw new Error(`the requested reference file \`${name}\` is not in \`${folder}\``);
-    read.push(guidanceSource("reference", file.path, "active", file.bytes));
+    const path = inventory.find((file) => basename(file) === name);
+    if (!path) throw new Error(`the requested reference file \`${name}\` is not in \`${folder}\``);
+    read.push(guidanceSource("reference", path, "active", readGuidance(path)));
   }
-  const inspection = {
-    skill, kind: installed.kind, sources: read.map(({ source }) => source), referenceInventory: inventory.map(({ path, bytes }) => ({ path, sha256: sha256Hex(bytes) })),
-  };
+  const inspection = { skill, kind: installed.kind, sources: read.map(({ source }) => source), referenceInventory: inventory.map((path) => ({ path })) };
   return { inspection, folder, texts: read.map(({ text }) => text) };
 }
 
@@ -820,7 +818,7 @@ function failIfStale(id: string, { currency }: Pick<ReceiptContext, "currency">,
 }
 
 function guidanceChanges(inspected: GuidanceInspection, current: GuidanceInspection): string[] {
-  const diff = (noun: string, was: ReadonlyArray<{ path: string; sha256: string }>, now: ReadonlyArray<{ path: string; sha256: string }>) => [
+  const diff = (noun: string, was: ReadonlyArray<{ path: string; sha256?: string }>, now: ReadonlyArray<{ path: string; sha256?: string }>) => [
     ...now.filter(({ path }) => !was.some((old) => old.path === path)).map(({ path }) => `${noun} \`${path}\` was added`),
     ...was.flatMap(({ path, sha256 }) => {
       const found = now.find((next) => next.path === path);

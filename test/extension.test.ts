@@ -6911,7 +6911,7 @@ describe("observer_review inspect and grounded repairs", () => {
     const result = await host.callTool("observer_review", { action: "inspect", skill: GUIDE, ...params });
     return { result, id: lastCallId(host) };
   }
-  type Inspection = { skill: string; kind: string; sources: Array<{ role: string; path: string; status: string; sha256: string; lines: number; sections: string[] }>; referenceInventory: Array<{ path: string; sha256: string }> };
+  type Inspection = { skill: string; kind: string; sources: Array<{ role: string; path: string; status: string; sha256: string; lines: number; sections: string[] }>; referenceInventory: Array<{ path: string }> };
   const inspectionOf = (result: ToolResult<unknown>) => (result.details as { inspection?: Inspection }).inspection;
 
   it("reports each current guidance source with its status and fingerprint, a stale pin still active, and leaves unrequested references uninspected", async () => {
@@ -6941,7 +6941,7 @@ describe("observer_review inspect and grounded repairs", () => {
         expect.objectContaining({ role: "rule", path: rule, status: "stale", sha256: sha256(rule) }),
         { role: "reference", path: requested, status: "active", sha256: sha256(requested), lines: 3, sections: ["Requested"] },
       ]),
-      referenceInventory: [{ path: requested, sha256: sha256(requested) }, { path: unrequested, sha256: sha256(unrequested) }],
+      referenceInventory: [{ path: requested }, { path: unrequested }],
     });
     expect(inspectionOf(result)?.sources).toHaveLength(4);
     const text = resultText(result);
@@ -7132,7 +7132,11 @@ describe("observer_review inspect and grounded repairs", () => {
     { label: "a removed amendment", change: (host) => rmSync(join(host.rulesDir, "guide-no-todo.md")), named: "guide-no-todo.md" },
     { label: "a removed reference file", change: (host) => rmSync(join(guideReferences(host), "requested.md")), named: "requested.md" },
     { label: "an unreadable skill file", change: (host) => { rmSync(guidePath(host)); mkdirSync(guidePath(host)); }, named: "SKILL.md" },
-    { label: "a changed reference inventory", change: (host) => writeFileSync(join(guideReferences(host), "unrequested.md"), "Unrequested.\n"), named: "unrequested.md" },
+    { label: "an added reference file", change: (host) => writeFileSync(join(guideReferences(host), "unrequested.md"), "Unrequested.\n"), named: "unrequested.md" },
+    { label: "a removed unrequested reference file", before: (host) => writeFileSync(join(guideReferences(host), "unrequested.md"), "Unrequested.\n"),
+      change: (host) => rmSync(join(guideReferences(host), "unrequested.md")), named: "unrequested.md" },
+    { label: "an edited requested reference file", change: (host) => appendFileSync(join(guideReferences(host), "requested.md"), "More.\n"), named: "requested.md" },
+    { label: "an edited amendment rule", change: (host) => appendFileSync(join(host.rulesDir, "guide-no-todo.md"), "More.\n"), named: "guide-no-todo.md" },
   ];
 
   async function inspectedGuide(before?: (host: ReturnType<typeof loadExtension>) => void) {
@@ -7147,36 +7151,32 @@ describe("observer_review inspect and grounded repairs", () => {
     return { host, id };
   }
 
-  it("refuses preparing a repair once the guidance its receipt read has changed, naming what to inspect again", async () => {
-    for (const { label, before, change, named } of guidanceChanges) {
-      const { host, id } = await inspectedGuide(before);
-      change(host);
-      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
-      expect(prepared.isError, label).toBe(true);
-      expect(reviewEntries(prepared), label).toEqual([]);
-      const reason = failures(prepared).join("\n");
-      expect(reason, label).toContain(id);
-      expect(reason, label).toContain(named);
-      expect(reason, label).toContain(`inspect \`${GUIDE}\` again`);
-    }
+  it.each(guidanceChanges)("refuses preparing a repair once the guidance its receipt read has changed ($label), naming what to inspect again", async ({ label, before, change, named }) => {
+    const { host, id } = await inspectedGuide(before);
+    change(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
+    expect(prepared.isError, label).toBe(true);
+    expect(reviewEntries(prepared), label).toEqual([]);
+    const reason = failures(prepared).join("\n");
+    expect(reason, label).toContain(id);
+    expect(reason, label).toContain(named);
+    expect(reason, label).toContain(`inspect \`${GUIDE}\` again`);
   });
 
-  it("produces no Ask form when the guidance a prepared repair's receipt read changes before Select, naming the proposal to refresh", async () => {
-    for (const { label, before, change, named } of guidanceChanges) {
-      const { host, id } = await inspectedGuide(before);
-      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
-      expect(failures(prepared), label).toEqual([]);
-      const [entry] = reviewEntries(prepared);
-      change(host);
-      const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
-      expect(selection.isError, label).toBe(true);
-      expect(JSON.parse(resultText(selection)).askHtml, label).toBeUndefined();
-      expect(reviewEntries(selection, "selected"), label).toEqual([]);
-      const reason = failures(selection).join("\n");
-      expect(reason, label).toContain(entry!.reference.candidateId);
-      expect(reason, label).toContain(named);
-      expect(reason, label).toContain(`inspect \`${GUIDE}\` again`);
-    }
+  it.each(guidanceChanges)("produces no Ask form when the guidance a prepared repair's receipt read changes before Select ($label), naming the proposal to refresh", async ({ label, before, change, named }) => {
+    const { host, id } = await inspectedGuide(before);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
+    expect(failures(prepared), label).toEqual([]);
+    const [entry] = reviewEntries(prepared);
+    change(host);
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+    expect(selection.isError, label).toBe(true);
+    expect(JSON.parse(resultText(selection)).askHtml, label).toBeUndefined();
+    expect(reviewEntries(selection, "selected"), label).toEqual([]);
+    const reason = failures(selection).join("\n");
+    expect(reason, label).toContain(entry!.reference.candidateId);
+    expect(reason, label).toContain(named);
+    expect(reason, label).toContain(`inspect \`${GUIDE}\` again`);
   });
 
   it("selects a prepared repair whose inspected guidance is unchanged, while unrelated skills change", async () => {
@@ -7186,6 +7186,24 @@ describe("observer_review inspect and grounded repairs", () => {
     const selection = await host.callTool("observer_review", { action: "select", proposals: [reviewEntries(prepared)[0]!.reference] });
     expect(failures(selection)).toEqual([]);
     expect(JSON.parse(resultText(selection)).askHtml).toContain("A future agent builds one fixture per seam.");
+  });
+
+  it("keeps a receipt current when an unrequested reference body changes or can't be read, since it was never inspected", async () => {
+    const { host, id } = await inspectedGuide((host) => writeFileSync(join(guideReferences(host), "unrequested.md"), "Unrequested.\n"));
+    const unrequested = join(guideReferences(host), "unrequested.md");
+    writeFileSync(unrequested, "Rewritten unrequested text.\n");
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
+    expect(failures(prepared)).toEqual([]);
+    chmodSync(unrequested, 0o000);
+    try {
+      const selection = await host.callTool("observer_review", { action: "select", proposals: [reviewEntries(prepared)[0]!.reference] });
+      expect(failures(selection)).toEqual([]);
+      const again = await inspect(host, { references: ["requested.md"] });
+      expect(again.result.isError).toBeFalsy();
+      expect(inspectionOf(again.result)?.referenceInventory).toEqual([{ path: join(guideReferences(host), "requested.md") }, { path: unrequested }]);
+    } finally {
+      chmodSync(unrequested, 0o644);
+    }
   });
 
   it("refuses a repair once its inspected skill changed owner with the same SKILL.md, naming the kind to inspect again", async () => {
