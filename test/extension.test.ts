@@ -7965,24 +7965,51 @@ describe("qualified skill catalog capture", () => {
 
   it("applies native skill notice additions, updates and removals after the binding at later points, without copying them", async () => {
     const host = loadExtension();
-    append(host, skillNotice("notice-early", { added: [["early-skill", "Announced before any observation."]] }));
+    // An earlier prompt's notice: a reply follows it, so it was not delivered with the observed prompt.
+    append(host, skillNotice("notice-early", { added: [["early-skill", "Announced before any observation."]] }), reply("reply-0"));
     await observeCatalog(host, [SEAMS]);
     const stored = structuredClone(catalogEntries(host));
     const updated = "Finds seams in legacy code.";
     append(host, reply("reply-1"), skillNotice("notice-1", { added: [NOTES] }), reply("reply-2"),
       skillNotice("notice-2", { updated: [[SEAMS[0], updated]] }), skillNotice("notice-3", { removed: [NOTES[0]] }));
     expect(await states(host, NOTES[0])).toEqual([
-      { at: "user-1", via: "catalog", status: "not-listed" },
+      { at: "user-2", via: "catalog", status: "not-listed" },
       { at: "notice-1", via: "skill-notice", status: "listed", description: NOTES[1] },
       { at: "notice-3", via: "skill-notice", status: "not-listed" },
     ]);
     expect(await states(host, SEAMS[0])).toEqual([
-      { at: "user-1", via: "catalog", status: "listed", description: SEAMS[1] },
+      { at: "user-2", via: "catalog", status: "listed", description: SEAMS[1] },
       { at: "notice-2", via: "skill-notice", status: "listed", description: updated },
     ]);
     expect((await lookUp(host, SEAMS[0])).text).toContain(`listed as "${updated}"`);
-    expect(await states(host, "early-skill")).toEqual([{ at: "user-1", via: "catalog", status: "not-listed" }]);
+    expect(await states(host, "early-skill")).toEqual([{ at: "user-2", via: "catalog", status: "not-listed" }]);
     expect(catalogEntries(host)).toEqual(stored);
+  });
+
+  it("applies a skill notice OMP saved just before its prompt's user message to that prompt's observation", async () => {
+    const host = loadExtension();
+    await host.startAgent("Write the tests.", { systemPrompt: catalogPrompt([SEAMS]) });
+    append(host, skillNotice("notice-0", { added: [NOTES] }));
+    await host.commitPrompt("Write the tests.");
+    expect(host.getBranch().map(({ id, customType }) => customType ?? id)).toEqual(["skill-notice", "user-1", "skill-observer-catalog", "skill-observer-catalog-binding"]);
+    expect(await states(host, NOTES[0])).toEqual([
+      { at: "user-1", via: "catalog", status: "not-listed" },
+      { at: "notice-0", via: "skill-notice", status: "listed", description: NOTES[1] },
+    ]);
+    const found = await host.callTool("observer_review", { action: "catalog", terms: ["release notes"] });
+    expect((found.details as { catalog: { matches: Array<{ skill: string }> } }).catalog.matches.map(({ skill }) => skill)).toEqual([NOTES[0]]);
+
+    append(host, reply("reply-1"));
+    await host.startAgent("Next.", { systemPrompt: catalogPrompt([SEAMS, ["other-skill", "Other work."]]) });
+    append(host, skillNotice("notice-1", { removed: [NOTES[0]] }));
+    await host.commitPrompt("Next.");
+    const second = host.getBranch().findLast((entry) => entry.message?.role === "user")!.id;
+    expect(await states(host, NOTES[0])).toEqual([
+      { at: "user-1", via: "catalog", status: "not-listed" },
+      { at: "notice-0", via: "skill-notice", status: "listed", description: NOTES[1] },
+      { at: second, via: "catalog", status: "not-listed" },
+      { at: "notice-1", via: "skill-notice", status: "not-listed" },
+    ]);
   });
 
   it("drops a notice outside a compaction's kept range and reports the window before OMP announces the skill again", async () => {

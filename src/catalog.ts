@@ -168,8 +168,11 @@ export function registerCatalogCapture(pi: ExtensionAPI, isObservable: (ctx: Ext
   return () => gap;
 }
 
-/** `promptIndex` is where the observation was made: its prompt's user message, or the binding itself when that message isn't on the branch. */
-interface BoundCatalog { index: number; promptIndex: number; bindingId: string; binding: CatalogBinding; definitionId: string; definition: CatalogDefinition }
+/**
+ * `promptIndex` is where the observation was made: its prompt's user message, or the binding itself when that message isn't on the branch.
+ * `noticesFrom` is where its skill notices may start: OMP saves the notices delivered with a prompt just before its user message.
+ */
+interface BoundCatalog { index: number; promptIndex: number; noticesFrom: number; bindingId: string; binding: CatalogBinding; definitionId: string; definition: CatalogDefinition }
 
 interface CatalogHistory { bound: BoundCatalog[]; definitions: Map<string, { id: string; definition: CatalogDefinition }>; unavailable: Array<{ index: number; text: string }> }
 
@@ -191,8 +194,14 @@ function catalogBindings(branch: readonly SessionEntry[]): CatalogHistory {
         continue;
       }
       const found = definitions.get(binding.catalogId);
-      if (found) bound.push({ index, promptIndex: positions.get(binding.observedAt) ?? index, bindingId: entry.id, binding, definitionId: found.id, definition: found.definition });
-      else unavailable.push({ index, text: `the observation at entry \`${binding.observedAt}\` (binding \`${entry.id}\`) refers to catalog \`${binding.catalogId}\`, whose definition is not on this branch, so that observation is unavailable` });
+      if (!found) {
+        unavailable.push({ index, text: `the observation at entry \`${binding.observedAt}\` (binding \`${entry.id}\`) refers to catalog \`${binding.catalogId}\`, whose definition is not on this branch, so that observation is unavailable` });
+        continue;
+      }
+      const promptIndex = positions.get(binding.observedAt);
+      let noticesFrom = promptIndex ?? index;
+      while (promptIndex !== undefined && noticesFrom > 0 && branch[noticesFrom - 1]!.type === "custom_message") noticesFrom--;
+      bound.push({ index, promptIndex: promptIndex ?? index, noticesFrom, bindingId: entry.id, binding, definitionId: found.id, definition: found.definition });
     }
   }
   return { bound, definitions, unavailable };
@@ -292,7 +301,7 @@ export function lookupCatalog(query: CatalogQuery, branch: readonly SessionEntry
   if (!Number.isInteger(limit) || limit < 1) throw new Error("`limit` is the page size, a whole number of at least 1");
   const history = catalogBindings(branch);
   let gaps = captureGaps(history, pendingGap);
-  let scope = history.bound.map((catalog, at) => ({ catalog, end: history.bound[at + 1]?.index ?? branch.length }));
+  let scope = history.bound.map((catalog, at) => ({ catalog, end: history.bound[at + 1]?.noticesFrom ?? branch.length }));
   if (query.at !== undefined) {
     const point = branch.findIndex((entry) => entry.id === query.at);
     if (point < 0) throw new Error(`Entry \`${query.at}\` is not on the active branch; \`at\` takes the exact ID of an entry on this branch`);
@@ -352,7 +361,7 @@ function cursorOffset(cursor: string, queryKey: string, revision: string, total:
 
 function skillNames(branch: readonly SessionEntry[], catalog: BoundCatalog, end: number): string[] {
   const names = new Set(catalog.definition.entries.map(({ name }) => name));
-  for (const entry of branch.slice(catalog.index + 1, end)) {
+  for (const entry of branch.slice(catalog.noticesFrom, end)) {
     if (entry.type !== "custom_message" || entry.customType !== SKILL_NOTICE_TYPE) continue;
     const notice = parseNotice(entry);
     if ("states" in notice) for (const skill of notice.states.keys()) names.add(skill);
@@ -379,7 +388,7 @@ function skillHistory(name: string, branch: readonly SessionEntry[], catalog: Bo
   const history = [match(binding.observedAt, "catalog", base)];
   const notices: Array<{ index: number; id: string; state: SkillState }> = [];
   let current = base;
-  for (let index = catalog.index + 1; index < end; index++) {
+  for (let index = catalog.noticesFrom; index < end; index++) {
     const entry = branch[index]!;
     const id = entry.id ?? "(no id)";
     if (entry.type === "custom_message" && entry.customType === SKILL_NOTICE_TYPE) {
