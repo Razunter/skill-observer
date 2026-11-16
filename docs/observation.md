@@ -40,6 +40,18 @@ The model applies approved edits to local skills directly and to managed or new 
 
 If an answer in the main batch retracts an applied fix, the pass prepares and selects its withdrawal, then asks about it in a separate follow-up `ask` in the same pass. **Decline** on a withdrawal keeps the fix: `observer_resolve` records nothing for it and says the fix stays in force. An answer cites its proposal by the reference of the pass's latest Prepare holding it; an older reference is refused with the latest one named. See [Proposal approval](development.md#proposal-approval) and [Ledger](development.md#ledger) for the approval and recording rules.
 
+## Grounded repairs
+
+A skill-text repair must show what the skill already says before it reaches a question. `observer_review` takes two read-only actions for this, available once the pass's tools are active. Both write nothing; their saved tool result is the receipt.
+
+**Inspection.** `action: "inspect"` with a `skill` reads that installed skill's current guidance: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force) and the reference files of its on-read amendment named in `references`, each numbered by line with its SHA-256 and `## ` sections. The folder's other reference files are listed by fingerprint only and cannot be cited. A missing, unreadable or malformed required source fails the inspection; a failed inspection grounds nothing. Reading the skill now says nothing about whether it guided the earlier work.
+
+**The evidence gate.** A direct edit of a local or managed skill, an on-read fix and a pattern amendment or barrier rule carry a `diagnosis`: the call ID of this pass's inspection of that skill, an explanation of why the inspected guidance does not already cover the finding with the check that could disprove it and its result, a one-sentence `delta` saying what a future agent will do differently, and `citations` naming inspected sources by line range or `## ` section. Prepare refuses a repair whose diagnosis is missing or incomplete, whose receipt is forged, failed, from an earlier pass or from another branch, names another skill, or cites a source or location the inspection does not hold. It also refuses one whose skill file, rules or reference files changed, appeared or disappeared since the inspection. Select checks freshness again right before rendering the form. Each refusal says what to inspect again; nothing repairs a citation silently. The diagnosis is part of the prepared proposal, so its content hash covers it, and the form shows the explanation, delta and citations once beside the preview. The checks are structural: they do not prove the explanation is right.
+
+Project and harness remedies, stale answers, withdrawals and compactions keep their own contracts and take no diagnosis. After the form is rendered, the existing approval and target-freshness rules apply unchanged: a later change to other inspected guidance adds no expiry. An approval saved before the gate existed keeps its contract, but a proposal prepared without a diagnosis and not yet approved cannot reach a new form: inspect and prepare it again.
+
+**New-skill search.** `action: "inspect"` with the proposed name in `skill` and the workflow's words in `terms` searches, case-insensitively, the names and descriptions of the skills directory, managed skills, enabled plugins, skills created this session and, when readable, the prompt's skill catalog. It fails when a skill of that name exists, or when one of the first four sources exists but cannot be read; a source that is not installed counts as searched and empty. The result lists each source's coverage and the matches. A new-skill proposal cites the search as its `diagnosis.inspection` and explains why each match does not fit, with no `citations`. Prepare and Select refuse it once a skill of that name exists or any searched source or skill file changed. A fitting match becomes an ordinary repair of that skill, with its own inspection.
+
 ## Observations
 
 The main agent records an observation with the `observe` tool: one remark of up to 500 characters about something a skill, a rule or the project setup got wrong, or that cost it a detour. The tool is active as soon as the extension loads and never asks for approval. A subagent's call is refused. Text that is empty, has no letter or digit, or is over 500 characters is refused, and nothing is recorded.
@@ -50,6 +62,25 @@ An observation is pending until a pass shows it, or until 30 days after it was l
 
 `/observe` lists the project's pending observations in the payload's **observations** section and starts a pass even when they are its only evidence. Right after sending the payload it marks the listed ones shown, so the next pass does not list them, even when this one is interrupted. If marking fails, an error notice says so and the pass continues. An observation recorded during a pass, or recorded again while `/observe` assembled the payload, waits for the next one. The pass checks each observation against the session and the checkout, turns it into a proposal when a proposal kind fits, and otherwise reports it as a [report item](#report-items). Pending observations do not turn on the `project` gate.
 
+## Skill catalog observations
+
+To diagnose a suspected missed trigger, the pass needs to know which skills the system prompt listed earlier, with their descriptions as rendered then. Today's installed skills cannot tell it that.
+
+**Capture.** For each prompt of a main session with UI, the extension reads the system prompt at the `before_agent_start` hook, without changing it, and parses its `<skills>` block in OMP's standard form or its bundled custom-prompt form. It stages the result and records it at `message_end`, once that prompt's user message is on the branch, so a preparation OMP discards or re-runs records nothing of its own. Subagents, including revived ones, are not captured.
+
+**Storage.** Observations are non-model custom session entries. A `skill-observer-catalog` entry holds one distinct catalog once per session: its format, its coverage (`observed`, `partial`, `no-block` or `unsupported`), each skill's name and rendered description, and its limitations. A small `skill-observer-catalog-binding` entry marks where the branch observed it: the prompt's entry ID and the hook. An unchanged catalog records nothing; a changed one records a binding, plus a definition only when that catalog is new to the session. After a `/clear`, or after a capture failure, the next observation is bound again even when unchanged. The entries live and die with the session file: there is no global catalog store, retention period or cleanup, and neither full prompts nor skill bodies are kept. OMP's own skill notices are already saved in the session and are not copied.
+
+**Lookup.** `observer_review` `action: "catalog"` searches the active branch's observations by exact skill name in `skill`, or by `terms` that must all appear, case-insensitively and literally, in an observed description. A blank query is refused rather than listing the catalog. With `at`, the exact ID of an entry on the branch, it returns the latest observation at or before that entry, its real position and the known gaps in between; it was observed at that prompt, not at every request since. Without `at`, it returns every observation on the branch. Results are ordered by observation, then skill name, 20 to a page by default (`limit`); a page's `next` cursor continues the same query and is refused once the branch's catalog evidence changed. Each result also lists what OMP's later skill notices, compactions and `/clear` resets changed while still in context. Only bindings on the active branch count: a definition reachable from another branch resolves a binding here but is no evidence this branch observed it.
+
+The payload carries only a short **catalog** section: how many observations the branch holds, what the latest listed, any known gaps, and how to look a skill up. A branch with catalog observations alone starts no pass.
+
+**Limits.**
+
+- An observation is the hook's view. A later `before_agent_start` handler or a provider hook may change the request, so it is never proof of what the model received.
+- Unknown is not absence. A miss means only that no observation on this branch matched: coverage may be partial, a gap may hide the skill, an older session has no observations, and other wording would not match. A missing or malformed entry reads as unknown, never as another branch's state.
+- A capture failure the extension sees is reported as a gap at the next lookup and pass. OMP's append API gives no persistence acknowledgement and the host can swallow a write error, so a lost entry is undetectable: after a restart it simply reads as unknown.
+- How notices drop out of context follows OMP 18.20.3's context build: after a compaction, a notice stays in force only within the kept range; where the provider replays the kept turns from its own payload, or a context rollover keeps only the latest request, its state is unknown. Another OMP version may differ.
+
 ## Observation payload
 
 The message that starts a pass holds these sections, in this order, leaving out any without text:
@@ -58,6 +89,7 @@ The message that starts a pass holds these sections, in this order, leaving out 
 - **note**: the User note;
 - **digest**: the [session digest](#digest);
 - **observations**: the project's [pending observations](#observations), one line each with its count and the date it was last recorded;
+- **catalog**: the [skill catalog observations](#skill-catalog-observations) summary, when the branch has an observation or a known capture gap;
 - **ledger**: the proposal ledger's Later entries, each with its re-offer condition (`Re-offer when: …`) when its record has one;
 - **outcomes**: the remedy outcomes of applied fixes. Only project-environment fixes and fixes for a skill the digest loaded are listed. One closing line counts the rest, whose skills were not loaded in this session;
 - **rules-in-force**: the [rules in force](#rules-in-force);
@@ -76,6 +108,7 @@ The message that starts a pass holds these sections, in this order, leaving out 
 | `ranking` | the host has an explicit, available `judge` role assignment | advisory ranking and Select's `rankings`; without it the pass calls Select without rankings |
 | `note` | there is a User note | how to weigh the User note |
 | `observations` | the project has a pending observation | checking observations; those no proposal kind fits become report items |
+| `catalog` | the branch has a skill catalog observation or a known capture gap | catalog lookup and diagnosing a suspected missed trigger |
 | `tool-result` | never in the payload | what to do after a changed target, a failed ledger append or a failed cleanup, with custom input and with an approval note; see below |
 
 Under the `project` gate, the Retrospective reference includes the installed `retro` skill's text inline, without its frontmatter. A preceding line says which parts apply: its candidate categories do; its own steps and Files section describe a standalone retrospective and do not. Without `retro`, the section says the reference is unavailable and the UI warns. Without the gate, neither the section nor the warning appears.
@@ -98,7 +131,8 @@ The pass-start notice estimates the payload's size by section, as in `Observatio
 4. **Stale amendments**, by rule name and skill;
 5. the **payload estimate** of the pass `/observe` would start now, from the same assembly and gates (without a User note);
 6. the number of **Later** proposals for this project;
-7. the number of **pending observations** for this project, without their text. Reporting them marks none shown.
+7. the number of **pending observations** for this project, without their text. Reporting them marks none shown;
+8. the **skill catalog observations** on the branch: their count, what the latest listed, and known gaps. They alone do not make the report non-empty.
 
 The report names tools, signal kinds, skills, rule names and project target paths only: no tool arguments, error text, evidence file paths, session IDs or observation text. A branch with no signals, loaded skills, stale amendments, applied fixes or pending observations reports `No skill evidence on this branch.` and no estimate.
 
