@@ -209,6 +209,10 @@ export type ExtensionEvent =
  */
 export interface BeforeAgentStartEvent {
   prompt: string;
+  /** `revive` when a parked subagent resumes; missing on older hosts. */
+  reason?: "prompt" | "revive";
+  /** The system prompt prepared for this prompt; missing on older hosts. */
+  systemPrompt?: string[];
 }
 
 /** A message returned here is appended after the submitted batch, on the same turn. */

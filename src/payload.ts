@@ -19,9 +19,9 @@ export const HOOK_CHECK_PATH = fileURLToPath(new URL("../scripts/check-hook.ts",
  * gate is always on. `tool-result` fragments never enter the payload: they
  * ride in the tool result that reports their condition.
  */
-export type Gate = "stale" | "compaction" | "project" | "withdrawal" | "ranking" | "note" | "observations" | "tool-result";
+export type Gate = "stale" | "compaction" | "project" | "withdrawal" | "ranking" | "note" | "observations" | "catalog" | "tool-result";
 
-const GATE_NAMES: Record<Gate, true> = { stale: true, compaction: true, project: true, withdrawal: true, ranking: true, note: true, observations: true, "tool-result": true };
+const GATE_NAMES: Record<Gate, true> = { stale: true, compaction: true, project: true, withdrawal: true, ranking: true, note: true, observations: true, catalog: true, "tool-result": true };
 
 /** A run of whole paragraphs or list items of `observer.md`, in document order; `section` sorts in document order too. */
 export interface Fragment {
@@ -127,6 +127,8 @@ export interface GateInput {
   observations: readonly Observation[];
   /** Whether the skill has an on-read amendment in the amendments directory. */
   onReadAmendmentFor(skill: string): boolean;
+  /** Skill catalog observations on the branch. */
+  catalogObservations: number;
 }
 
 const GATE_EVIDENCE: Record<Exclude<Gate, "tool-result">, (input: GateInput) => boolean> = {
@@ -139,6 +141,7 @@ const GATE_EVIDENCE: Record<Exclude<Gate, "tool-result">, (input: GateInput) => 
   ranking: ({ rankingAvailable }) => rankingAvailable,
   note: ({ note }) => note !== "",
   observations: ({ observations }) => observations.length > 0,
+  catalog: ({ catalogObservations }) => catalogObservations > 0,
 };
 
 /** The gates whose evidence is present; never `tool-result`. */
@@ -183,7 +186,7 @@ export function whatToDoNow(conditions: readonly ToolResultCondition[]): string 
   }
 }
 
-export type PayloadSectionName = "instructions" | "note" | "digest" | "observations" | "ledger" | "outcomes" | "rules-in-force" | "project" | "retro" | "stale";
+export type PayloadSectionName = "instructions" | "note" | "digest" | "observations" | "catalog" | "ledger" | "outcomes" | "rules-in-force" | "project" | "retro" | "stale";
 
 export interface PayloadSection {
   name: PayloadSectionName;

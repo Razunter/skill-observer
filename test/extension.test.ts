@@ -142,13 +142,18 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     for (const handler of handlers[event] ?? []) await handler({ type: event }, ctx);
   };
 
+  /** What each `before_agent_start` handler returned on the latest `startAgent`. */
+  let startResults: unknown[] = [];
+
   /** Runs `before_agent_start` for a submitted prompt and returns the messages the handlers add to it. */
-  const startAgent = async (prompt: string): Promise<CustomMessage[]> => {
+  const startAgent = async (prompt: string, event: { systemPrompt?: string[]; reason?: "prompt" | "revive" } = {}): Promise<CustomMessage[]> => {
     const added: CustomMessage[] = [];
+    startResults = [];
     for (const handler of handlers.before_agent_start ?? []) {
-      const result = (await handler({ type: "before_agent_start", prompt, systemPrompt: [] }, ctx)) as
+      const result = (await handler({ type: "before_agent_start", prompt, systemPrompt: [], ...event }, ctx)) as
         | { message?: CustomMessage }
         | undefined;
+      startResults.push(result);
       if (result?.message) added.push(result.message);
     }
     return added;
@@ -157,6 +162,12 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
   /** Saves a message `before_agent_start` returned on the branch and fires its `message_end`, as OMP does once it commits a preparation. */
   const commitMessage = async (message: CustomMessage) => {
     branch = [...branch, { type: "custom_message", id: `message-${branch.length}`, customType: message.customType, content: message.content, details: message.details }];
+    await emit("message_end");
+  };
+
+  /** Saves the prompt's user message on the branch and fires its `message_end`, as OMP does once it commits a preparation. */
+  const commitPrompt = async (prompt: string) => {
+    branch = [...branch, { type: "message", id: `user-${branch.length}`, message: { role: "user", content: prompt } }];
     await emit("message_end");
   };
 
@@ -215,7 +226,9 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     endTurn: () => emit("agent_end"),
     emit,
     startAgent,
+    startResults: () => startResults,
     commitMessage,
+    commitPrompt,
     toolResult,
     runCommand: async (name: string, args = "") => {
       const command = commands[name];
@@ -6214,6 +6227,9 @@ describe("evidence-gated instructions", () => {
     ["observations: a pending observation", ["observations"],
       async (host) => { await host.callTool("observe", { text: "The tdd skill names no seam for HTTP clients." }); return { branch: base }; },
       () => ({ branch: base })],
+    ["catalog: a skill catalog observation", ["catalog"],
+      async (host) => { host.setBranch(base); await observeCatalog(host, [["seam-finder", "Finds test seams."]]); return { branch: host.getBranch() }; },
+      () => ({ branch: base })],
   ];
 
   /** The fragments of `observer.md` the payload `/observe` sends with `setup`'s evidence holds. */
@@ -6481,6 +6497,7 @@ describe("/observe-report", () => {
       expect.stringMatching(/^Payload estimate for \/observe now: ≈ \d+ tokens \(instructions \d+, digest \d+, .*stale \d+; chars\/4 estimate\)$/),
       "Later proposals: 1",
       "Pending observations: 0",
+      "Skill catalog observations: none on this branch (unknown)",
     ]);
   });
 
@@ -7574,6 +7591,154 @@ describe("approval compatibility under the evidence gate", () => {
 
     expect({ branch: host.getBranch(), files: observerBytes(host), observations: readFileSync(host.observationsFile, "utf8"), sent: host.sent.length }).toEqual(before);
     expect(host.notices.at(-1)).toContain("Evidence report (no observation pass started)");
+  });
+});
+
+/** A system prompt in OMP's standard template, its `<skills>` block listing `skills`. */
+function catalogPrompt(skills: ReadonlyArray<readonly [string, string]>): string[] {
+  return [
+    "You are a coding agent.",
+    `# Skills & Rules\nMatching skill → MUST read skill://<name> first.\n<skills>\n${skills.map(([name, description]) => `- ${name}: ${description}`).join("\n")}\n</skills>`,
+    "# Tools",
+  ];
+}
+
+/** Submits a prompt whose system prompt lists `skills` (or is `systemPrompt`) and commits its user message, as OMP does. */
+async function observeCatalog(host: ReturnType<typeof loadExtension>, skills: ReadonlyArray<readonly [string, string]>, systemPrompt = catalogPrompt(skills)) {
+  await host.startAgent("Write the tests.", { systemPrompt });
+  await host.commitPrompt("Write the tests.");
+}
+
+const catalogEntries = (host: ReturnType<typeof loadExtension>) =>
+  host.getBranch().filter((entry) => entry.type === "custom" && entry.customType?.startsWith("skill-observer-catalog"));
+
+async function lookUp(host: ReturnType<typeof loadExtension>, skill: string) {
+  const result = await host.callTool("observer_review", { action: "catalog", skill });
+  const { catalog } = result.details as { catalog: { matches: Array<Record<string, unknown>> } };
+  return { result, text: result.content.map((block) => block.text ?? "").join("\n"), matches: catalog.matches };
+}
+
+describe("skill catalog observations", () => {
+  const SEAMS = ["seam-finder", "Finds test seams before writing tests."] as const;
+  const NOTES = ["release-notes", "Drafts release notes from merged changes."] as const;
+
+  it("records the hook's catalog once the prompt's user message is on the branch, without touching the prompt or returning a result", async () => {
+    const host = loadExtension();
+    const systemPrompt = catalogPrompt([SEAMS, NOTES]);
+    const before = structuredClone(systemPrompt);
+    expect(await host.startAgent("Write the tests.", { systemPrompt })).toEqual([]);
+    expect(host.startResults().every((result) => result === undefined)).toBe(true);
+    expect(systemPrompt).toEqual(before);
+    expect(catalogEntries(host)).toEqual([]);
+    await host.commitPrompt("Write the tests.");
+    const [definition, binding] = catalogEntries(host);
+    expect(definition?.data).toEqual({ catalogId: expect.any(String), format: "standard", coverage: "observed", entries: [{ name: SEAMS[0], description: SEAMS[1] }, { name: NOTES[0], description: NOTES[1] }], limitations: [expect.stringContaining("not proof of what the model received")] });
+    expect(binding?.data).toEqual({ catalogId: (definition?.data as { catalogId: string }).catalogId, observedAt: "user-0", boundary: "before_agent_start" });
+    expect(catalogEntries(host)).toHaveLength(2);
+  });
+
+  it("looks a skill up by exact name as observed, with its position and references, after the skill file changed", async () => {
+    const host = loadExtension();
+    const skillFile = join(host.skillHome.roots.skillsDir, SEAMS[0], "SKILL.md");
+    mkdirSync(dirname(skillFile), { recursive: true });
+    writeFileSync(skillFile, `---\nname: ${SEAMS[0]}\ndescription: ${SEAMS[1]}\n---\n\nBody.\n`);
+    await observeCatalog(host, [SEAMS, NOTES]);
+    writeFileSync(skillFile, `---\nname: ${SEAMS[0]}\ndescription: Rewritten after capture.\n---\n\nBody.\n`);
+    const [definition, binding] = catalogEntries(host);
+    const { result, text, matches } = await lookUp(host, SEAMS[0]);
+    expect(result.isError).toBe(false);
+    expect(matches).toEqual([{ observedAt: "user-0", bindingId: binding!.id, definitionId: definition!.id, coverage: "observed", status: "listed", description: SEAMS[1], limitations: expect.any(Array) }]);
+    expect(text).toContain(`listed as "${SEAMS[1]}"`);
+    expect(text).toContain("not proof of what the model received");
+    expect(text).not.toContain("Rewritten after capture.");
+    expect((await lookUp(host, "seam")).matches).toEqual([expect.objectContaining({ status: "not-listed" })]);
+  });
+
+  it("writes nothing for an unchanged repeat on the branch and stores a changed catalog as distinguishable content", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS, NOTES]);
+    await observeCatalog(host, [SEAMS, NOTES]);
+    expect(catalogEntries(host)).toHaveLength(2);
+    const changed = [SEAMS[0], "Finds seams."] as const;
+    await observeCatalog(host, [changed, NOTES]);
+    expect(catalogEntries(host).map(({ customType }) => customType)).toEqual(["skill-observer-catalog", "skill-observer-catalog-binding", "skill-observer-catalog", "skill-observer-catalog-binding"]);
+    const ids = catalogEntries(host).filter(({ customType }) => customType === "skill-observer-catalog").map(({ data }) => (data as { catalogId: string }).catalogId);
+    expect(new Set(ids).size).toBe(2);
+    // Back to the first catalog: a new binding to the definition already on the branch.
+    await observeCatalog(host, [SEAMS, NOTES]);
+    expect(catalogEntries(host).at(-1)?.customType).toBe("skill-observer-catalog-binding");
+    expect(catalogEntries(host)).toHaveLength(5);
+    expect((await lookUp(host, SEAMS[0])).matches.map(({ description }) => description)).toEqual([SEAMS[1], changed[1], SEAMS[1]]);
+  });
+
+  it.each([
+    ["a subagent", { agentKind: "sub" as const }, undefined],
+    ["a session without a UI", { hasUI: false }, undefined],
+    ["a revived subagent", {}, "revive" as const],
+  ])("captures nothing for %s", async (_label, options, reason) => {
+    const host = loadExtension(options);
+    await host.startAgent("Write the tests.", { systemPrompt: catalogPrompt([SEAMS]), reason });
+    await host.commitPrompt("Write the tests.");
+    expect(catalogEntries(host)).toEqual([]);
+  });
+
+  it("records only the preparation OMP kept: a re-run replaces it and a switched session drops it", async () => {
+    const host = loadExtension();
+    await host.startAgent("Write the tests.", { systemPrompt: catalogPrompt([SEAMS]) });
+    await host.startAgent("Write the tests.", { systemPrompt: catalogPrompt([NOTES]) });
+    await host.commitMessage({ customType: "other-extension", content: "context", display: false });
+    expect(catalogEntries(host)).toEqual([]);
+    await host.commitPrompt("Write the tests.");
+    expect((await lookUp(host, NOTES[0])).matches).toEqual([expect.objectContaining({ status: "listed" })]);
+    expect((await lookUp(host, SEAMS[0])).matches).toEqual([expect.objectContaining({ status: "not-listed" })]);
+
+    await host.startAgent("Next.", { systemPrompt: catalogPrompt([SEAMS]) });
+    await host.emit("session_switch");
+    await host.commitPrompt("Next.");
+    expect(catalogEntries(host)).toHaveLength(2);
+  });
+
+  it("reports unknown, never absent, without an observation or with no standard skills block", async () => {
+    const host = loadExtension();
+    const none = await lookUp(host, SEAMS[0]);
+    expect(none.result.isError).toBe(false);
+    expect(none.matches).toEqual([]);
+    expect(none.text).toContain(`whether \`${SEAMS[0]}\` was listed is unknown`);
+    await observeCatalog(host, [], ["You are a coding agent with a custom prompt."]);
+    const custom = await lookUp(host, SEAMS[0]);
+    expect(custom.matches).toEqual([expect.objectContaining({ status: "unknown", coverage: "no-block" })]);
+    expect(custom.text).toContain("unknown (the system prompt had no standard skills block");
+    expect(custom.text).not.toMatch(/\bnot listed\b|\babsent\b/);
+  });
+
+  it("writes no file: no global catalog store, prompt archive, skill body or ledger row", async () => {
+    const host = loadExtension();
+    const files = () => readdirSync(host.skillHome.home, { recursive: true }).map(String).sort();
+    const before = files();
+    await observeCatalog(host, [SEAMS, NOTES]);
+    await lookUp(host, SEAMS[0]);
+    expect(files()).toEqual(before);
+    expect(JSON.stringify(catalogEntries(host))).not.toContain("You are a coding agent");
+  });
+
+  it("gives the pass and /observe-report a summary and lookup instructions, never the entries, and counts it in the payload estimate", async () => {
+    const host = loadExtension();
+    host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage, ...fx.skillUrlRead]);
+    await observeCatalog(host, [SEAMS, NOTES]);
+    await host.runCommand("observe-report");
+    const report = host.notices.at(-1)!;
+    expect(report).toContain("\nSkill catalog observations: 1 on this branch; the latest, at entry `user-");
+    expect(report).toContain("listed 2 skills");
+    expect(report).toMatch(/\nPayload estimate for \/observe now: ≈ \d+ tokens \(.*catalog \d+/);
+    expect(report).not.toContain(SEAMS[1]);
+
+    await host.runCommand("observe");
+    const content = String(host.sent[0]?.message.content);
+    expect(content).toContain("## Skill catalog observations\n\n1 skill catalog observation on this branch");
+    expect(content).toContain("`observer_review` `action: \"catalog\"`");
+    expect(content).not.toContain(SEAMS[1]);
+    expect(content).not.toContain(NOTES[0]);
+    expect(host.notices.at(-1)).toMatch(/catalog \d+/);
   });
 });
 

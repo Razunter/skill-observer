@@ -4,6 +4,7 @@
  * rule names and project target paths only; never tool arguments, error text,
  * evidence file paths or session IDs.
  */
+import { type CatalogSummary, describeCatalogSummary } from "./catalog.js";
 import type { ObserverRule } from "./amendments.js";
 import { droppedSignalCount, type LoadedSkill, type SessionDigest, type SkillSignal } from "./digest.js";
 import { type LedgerRecord, targetLabel } from "./ledger.js";
@@ -27,6 +28,8 @@ export interface EvidenceReport {
   later: number;
   /** The project's pending observations, counted; their text stays out of the report. */
   observations: number;
+  /** Availability only; catalog presence alone never makes the report non-empty. */
+  catalog: CatalogSummary;
   /** The payload `/observe` would send now; absent on an empty report. */
   payload?: PayloadEstimate;
 }
@@ -34,11 +37,12 @@ export interface EvidenceReport {
 const STATUS_ORDER: readonly RemedyOutcome["status"][] = ["delivered", "exercised-clean", "recurrence", "inconclusive"];
 
 /** The report of `digest` with `ledger`, the proposal ledger already scoped to this project, and the project's pending observation count. */
-export function evidenceReport({ digest, ledger, stale, observations }: {
+export function evidenceReport({ digest, ledger, stale, observations, catalog }: {
   digest: SessionDigest;
   ledger: readonly LedgerRecord[];
   stale: readonly ObserverRule[];
   observations: number;
+  catalog: CatalogSummary;
 }): EvidenceReport {
   const signals: Record<SignalKind, number> = {
     steering: 0, "rule-violation": 0, "ask-custom-input": 0, "ask-off-recommendation": 0, "tool-error": 0, workflow: 0,
@@ -60,6 +64,7 @@ export function evidenceReport({ digest, ledger, stale, observations }: {
     stale: stale.map((rule) => ({ rule: rule.name, skill: rule.amends })),
     later: ledger.filter((record) => record.outcome === "later" && !record.compaction).length,
     observations,
+    catalog,
   };
 }
 
@@ -88,5 +93,6 @@ export function renderEvidenceReport(report: EvidenceReport): string {
     ...(report.payload ? [`Payload estimate for /observe now: ${describePayloadEstimate(report.payload)}`] : []),
     `Later proposals: ${report.later}`,
     `Pending observations: ${report.observations}`,
+    `Skill catalog observations: ${describeCatalogSummary(report.catalog)}`,
   ].join("\n");
 }

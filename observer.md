@@ -50,6 +50,10 @@ Each entry under **Stale amendments** is a candidate too: an amendment rule whos
 Each entry under **Observations** is a remark the main agent recorded while working in this repository, in this session or an earlier one: evidence to check against the session and the checkout before you propose anything. A path in it may belong to another worktree of the repository; look for the same file under the current checkout. Once checked, an observation that fits a proposal kind available in this pass becomes a candidate like any signal; any other becomes a report item, which also says what checking it showed.
 <!-- end -->
 
+<!-- when: catalog -->
+**Skill catalog observations** record which skills the system prompt listed, with their descriptions as shown then, when the `before_agent_start` hook ran for a prompt. When session evidence suggests the agent missed a skill that should have applied, look the skill up by exact name with `observer_review` `action: "catalog"` before judging its description. A listing is what the hook saw, not proof the model received it; an unlisted or unknown result is not proof the skill was unavailable, and no observation is a finding by itself.
+<!-- end -->
+
 Done when every signal and relevant note point is either an evidence-backed candidate with one mechanism, exact target, scope, remedy and verification method, a report item, or dismissed with its reason; cross-source duplicates are merged, gaps are disclosed, and every Later entry, stale amendment and marked compaction is accounted for.
 
 ## 2. Draft

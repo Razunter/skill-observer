@@ -18,7 +18,7 @@ const SRC_DIR = join(dirname(INSTRUCTIONS_PATH), "src");
 
 const observerMd = readFileSync(INSTRUCTIONS_PATH, "utf8");
 const fragments = parseFragments(observerMd);
-const ALL_GATES = new Set<Gate>(["stale", "compaction", "project", "withdrawal", "ranking", "note", "observations", "tool-result"]);
+const ALL_GATES = new Set<Gate>(["stale", "compaction", "project", "withdrawal", "ranking", "note", "observations", "catalog", "tool-result"]);
 
 describe("observer.md fragments", () => {
   it("keeps the committed observer/ files in step with observer.md", () => {

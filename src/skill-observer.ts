@@ -26,6 +26,7 @@ import {
   type SessionDigest,
   type SkillSignal,
 } from "./digest.js";
+import { catalogSummary, registerCatalogCapture, renderCatalogSummary } from "./catalog.js";
 import { registerAmendmentDelivery } from "./delivery.js";
 import { harnessRootDirs, ledgerForProject, readLedger, renderLedger } from "./ledger.js";
 import type { AskDetails, ExtensionAPI, ExtensionContext } from "./omp.js";
@@ -128,6 +129,7 @@ async function observationPayload(
   const hookDirs = harnessRootDirs(ctx.cwd, ompAgentDir());
   const inForce = rulesInForce(ledger, readObserverRules(ruleDirs()), digest, referencesDir());
   const onReadAmendments = readOnReadAmendments(amendmentsDir());
+  const catalog = catalogSummary(ctx.sessionManager.getBranch());
   const gates = activeGates({
     digest,
     stale,
@@ -136,6 +138,7 @@ async function observationPayload(
     observations,
     rankingAvailable: (await rankingModelUnavailable(pi, ctx).catch(() => "unreadable")) === undefined,
     onReadAmendmentFor: (skill) => onReadAmendments.some((rule) => rule.amends === skill),
+    catalogObservations: catalog.observations,
   });
   const retro = gates.has("project") ? retroReference(provenance) : undefined;
   const sections: PayloadSection[] = [
@@ -152,6 +155,7 @@ async function observationPayload(
     { name: "note", text: note && `## User note\n\n${note}` },
     { name: "digest", text: `## Session digest\n\n${renderDigest(digest)}` },
     { name: "observations", text: renderObservations(observations) },
+    { name: "catalog", text: renderCatalogSummary(catalog) },
     { name: "ledger", text: renderLedger(ledger) },
     { name: "outcomes", text: renderRemedyOutcomes(remedyOutcomes(ledger, digest), ledger, digest) },
     { name: "rules-in-force", text: renderRulesInForce(inForce, readHandWrittenRules(userRulesDir())) },
@@ -200,6 +204,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
     console.error("skill-observer: migrating amendment rules failed:", error);
   }
   registerAmendmentDelivery(pi, amendmentsDir);
+  registerCatalogCapture(pi, isObservable);
   pi.on("tool_call", async (event) => {
     try {
       recordHookCall(pi, event);
@@ -323,7 +328,9 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const stale = findStaleAmendments(ruleDirs(), provenance);
       try {
         const observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
-        const report = evidenceReport({ digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale, observations: observations.length });
+        const report = evidenceReport({
+          digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale, observations: observations.length, catalog: catalogSummary(ctx.sessionManager.getBranch()),
+        });
         if (!isEmptyEvidenceReport(report)) {
           report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, roots, provenance })).sections);
         }
