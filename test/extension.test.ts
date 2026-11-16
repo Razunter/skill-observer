@@ -7268,6 +7268,26 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(reason).toContain(`inspect \`${skill}\` again`);
   });
 
+  it("produces no Ask form when a prepared repair's skill changes owner with the same SKILL.md before Select", async () => {
+    const host = loadExtension();
+    const skill = "sample-local";
+    writeSkill(join(host.skillHome.roots.skillsDir, skill), skill);
+    startPass(host);
+    const { id, result } = await inspect(host, { skill });
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [descriptionFix(skill, "local", id, firstSource(result))] });
+    expect(failures(prepared)).toEqual([]);
+    const [entry] = reviewEntries(prepared);
+    setLockHash(host, skill, "fixture-lock-hash");
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+    expect(selection.isError).toBe(true);
+    expect(JSON.parse(resultText(selection)).askHtml).toBeUndefined();
+    expect(reviewEntries(selection, "selected")).toEqual([]);
+    const reason = failures(selection).join("\n");
+    expect(reason).toContain(entry!.reference.candidateId);
+    expect(reason).toContain("now an upstream skill");
+    expect(reason).toContain(`inspect \`${skill}\` again`);
+  });
+
   it("refuses a Select whose saved candidate diagnosis was replaced after Prepare under the same reference", async () => {
     const host = loadExtension();
     installGuide(host);
