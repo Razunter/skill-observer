@@ -34,7 +34,7 @@ import {
 import { IN_FORCE_OUTCOMES, laterReoffer, type LedgerRecord, type ProposalKind, type SkillLedgerRecord, STALE_OUTCOMES } from "./ledger.js";
 import type { SessionEntry } from "./omp.js";
 import type { ProvenanceResolver } from "./provenance.js";
-import { type ApprovalEvidence, approvedChange, type ApprovedChange, TargetChangedError } from "./proposal-approval.js";
+import { type ApprovalEvidence, approvedChange, type ApprovedChange, approvedDirectEdit, TargetChangedError } from "./proposal-approval.js";
 import { type FixRule, publishFix } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, readReferenceFiles, type ReferenceFile, replaceReferenceFiles } from "./references.js";
 import { describeVerdict, type ReplayCase, type Verdict } from "./replay.js";
@@ -56,12 +56,13 @@ export interface AmendmentContext {
 
 type WithdrawalChange = Extract<ApprovedChange, { operation: "withdrawal" }>;
 
-/** A skill answer that passed the resolver's checks: its ledger fingerprint and, for an applied fix, the rule it writes, or for a withdrawal, its approved change. */
+/** A skill answer that passed the resolver's checks: its ledger fingerprint and, for an applied fix, the rule it writes, for a withdrawal, its approved change, or for an applied direct edit, that the main agent made it. */
 export interface ValidatedAnswer {
   answer: ProposalAnswer;
   fingerprint: string;
   fix?: FixRule;
   withdrawal?: WithdrawalChange;
+  directEdit?: true;
 }
 
 /** One call's answers that change rules and on-read amendments. */
@@ -122,8 +123,8 @@ export function onReadAmendmentTransitions(invocation: AmendmentInvocation, cont
   const { dirs, referencesDir, latest, provenance } = context;
   const failures: string[] = [];
   let targetChanged = false;
-  const prepared = invocation.answers.flatMap(({ answer, fingerprint, fix, withdrawal: change }): ScheduledAnswer[] => {
-    if (!change) return [{ answer, fingerprint, fix }];
+  const prepared = invocation.answers.flatMap(({ answer, fingerprint, fix, withdrawal: change, directEdit }): ScheduledAnswer[] => {
+    if (!change) return [{ answer, fingerprint, fix, ...(directEdit && { directEdit }) }];
     try {
       return [{ answer, fingerprint, withdrawn: preparedWithdrawal(answer, change, latest, dirs, referencesDir) }];
     } catch (error) {
@@ -172,12 +173,13 @@ export function onReadAmendmentTransitions(invocation: AmendmentInvocation, cont
   };
 }
 
-/** A scheduled skill answer: an applied fix's rule, or the withdrawal it carries out as checked against the ledger and the fix's rule file. */
+/** A scheduled skill answer: an applied fix's rule, the withdrawal it carries out as checked against the ledger and the fix's rule file, or an applied direct edit the main agent made. */
 interface ScheduledAnswer {
   answer: ProposalAnswer;
   fingerprint: string;
   fix?: FixRule;
   withdrawn?: Withdrawal;
+  directEdit?: true;
 }
 
 interface Schedule {
@@ -208,7 +210,15 @@ function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[]
       return error as Error;
     }
   };
-  const approved = answers.map(({ answer }) => (answer.approval ? approvedNow(answer) : undefined));
+  const approvedEdit = (answer: ProposalAnswer) => {
+    try {
+      approvedDirectEdit(answer.approval, branch);
+      return undefined;
+    } catch (error) {
+      return error as Error;
+    }
+  };
+  const approved = answers.map(({ answer, directEdit }) => (directEdit ? approvedEdit(answer) : answer.approval ? approvedNow(answer) : undefined));
   const staleApproved = stale.map((answer) => (answer.action === "keep" ? undefined : approvedNow(answer)));
   const compactionApproved = compactions.map(({ answer }) => (answer.outcome === "applied" ? approvedNow(answer) : undefined));
 

@@ -49,12 +49,12 @@ import {
 } from "./ledger.js";
 import type { ExtensionAPI, SessionEntry } from "./omp.js";
 import { onReadAmendmentTransitions, type Publication, type ValidatedAnswer } from "./on-read-amendment-transitions.js";
-import { createProvenanceResolver, defaultSkillRoots } from "./provenance.js";
+import { createProvenanceResolver, defaultSkillRoots, type ProvenanceResolver } from "./provenance.js";
 import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
-import { checkHarnessPublication, checkProjectPublication } from "./project-publication.js";
-import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedHarness, laterNote, latestPrepared, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
+import { checkHarnessPublication, checkProjectPublication, checkSkillEditPublication, type SkillEditPublication } from "./project-publication.js";
+import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, laterNote, latestPrepared, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
 import { type ToolResultCondition, whatToDoNow } from "./payload.js";
 import { isProposalRef, type PreparedProposal, type PreparedProposalRef, proposalRefSchema } from "./review.js";
 import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
@@ -76,8 +76,10 @@ export interface ObserverFiles {
 export interface ProposalAnswer extends Pick<SkillLedgerRecord, "skill" | "kind" | "gist" | "reoffer"> {
   outcome: AnswerOutcome;
   fingerprint?: string;
-  /** For an applied on-read fix, pattern amendment or barrier rule, or a withdrawal: where the user's approval of its prepared proposal is saved on the branch, and for a fix, the reconciliation whose content is written instead, if any. */
+  /** For an applied on-read fix, pattern amendment, barrier rule or direct edit, or a withdrawal: where the user's approval of its prepared proposal is saved on the branch, and for a fix, the reconciliation whose content is written instead, if any. */
   approval?: AnswerApproval;
+  /** For an applied local, managed or new skill direct edit only: the call that made it after the user's Apply. */
+  publication?: SkillEditPublication;
   evidence?: Evidence[];
 }
 
@@ -234,7 +236,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
     name: RESOLVE_TOOL_NAME,
     label: "Observer Resolve",
     description:
-      "Record the user's answers to an `/observe` pass in the proposal ledger, which later passes read to skip declined proposals and re-offer deferred ones. A skill outcome that cites its prepared proposal, through `approval` or `proposal`, is recorded under that proposal's skill, kind, gist, fingerprint and evidence. An applied upstream or plugin fix is written here: an on-read fix as a section appended to the skill's one on-read amendment, `<skill>-amendment`, created with that section when the skill has none; a pattern amendment as its own rule. An applied barrier for a local or managed skill is written as its barrier rule. An applied on-read fix, pattern amendment or barrier rule, a `withdrawn` answer, a stale `update` or `delete` and an applied compaction carry `approval`: the section, rule, body, reference files or deletion is the one its prepared proposal holds (for a stale answer, the alternative of the selected option), carried out only when this observation pass holds that proposal's Prepare, its Select and a native `ask` called with that Select's `askHtml` unchanged, in which the user explicitly chose the proposal's Apply option (for a stale amendment, Update or Delete) before any timeout, custom input approving nothing, and only while the amendment or rule file and its reference files hold the bytes Prepare read, a re-pin aside for a stale answer, withdrawal or compaction; when the user attached a note to an on-read fix's or rule's Apply, or its target changed, `revision` cites a reconciliation prepared through observer_review, whose content is written while the target holds the bytes that reconciliation read, and a noted or changed stale answer, withdrawal or compaction is prepared and asked again. Otherwise it writes and records nothing. A rule with a pattern is replayed as `observer_check` does and written only when it passes, else recorded as `later`; the approval is checked again after the replay, right before the write. A `withdrawn` answer takes back an earlier applied fix: it deletes the rule file the fix wrote, or, for a fix inside the skill's on-read amendment, rewrites the amendment with the body its withdrawal proposal prepared; a fix moved to another skill is a `withdrawn` answer plus an `applied` one. An applied compaction rewrites the skill's on-read amendment with its prepared body and replaces its reference files with its prepared set, after this call's additions, only when its prepared `includes` names every on-read fix this call applied for the skill and only fixes this call applied, and no stale update or delete or withdrawal in this call changed the amendment; otherwise it is recorded as `later`. Stale answers are carried out before every other answer: Keep re-pins its rule without an approval, leaving its body and reference files byte for byte, and Update and Delete rewrite or delete it, and deleting a skill's on-read amendment takes its fixes out of force and deletes its reference files. Returns the records and rule files written, what each change carried out from a prepared proposal rests on (a note and the text written under it included), the answers held back as `later`, and any answer that wrote nothing.",
+      "Record the user's answers to an `/observe` pass in the proposal ledger, which later passes read to skip declined proposals and re-offer deferred ones. A skill outcome that cites its prepared proposal, through `approval` or `proposal`, is recorded under that proposal's skill, kind, gist, fingerprint and evidence. An applied upstream or plugin fix is written here: an on-read fix as a section appended to the skill's one on-read amendment, `<skill>-amendment`, created with that section when the skill has none; a pattern amendment as its own rule. An applied barrier for a local or managed skill is written as its barrier rule. An applied direct edit of a local, managed or new skill is made by you, not here: it carries the `approval` of its prepared proposal and `publication`, the call that made the edit after that Apply, and is recorded only when both hold. An applied on-read fix, pattern amendment or barrier rule, a `withdrawn` answer, a stale `update` or `delete` and an applied compaction carry `approval`: the section, rule, body, reference files or deletion is the one its prepared proposal holds (for a stale answer, the alternative of the selected option), carried out only when this observation pass holds that proposal's Prepare, its Select and a native `ask` called with that Select's `askHtml` unchanged, in which the user explicitly chose the proposal's Apply option (for a stale amendment, Update or Delete) before any timeout, custom input approving nothing, and only while the amendment or rule file and its reference files hold the bytes Prepare read, a re-pin aside for a stale answer, withdrawal or compaction; when the user attached a note to an on-read fix's or rule's Apply, or its target changed, `revision` cites a reconciliation prepared through observer_review, whose content is written while the target holds the bytes that reconciliation read, and a noted or changed stale answer, withdrawal or compaction is prepared and asked again. Otherwise it writes and records nothing. A rule with a pattern is replayed as `observer_check` does and written only when it passes, else recorded as `later`; the approval is checked again after the replay, right before the write. A `withdrawn` answer takes back an earlier applied fix: it deletes the rule file the fix wrote, or, for a fix inside the skill's on-read amendment, rewrites the amendment with the body its withdrawal proposal prepared; a fix moved to another skill is a `withdrawn` answer plus an `applied` one. An applied compaction rewrites the skill's on-read amendment with its prepared body and replaces its reference files with its prepared set, after this call's additions, only when its prepared `includes` names every on-read fix this call applied for the skill and only fixes this call applied, and no stale update or delete or withdrawal in this call changed the amendment; otherwise it is recorded as `later`. Stale answers are carried out before every other answer: Keep re-pins its rule without an approval, leaving its body and reference files byte for byte, and Update and Delete rewrite or delete it, and deleting a skill's on-read amendment takes its fixes out of force and deletes its reference files. Returns the records and rule files written, what each change carried out from a prepared proposal rests on (a note and the text written under it included), the answers held back as `later`, and any answer that wrote nothing.",
     parameters: z.object({
       outcomes: z
         .array(
@@ -259,10 +261,14 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
                   .describe("When the user attached a note to Apply, or the amendment or rule file changed after Prepare: the `reference` of the reconciliation that cites this approval, exactly as Prepare returned it."),
               })
               .optional()
-              .describe("Applied on-read fix, pattern amendment or barrier rule, or withdrawal only, and required for one: where the user's approval of its prepared proposal is saved. The section, rule or withdrawal carried out is the prepared one, or for a fix its reconciliation's; skill, kind, gist, fingerprint and evidence are the prepared proposal's."),
+              .describe("Applied on-read fix, pattern amendment, barrier rule or direct edit, or withdrawal only, and required for one: where the user's approval of its prepared proposal is saved. The section, rule or withdrawal carried out is the prepared one, or for a fix its reconciliation's; skill, kind, gist, fingerprint and evidence are the prepared proposal's."),
+            publication: z
+              .object({ writeToolCallId: z.string() })
+              .optional()
+              .describe("Applied local, managed or new skill direct edit only, and required for one: the `observerToolCallId` of the successful call that made the approved edit after the user's Apply, the `edit` or `write` of a local skill's SKILL.md, or the `manage_skill` `update` of a managed skill or `create` of a new one. This tool writes no skill."),
             proposal: proposalRefSchema(z)
               .optional()
-              .describe("Any other answer to a prepared on-read fix, rule or direct edit (Later, Decline, deferred by Select, applied direct edit), or a Decline of a withdrawal: its `reference` from the pass's latest Prepare holding it, exactly as Prepare returned it. Skill, kind, gist, fingerprint and evidence are the prepared proposal's; a Later without `reoffer` takes the note the user attached to Later."),
+              .describe("Any other answer to a prepared on-read fix, rule or direct edit (Later, Decline, deferred by Select), or a Decline of a withdrawal: its `reference` from the pass's latest Prepare holding it, exactly as Prepare returned it. Skill, kind, gist, fingerprint and evidence are the prepared proposal's; a Later without `reoffer` takes the note the user attached to Later."),
             evidence: z
               .array(
                 z.object({
@@ -379,7 +385,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         try {
           const answer = citedAnswer(sent, ctx.sessionManager.getBranch());
           shown = answer;
-          if ("target" in answer || "publication" in answer || latest.get(answer.fingerprint ?? "")?.target !== undefined) {
+          if ("target" in answer || latest.get(answer.fingerprint ?? "")?.target !== undefined) {
             throw new Error("a project or harness identity cannot be submitted as a global skill answer");
           }
           const installed = sent.proposal === undefined && sent.approval === undefined && answer.kind !== "new" ? provenance.byName(answer.skill).kind : "unknown";
@@ -391,10 +397,13 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           if ((answer.outcome === "applied" || withdraws) && "rule" in answer) {
             throw new Error("an applied or withdrawn answer carries `approval`, not a `rule`: what it writes or takes back is what its approved proposal holds");
           }
-          // An upstream or plugin fix is always a rule; a local or managed one is a barrier rule when it cites the approval of its prepared rule, else an edit the model made.
-          const writesRule = answer.outcome === "applied" && (isPinKind(answer.kind) || answer.approval !== undefined);
-          if (answer.approval !== undefined && !writesRule && !withdraws) {
-            throw new Error("`approval` comes only with an applied on-read fix, pattern amendment or barrier rule, or a withdrawal");
+          // An upstream or plugin fix is always a rule; a local, managed or new one is a barrier rule when it cites only the approval of its prepared rule, else an edit the model made.
+          const isDirectEdit = answer.outcome === "applied" && !isPinKind(answer.kind) && (answer.approval === undefined || answer.publication !== undefined);
+          if (isDirectEdit) checkDirectEdit(answer, provenance, ctx.cwd, ctx.sessionManager.getBranch());
+          else if (answer.publication !== undefined) throw new Error("`publication` comes only with an applied local, managed or new skill direct edit");
+          const writesRule = answer.outcome === "applied" && !isDirectEdit;
+          if (answer.approval !== undefined && !writesRule && !withdraws && !isDirectEdit) {
+            throw new Error("`approval` comes only with an applied on-read fix, pattern amendment, barrier rule or direct edit, or a withdrawal");
           }
           const approved = writesRule || withdraws ? approvedChange(answer, ctx.sessionManager.getBranch()) : undefined;
           const fingerprint = approved?.evidence.fingerprint ?? (answer.fingerprint || proposalFingerprint(answer.skill, answer.gist));
@@ -407,8 +416,8 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             return [];
           }
           const change = approved?.change;
-          const checked = change?.operation === "withdrawal"
-            ? { answer, fingerprint, withdrawal: change }
+          const checked: ValidatedAnswer = isDirectEdit ? { answer, fingerprint, directEdit: true }
+            : change?.operation === "withdrawal" ? { answer, fingerprint, withdrawal: change }
             : { answer, fingerprint, fix: change && fixRule({ ...answer, rule: fixDraft(change) }, fingerprint, dirs, provenance) };
           claimed.set(fingerprint, answer.skill);
           return [checked];
@@ -514,6 +523,25 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       };
     },
   });
+}
+
+/**
+ * Throws unless the applied local, managed or new skill edit `answer` cites
+ * the user's Apply of its prepared direct edit and the observed owner-tool
+ * call that made the edit after that Apply: the main agent makes the edit, so
+ * the ledger records it applied only once the branch shows it was made.
+ */
+function checkDirectEdit(answer: ProposalAnswer, provenance: ProvenanceResolver, cwd: string, branch: readonly SessionEntry[]): void {
+  if (answer.approval === undefined) {
+    throw new Error("an applied local, managed or new skill edit cites the user's Apply of its prepared proposal through `approval` and the call that made the edit through `publication`");
+  }
+  const { proposal, answeredAt } = approvedDirectEdit(answer.approval, branch);
+  const isThisAnswer = proposal.skill === answer.skill && proposal.kind === answer.kind && proposal.gist === answer.gist &&
+    (answer.fingerprint === undefined || answer.fingerprint === proposal.fingerprint);
+  if (!isThisAnswer) throw new Error(`the approved proposal is \`${proposal.skill}\` (${proposal.kind}) "${proposal.gist}" under fingerprint \`${proposal.fingerprint}\`, not this answer`);
+  const installed = provenance.byName(proposal.skill);
+  const path = installed.kind === "local" ? installed.path : undefined;
+  checkSkillEditPublication({ name: proposal.skill, kind: proposal.kind, ...(path !== undefined && { path }) }, answer.publication, cwd, branch, answeredAt);
 }
 
 /** Operations whose proposal a skill answer cites through `proposal`. A withdrawal is answered through its approval, and only its Decline cites it through `proposal`; a stale amendment and a compaction are answered in their own lists. */

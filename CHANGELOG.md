@@ -15,6 +15,7 @@
 
 ### Changed
 
+- `observer_resolve` records an applied direct edit of a local, managed or new skill only with the `approval` of its prepared proposal and `publication: { writeToolCallId }`: a successful `edit` or `write` of the local skill's `SKILL.md`, or `manage_skill` `update` of the managed skill or `create` of the new one, made after the user's Apply. Before, an applied direct edit cited only its proposal, or nothing, and was recorded even when no write happened.
 - `/observe` asks through the HTML-form `ask` of OMP 18.18. `observer_review` Select returns `askHtml`, the complete form with one fieldset per selected proposal (target and gist, remedy, evidence, preview, and Apply / Later / Decline, or Keep / Update / Delete for a stale amendment); the model passes it to `ask` unchanged. Nothing is preselected.
 - Proposal approval requires the saved Ask's `html` to equal the form rendered from that Select, no timeout, and exactly one answer named by the proposal's `candidateId` holding the approving label. This replaces the per-option preview comparison.
 - The form shows previews as wrapped text, because the host's form dialog cuts `<pre>` lines at its width: every word and line break, with the whitespace the form collapses marked, `·` per space of an indent, a trailing run or a repeated run and `→` per tab. The bytes written are the prepared ones.

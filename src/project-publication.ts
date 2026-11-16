@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
 import { canonicalPathIn, canonicalProjectTarget, type HarnessFile, type HarnessPublication, type ProjectPublication, type ProjectTarget } from "./ledger.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
@@ -15,13 +16,8 @@ export function checkProjectPublication(target: ProjectTarget, publication: Proj
   }
   const evidence = sessionToolEvidence(branch);
   const write = successfulCall(evidence, publication.writeToolCallId);
-  const writeArgs = write.call.args;
   if (write.call.name !== "write" && write.call.name !== "edit") throw new Error("project publication must use normal write/edit tools");
-  const paths: string[] = [];
-  if (write.call.name === "edit" && typeof writeArgs.input === "string") {
-    if (/^(?:REM|MV )/m.test(writeArgs.input)) throw new Error("project receipt does not accept delete or rename edits");
-    paths.push(...[...writeArgs.input.matchAll(/^\[([^#\r\n]+)#[0-9A-Fa-f]{4}\]$/gm)].map((match) => match[1]!));
-  } else if (typeof writeArgs.path === "string") paths.push(write.call.name === "write" ? writeTargetPath(writeArgs.path) : writeArgs.path);
+  const paths = writtenPaths(write);
   const targets = paths.map((path) => {
     const absolute = isAbsolute(path) ? path : resolvePath(target.root, path);
     return canonicalProjectTarget(target.root, { ...target, path: relative(target.root, absolute) });
@@ -32,6 +28,50 @@ export function checkProjectPublication(target: ProjectTarget, publication: Proj
   if (!statSync(file).isFile() || sha256(readFileSync(file)) !== publication.afterHash) {
     throw new Error("project target no longer matches the observed publication hash");
   }
+}
+
+/** What an applied local, managed or new skill direct edit rests on: the owner-tool call that made it. */
+export interface SkillEditPublication {
+  writeToolCallId: string;
+}
+
+/**
+ * Throws unless `publication` cites a successful write of `skill` by its
+ * owner, made after the user's Apply saved at `approvedAt`: `edit` or `write`
+ * of a local skill's `SKILL.md` at `path`, `manage_skill` `update` of a
+ * managed skill, or `manage_skill` `create` of a new one.
+ */
+export function checkSkillEditPublication(skill: { name: string; kind: string; path?: string }, publication: SkillEditPublication | undefined, cwd: string, branch: readonly SessionEntry[], approvedAt: number): void {
+  if (typeof publication?.writeToolCallId !== "string" || !publication.writeToolCallId) {
+    throw new Error("an applied local, managed or new skill edit needs `publication`: `{ writeToolCallId }`, the observerToolCallId of the edit, write or manage_skill call that made it after the user's Apply");
+  }
+  const write = successfulCall(sessionToolEvidence(branch), publication.writeToolCallId);
+  if (write.call.position <= approvedAt) throw new Error(`\`${publication.writeToolCallId}\` was made before the user's Apply: make the approved edit after it and cite that call`);
+  if (skill.kind === "local") {
+    if (write.call.name !== "write" && write.call.name !== "edit") throw new Error(`the local skill \`${skill.name}\` is published with the normal edit or write tool`);
+    const target = skill.path === undefined ? undefined : canonical(skill.path);
+    // The native edit and write tools expand a leading `~/` before resolving against the working directory.
+    const written = writtenPaths(write).map((path) => canonical(resolvePath(cwd, path.startsWith("~/") ? join(homedir(), path.slice(2)) : path)));
+    if (target === undefined || !written.includes(target)) {
+      throw new Error(`\`${publication.writeToolCallId}\` does not write \`${skill.name}\`'s SKILL.md${skill.path === undefined ? "" : ` at \`${skill.path}\``}`);
+    }
+    return;
+  }
+  const action = skill.kind === "new" ? "create" : "update";
+  const details = write.result.details;
+  if (write.call.name !== "manage_skill" || details?.action !== action || details.name !== skill.name) {
+    throw new Error(`\`${publication.writeToolCallId}\` is not the manage_skill \`${action}\` of \`${skill.name}\` that publishes this ${skill.kind} skill`);
+  }
+}
+
+/** The paths a successful `edit` or `write` call names, as given: an edit's file headers, or a write's path. */
+function writtenPaths({ call }: CompletedToolCall): string[] {
+  const args = call.args;
+  if (call.name === "edit" && typeof args.input === "string") {
+    if (/^(?:REM|MV )/m.test(args.input)) throw new Error("a publication receipt does not accept delete or rename edits");
+    return [...args.input.matchAll(/^\[([^#\r\n]+)#[0-9A-Fa-f]{4}\]$/gm)].map((match) => match[1]!);
+  }
+  return typeof args.path === "string" ? [call.name === "write" ? writeTargetPath(args.path) : args.path] : [];
 }
 
 /** Throws unless `command` is the companion's check, its own tests: exactly `bun test` in the companion directory, since an argument could skip them (`--help`) or run code outside the approved files (`--preload`). */

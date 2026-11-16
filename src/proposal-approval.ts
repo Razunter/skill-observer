@@ -300,14 +300,40 @@ export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<P
   if (note !== undefined) {
     throw new Error(`the user chose Apply with the note ${JSON.stringify(note)}, which approves nothing for a hook or companion change: revise it by the note, prepare it and ask again`);
   }
+  checkLatestAnswer(approval, evidence, answeredAt);
+  return { proposal, change, answeredAt };
+}
+
+/**
+ * The local, managed or new skill direct edit the user answered Apply in this
+ * pass, established from the saved Ask answer like any approval, and the
+ * branch position where the Apply was saved: the main agent makes the edit
+ * itself, so its write must come after it. A note on Apply revises the edit
+ * the agent makes. A later Prepare or answer of the same proposal supersedes the Apply.
+ */
+export function approvedDirectEdit(ref: Partial<ProposalAnswerRef> | undefined, branch: readonly SessionEntry[]): { proposal: PreparedProposal; answeredAt: number } {
+  const approval = answerRef(ref);
+  const evidence = sessionToolEvidence(branch);
+  const { proposal, answeredAt } = approvedProposal(approval, evidence, branch, (prepared) => {
+    const change = "change" in prepared ? prepared.change : undefined;
+    if (change?.operation !== "direct-edit" || !["local", "managed", "new"].includes(prepared.kind)) {
+      throw new Error("`publication` comes only with an applied local, managed or new skill direct edit");
+    }
+    return new Map([[APPLY, change]]);
+  });
+  checkLatestAnswer(approval, evidence, answeredAt);
+  return { proposal, answeredAt };
+}
+
+/** Throws when a later Prepare or Ask of this pass holds the approved proposal again, which voids the answer saved at `answeredAt`. */
+function checkLatestAnswer(approval: ProposalAnswerRef, evidence: SessionToolEvidence, answeredAt: number): void {
   const { candidateId, reviewToolCallId } = approval.proposal;
   const isReprepared = latestPrepared(candidateId, evidence)?.reviewToolCallId !== reviewToolCallId;
   const isReasked = evidence.completedCalls("ask").some(({ result }) => result.position > answeredAt &&
     Array.isArray(result.details?.answers) && result.details.answers.some((answer: { name?: unknown } | undefined) => answer?.name === candidateId));
   if (isReprepared || isReasked) {
-    throw new Error("this Apply is superseded: a later Prepare or Ask of this pass holds the same proposal again; cite the user's latest answer, which must be an unnoted Apply");
+    throw new Error("this Apply is superseded: a later Prepare or Ask of this pass holds the same proposal again; cite the user's latest answer, which must be an Apply");
   }
-  return { proposal, change, answeredAt };
 }
 
 /** The reference that the branch's last successful Prepare holding `candidateId` returned for it; that Prepare may be native or nested. */
@@ -340,7 +366,7 @@ export function preparedInPass(ref: PreparedProposalRef, evidence: SessionToolEv
 function approvingOptions(proposal: PreparedProposal): Map<string, ApprovedChange> {
   if ("alternatives" in proposal) return new Map(proposal.alternatives.map(({ change }) => [STALE_OPTIONS[change.operation], change]));
   const { change } = proposal;
-  if (change.operation === "direct-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself");
+  if (change.operation === "direct-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself: cite its observed write as `publication`");
   if (change.operation === "harness") throw new Error("the approved proposal is a hook or companion change, answered as a `harness` outcome");
   return new Map([[APPLY, change]]);
 }

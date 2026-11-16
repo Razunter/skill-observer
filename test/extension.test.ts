@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { basename, delimiter, dirname, join, relative } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { appendLedger, canonicalProjectTarget, harnessFingerprint, type LedgerRecord, projectFingerprint, proposalFingerprint, readLedger } from "../src/ledger.js";
 import skillObserver from "../src/skill-observer.js";
@@ -1962,6 +1962,12 @@ const outcome = (skill: string, kind: string, gist: string, answer: string): Out
   outcome: answer,
 });
 
+/** Records `skill`'s edit as applied in the ledger, as an earlier pass did once it observed the edit after the user's Apply. */
+function seedApplied(host: ReturnType<typeof loadExtension>, skill: string, kind: string, gist: string): void {
+  appendLedger(host.ledgerFile, [{ fingerprint: proposalFingerprint(skill, gist), skill, kind, gist, outcome: "applied",
+    timestamp: new Date().toISOString(), sessionId: "fixture-session" } as LedgerRecord]);
+}
+
 function ledgerRecords(file: string): Array<Record<string, string>> {
   return readFileSync(file, "utf8")
     .trim()
@@ -2027,7 +2033,7 @@ describe("observer_resolve", () => {
     const host = loadExtension();
     const result = await host.callTool("observer_resolve", {
       outcomes: [
-        outcome("ce-commit-jj", "local", "Ask one question at a time.", "applied"),
+        outcome("ce-commit-jj", "local", "Ask one question at a time.", "declined"),
         outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later"),
         outcome("deploy-notes", "new", "Draft release notes from the jj log.", "declined"),
       ],
@@ -2045,7 +2051,7 @@ describe("observer_resolve", () => {
         sessionId: "fixture-session",
       });
     expect(ledgerRecords(host.ledgerFile)).toEqual([
-      record("ce-commit-jj", "local", "applied"),
+      record("ce-commit-jj", "local", "declined"),
       record("implement-spec", "managed", "later"),
       record("deploy-notes", "new", "declined"),
     ]);
@@ -3124,12 +3130,12 @@ describe("/observe with answers from earlier passes", () => {
 
   it("lists the loaded skills' rules with their fixes in force and nothing for other skills, apart from declined and deferred ones", async () => {
     const host = loadExtension();
+    seedApplied(host, "implement-spec", "managed", "Run the typecheck before each commit.");
+    seedApplied(host, "worktree-add", "managed", "Name the workspace after the ticket.");
     await host.callTool("observer_resolve", {
       outcomes: [
-        outcome("implement-spec", "managed", "Run the typecheck before each commit.", "applied"),
         outcome("implement-spec", "managed", "Read the spec before the tickets.", "declined"),
         outcome("grill-with-docs", "upstream", "Ask one question at a time.", "later"),
-        outcome("worktree-add", "managed", "Name the workspace after the ticket.", "applied"),
       ],
     });
     await addOnReadFix(host, "tdd", "Take seams from the ticket.", "## Seams\n\nTake seams from the ticket.");
@@ -3285,16 +3291,16 @@ describe("/observe with answers from earlier passes", () => {
 
   it("lists deferred proposals to re-offer, and leaves out declined ones and applied ones for skills this session didn't load", async () => {
     const host = loadExtension();
+    seedApplied(host, "grill-with-docs", "local", "Ask one question at a time.");
     await host.callTool("observer_resolve", {
       outcomes: [
         outcome("deploy-notes", "new", "Draft release notes from the jj log.", "declined"),
         outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later"),
-        outcome("grill-with-docs", "local", "Ask one question at a time.", "applied"),
       ],
     });
 
     const content = await observe(host);
-    const [, deferred] = ledgerRecords(host.ledgerFile);
+    const deferred = ledgerRecords(host.ledgerFile).find((record) => record.outcome === "later");
     expect(content).not.toContain("Draft release notes from the jj log.");
     expect(ledgerList(content, "Later")).toContain("Run the typecheck before each commit.");
     expect(ledgerList(content, "Later")).toContain(String(deferred?.fingerprint));
@@ -3310,11 +3316,9 @@ describe("/observe with answers from earlier passes", () => {
       ],
     });
     await host.callTool("observer_resolve", {
-      outcomes: [
-        outcome("tdd", "upstream", "Name the seam before the first test.", "later"),
-        outcome("implement-spec", "managed", "Run the typecheck before each commit.", "applied"),
-      ],
+      outcomes: [outcome("tdd", "upstream", "Name the seam before the first test.", "later")],
     });
+    seedApplied(host, "implement-spec", "managed", "Run the typecheck before each commit.");
 
     const content = await observe(host);
     expect(ledgerList(content, "Later")).toContain("Name the seam before the first test.");
@@ -3577,7 +3581,7 @@ describe("observer_resolve with upstream fixes", () => {
     writeFileSync(foreign, "---\ncondition: \"x\"\n---\n\nThe user's own rule.\n");
 
     const result = await host.callTool("observer_resolve", {
-      outcomes: [fix, outcome("ce-commit-jj", "local", "Ask one question at a time.", "applied")],
+      outcomes: [fix, outcome("ce-commit-jj", "local", "Ask one question at a time.", "declined")],
     });
 
     expect(readFileSync(foreign, "utf8")).toBe("---\ncondition: \"x\"\n---\n\nThe user's own rule.\n");
@@ -6230,8 +6234,7 @@ describe("evidence-gated instructions", () => {
     splitAmendment(host, skill, `${skill}-amendment`);
     rmSync(host.ledgerFile);
   };
-  const appliedManagedEdit = (host: ReturnType<typeof loadExtension>) =>
-    host.callTool("observer_resolve", { outcomes: [outcome("implement-spec", "managed", "Run the typecheck before each commit.", "applied")] });
+  const appliedManagedEdit = (host: ReturnType<typeof loadExtension>) => seedApplied(host, "implement-spec", "managed", "Run the typecheck before each commit.");
 
   const table: Array<[string, Gate[], Setup, Setup, { judge?: boolean }?]> = [
     ["stale: an amendment whose skill changed since its pin", ["stale"],
@@ -6384,15 +6387,15 @@ describe("re-offer conditions on Later entries", () => {
     expect(message).toMatch(/: Ask one question at a time\.$/m);
   });
 
-  it("records an Applied or Declined answer without its `reoffer`", async () => {
+  it("records a Declined answer without its `reoffer`", async () => {
     const host = loadExtension();
     const result = await resolve(host, [
-      { ...outcome("implement-spec", "managed", "Run the typecheck before each commit.", "applied"), reoffer },
+      { ...outcome("implement-spec", "managed", "Run the typecheck before each commit.", "declined"), reoffer },
       { ...outcome("grill-with-docs", "upstream", "Ask one question at a time.", "declined"), reoffer },
     ]);
     expect(failures(result)).toEqual([]);
     const records = ledgerRecords(host.ledgerFile);
-    expect(records.map((record) => record.outcome)).toEqual(["applied", "declined"]);
+    expect(records.map((record) => record.outcome)).toEqual(["declined", "declined"]);
     for (const record of records) expect(record).not.toHaveProperty("reoffer");
   });
 
@@ -7383,11 +7386,26 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(readLedger(host.ledgerFile)).toEqual([expect.objectContaining({ skill: GUIDE, kind: "upstream", outcome: "declined" })]);
   });
 
-  it("asks about a local or managed description fix with its inspection-backed diagnosis and disclosed uncertainty, and records it once applied", async () => {
+  /** Records a successful `name` call on the branch, as OMP saves it, and returns its ID. */
+  function callInSession(host: ReturnType<typeof loadExtension>, name: string, args: Record<string, unknown>, details: Record<string, unknown> = {}): string {
+    const id = `${name}-${host.getBranch().length}`;
+    host.getBranch().push(
+      { type: "message", id: `call-${id}`, message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } },
+      { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: name, isError: false, details, content: [{ type: "text", text: "Done." }] } },
+    );
+    return id;
+  }
+
+  it("asks about a local or managed description fix with its inspection-backed diagnosis and disclosed uncertainty, and records it applied only with its write after the Apply", async () => {
     for (const kind of ["local", "managed"] as const) {
       const host = loadExtension();
       const skill = "sample-local";
-      writeSkill(join(kind === "local" ? host.skillHome.roots.skillsDir : host.skillHome.roots.managedDir, skill), skill);
+      const folder = join(kind === "local" ? host.skillHome.roots.skillsDir : host.skillHome.roots.managedDir, skill);
+      writeSkill(folder, skill);
+      // The local skill is published the way the native write tool is often called: home-relative.
+      const publish = (name = skill) => kind === "local"
+        ? callInSession(host, "write", { path: `~/${relative(homedir(), join(dirname(folder), name, "SKILL.md"))}`, content: "edited" })
+        : callInSession(host, "manage_skill", { action: "update", name }, { action: "update", name });
       startPass(host);
       const { id, result } = await inspect(host, { skill });
       expect(inspectionOf(result)?.kind, kind).toBe(kind);
@@ -7396,15 +7414,34 @@ describe("observer_review inspect and grounded repairs", () => {
       expect(failures(prepared), kind).toEqual([]);
       const [entry] = reviewEntries(prepared);
       const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+      const selectionToolCallId = lastCallId(host);
       const { askHtml } = JSON.parse(resultText(selection));
       expect(askHtml, kind).toContain(escapeHtmlText(uncertain));
       expect(askHtml, kind).toContain("Use when asked to review a diff.");
+      const early = publish();
+      const approval = { proposal: entry!.reference, selectionToolCallId, askToolCallId: askUser(host, selection) };
+      const elsewhere = publish("sample-other");
+
+      for (const [answer, reason] of [
+        [{ proposal: entry!.reference, outcome: "applied" }, "`approval`"],
+        [{ skill, kind, gist: "Uncited edit.", outcome: "applied" }, "`approval`"],
+        [{ approval, outcome: "applied" }, "`publication`"],
+        [{ approval, outcome: "applied", publication: { writeToolCallId: early } }, "before the user's Apply"],
+        [{ approval, outcome: "applied", publication: { writeToolCallId: elsewhere } }, skill],
+      ] as const) {
+        expect(failures(await resolve(host, [answer])).join("\n"), `${kind} ${JSON.stringify(answer)}`).toContain(reason);
+      }
       expect(readLedger(host.ledgerFile), kind).toEqual([]);
 
-      askUser(host, selection);
-      const recorded = await resolve(host, [{ proposal: entry!.reference, outcome: "applied" }]);
+      const recorded = await resolve(host, [{ approval, outcome: "applied", publication: { writeToolCallId: publish() } }]);
       expect(failures(recorded), kind).toEqual([]);
       expect(readLedger(host.ledgerFile), kind).toEqual([expect.objectContaining({ skill, kind, outcome: "applied", fingerprint: entry!.proposal.fingerprint })]);
+
+      // The user speaks while the call waits after validating the answer: the approval is checked again before recording.
+      const retracted = resolve(host, [{ approval, outcome: "applied", publication: { writeToolCallId: publish() } }]);
+      host.getBranch().push({ type: "message", id: `steer-${kind}`, message: { role: "user", steering: true, content: "Stop, not that one." } });
+      expect(failures(await retracted).join("\n"), kind).toContain("sent a message after answering");
+      expect(readLedger(host.ledgerFile), kind).toHaveLength(1);
     }
   });
 });
@@ -7441,17 +7478,18 @@ describe("observer_review new-skill search", () => {
   });
   const prepare = (host: ReturnType<typeof loadExtension>, candidates: unknown[]) => host.callTool("observer_review", { action: "prepare", candidates });
 
-  /** Records a successful `manage_skill` create of `name` on the branch, as OMP saves it. */
-  function createInSession(host: ReturnType<typeof loadExtension>, name: string) {
+  /** Records a successful `manage_skill` create of `name` on the branch, as OMP saves it, and returns its ID. */
+  function createInSession(host: ReturnType<typeof loadExtension>, name: string): string {
     const id = `manage-${host.getBranch().length}`;
     host.getBranch().push(
       { type: "message", id: `call-${id}`, message: { role: "assistant", content: [{ type: "toolCall", id, name: "manage_skill", arguments: { action: "create", name } }] } },
       { type: "message", id: `result-${id}`, message: { role: "toolResult", toolCallId: id, toolName: "manage_skill", isError: false, details: { action: "create", name },
         content: [{ type: "text", text: `Created ${name}.` }] } },
     );
+    return id;
   }
 
-  it("records an absent target, each source's coverage and identified matches, and carries the new skill through Prepare and Select to Ask", async () => {
+  it("records an absent target, each source's coverage and identified matches, carries the new skill through Prepare and Select to Ask, and records it applied once created", async () => {
     const host = passHost({ systemPrompt: ["Matching skill → MUST read skill://<name> first.\n<skills>\n- sample-deploy: Deploy release notes to staging.\n- prompt-only: Publish release notes elsewhere.\n</skills>"] });
     createInSession(host, "sample-created");
     const before = observerBytes(host);
@@ -7482,12 +7520,19 @@ describe("observer_review new-skill search", () => {
     expect(entry?.proposal).toMatchObject({ kind: "new", diagnosis: { inspection: id, search: { terms: ["Release Notes"], matches: ["sample-deploy", "prompt-only"] } } });
 
     const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+    const selectionToolCallId = lastCallId(host);
     expect(failures(selection)).toEqual([]);
     const { askHtml } = JSON.parse(resultText(selection));
     expect(askHtml).toContain("sample-deploy only deploys notes someone already drafted.");
     expect(askHtml).toContain(`Searched current skills, inspection ${id}, for: Release Notes; matches: sample-deploy, prompt-only`);
-    expect(askUser(host, selection)).toMatch(/^ask-/);
+    const approval = { proposal: entry!.reference, selectionToolCallId, askToolCallId: askUser(host, selection) };
     expect(observerBytes(host)).toEqual(before);
+
+    const misnamed = await resolve(host, [{ approval, outcome: "applied", publication: { writeToolCallId: createInSession(host, "sample-other") } }]);
+    expect(failures(misnamed).join("\n")).toContain(`create\` of \`${NEW}\``);
+    const created = await resolve(host, [{ approval, outcome: "applied", publication: { writeToolCallId: createInSession(host, NEW) } }]);
+    expect(failures(created)).toEqual([]);
+    expect(readLedger(host.ledgerFile)).toEqual([expect.objectContaining({ skill: NEW, kind: "new", outcome: "applied" })]);
   });
 
   it("fails the search when a required source exists but can't be read, or a skill already holds the name", async () => {
