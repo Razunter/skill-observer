@@ -127,8 +127,8 @@ export interface GateInput {
   observations: readonly Observation[];
   /** Whether the skill has an on-read amendment in the amendments directory. */
   onReadAmendmentFor(skill: string): boolean;
-  /** Skill catalog observations on the branch. */
-  catalogObservations: number;
+  /** Whether the branch has a skill catalog observation or a known capture gap. */
+  catalogEvidence: boolean;
 }
 
 const GATE_EVIDENCE: Record<Exclude<Gate, "tool-result">, (input: GateInput) => boolean> = {
@@ -141,7 +141,7 @@ const GATE_EVIDENCE: Record<Exclude<Gate, "tool-result">, (input: GateInput) => 
   ranking: ({ rankingAvailable }) => rankingAvailable,
   note: ({ note }) => note !== "",
   observations: ({ observations }) => observations.length > 0,
-  catalog: ({ catalogObservations }) => catalogObservations > 0,
+  catalog: ({ catalogEvidence }) => catalogEvidence,
 };
 
 /** The gates whose evidence is present; never `tool-result`. */

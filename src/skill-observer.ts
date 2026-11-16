@@ -26,7 +26,7 @@ import {
   type SessionDigest,
   type SkillSignal,
 } from "./digest.js";
-import { catalogSummary, registerCatalogCapture, renderCatalogSummary } from "./catalog.js";
+import { type CatalogSummary, catalogSummary, registerCatalogCapture, renderCatalogSummary } from "./catalog.js";
 import { registerAmendmentDelivery } from "./delivery.js";
 import { harnessRootDirs, ledgerForProject, readLedger, renderLedger } from "./ledger.js";
 import type { AskDetails, ExtensionAPI, ExtensionContext } from "./omp.js";
@@ -102,6 +102,7 @@ interface PassEvidence {
   observations: readonly Observation[];
   roots: SkillRoots;
   provenance: ProvenanceResolver;
+  catalog: CatalogSummary;
 }
 
 /** The message that starts an observation pass, by section; sections without text are left out. */
@@ -123,13 +124,12 @@ interface ObservationPayload {
 async function observationPayload(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  { note, digest, stale, observations, roots, provenance }: PassEvidence,
+  { note, digest, stale, observations, roots, provenance, catalog }: PassEvidence,
 ): Promise<ObservationPayload> {
   const ledger = ledgerForProject(readLedger(ledgerFile()), ctx.cwd);
   const hookDirs = harnessRootDirs(ctx.cwd, ompAgentDir());
   const inForce = rulesInForce(ledger, readObserverRules(ruleDirs()), digest, referencesDir());
   const onReadAmendments = readOnReadAmendments(amendmentsDir());
-  const catalog = catalogSummary(ctx.sessionManager.getBranch());
   const gates = activeGates({
     digest,
     stale,
@@ -138,7 +138,7 @@ async function observationPayload(
     observations,
     rankingAvailable: (await rankingModelUnavailable(pi, ctx).catch(() => "unreadable")) === undefined,
     onReadAmendmentFor: (skill) => onReadAmendments.some((rule) => rule.amends === skill),
-    catalogObservations: catalog.observations,
+    catalogEvidence: catalog.latest !== undefined || catalog.gaps.length > 0,
   });
   const retro = gates.has("project") ? retroReference(provenance) : undefined;
   const sections: PayloadSection[] = [
@@ -204,7 +204,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
     console.error("skill-observer: migrating amendment rules failed:", error);
   }
   registerAmendmentDelivery(pi, amendmentsDir);
-  registerCatalogCapture(pi, isObservable);
+  const catalogGap = registerCatalogCapture(pi, isObservable);
   pi.on("tool_call", async (event) => {
     try {
       recordHookCall(pi, event);
@@ -250,7 +250,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
 
   registerResolveTool(pi, { ledgerFile, rulesDir: userRulesDir, amendmentsDir, referencesDir });
   registerCheckTool(pi);
-  registerReviewTool(pi, { ledgerFile, rulesDir: userRulesDir, amendmentsDir, referencesDir });
+  registerReviewTool(pi, { ledgerFile, rulesDir: userRulesDir, amendmentsDir, referencesDir }, catalogGap);
 
   pi.registerTool<{ text: string }, undefined>({
     name: "observe",
@@ -294,7 +294,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
           ctx.ui.notify("Nothing to observe: no skill signals, stale amendments or pending observations, and no note.", "info");
           return;
         }
-        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, roots, provenance });
+        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, roots, provenance, catalog: catalogSummary(ctx.sessionManager.getBranch(), catalogGap()) });
       } catch (error) {
         ctx.ui.notify(`Observation pass not started: ${error instanceof Error ? error.message : String(error)}`, "error");
         return;
@@ -328,11 +328,12 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const stale = findStaleAmendments(ruleDirs(), provenance);
       try {
         const observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
+        const catalog = catalogSummary(ctx.sessionManager.getBranch(), catalogGap());
         const report = evidenceReport({
-          digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale, observations: observations.length, catalog: catalogSummary(ctx.sessionManager.getBranch()),
+          digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale, observations: observations.length, catalog,
         });
         if (!isEmptyEvidenceReport(report)) {
-          report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, roots, provenance })).sections);
+          report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, roots, provenance, catalog })).sections);
         }
         ctx.ui.notify(renderEvidenceReport(report), "info");
       } catch (error) {

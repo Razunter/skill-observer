@@ -102,6 +102,8 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
       sent.push({ message, options: sendOptions });
     },
     appendEntry: (customType, data) => {
+      const failure = appendFailures.shift();
+      if (failure) throw failure;
       branch = [...branch, { type: "custom", id: `custom-${branch.length}`, customType, data: data as SessionEntry["data"] }];
     },
     zod,
@@ -113,6 +115,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
   skillObserver(pi);
 
   let branch: SessionEntry[] = [];
+  const appendFailures: Error[] = [];
   let calls = 0;
   const statusCalls: Array<[string, string | undefined]> = [];
   const status = new Map<string, string>();
@@ -224,6 +227,10 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
       branch = skillHome.relocate(entries);
     },
     endTurn: () => emit("agent_end"),
+    /** Registers another extension's handler after this one's, as a later-loaded extension would. */
+    on: pi.on,
+    /** Makes the next `appendEntry` throw `error`, as an observable persistence failure. */
+    failAppend: (error: Error) => { appendFailures.push(error); },
     emit,
     startAgent,
     startResults: () => startResults,
@@ -7338,7 +7345,7 @@ describe("observer_review new-skill search", () => {
         rmSync(host.skillHome.roots.pluginsRegistry);
       }, { "managed skills": "absent", "plugin registry": "absent", "prompt catalog": "unavailable" }],
       ["an enabled plugin whose install is gone", {}, (host) => rmSync(pluginInstall(host), { recursive: true }), { [`plugin ${CE_PLUGIN}`]: "absent" }],
-      ["a custom-format prompt catalog", { systemPrompt: ['<skills>\n<skill name="sample-deploy">\nDeploy release notes.\n</skill>\n</skills>'] }, () => {}, { "prompt catalog": "unavailable" }],
+      ["a prompt catalog in neither host form", { systemPrompt: ["<skills>\n* sample-deploy (Deploy release notes.)\n</skills>"] }, () => {}, { "prompt catalog": "unavailable" }],
       ["a prompt without a skills block", { systemPrompt: ["No skills here."] }, () => {}, { "prompt catalog": "absent" }],
     ];
     for (const [label, options, change, statuses] of cases) {
@@ -7603,6 +7610,29 @@ function catalogPrompt(skills: ReadonlyArray<readonly [string, string]>): string
   ];
 }
 
+/** A system prompt rendered from OMP's bundled custom-prompt template, its `<skills>` block listing `skills`. */
+function customCatalogPrompt(skills: ReadonlyArray<readonly [string, string]>): string[] {
+  return [
+    `You review pull requests.\nSkills are specialized knowledge. Scan descriptions for your task domain.\nIf a skill applies, you MUST read \`skill://<name>\` before proceeding.\n<skills>\n${skills.map(([name, description]) => `<skill name="${name}">\n${description}\n</skill>`).join("\n")}\n</skills>`,
+  ];
+}
+
+/** A persisted native skill notice as OMP renders and saves it; `details` defaults to what its text announces. */
+function skillNotice(id: string, change: { added?: ReadonlyArray<readonly [string, string]>; updated?: ReadonlyArray<readonly [string, string]>; removed?: string[] }, details?: unknown): SessionEntry {
+  const { added = [], updated = [], removed = [] } = change;
+  const listed = (skills: ReadonlyArray<readonly [string, string]>) => skills.map(([name, description]) => `- ${name}: ${description}`);
+  const content = [
+    "<system-notice id=\"skills\">",
+    "Skills changed this session. Matching skill → MUST read `skill://<name>` first. This lists only what changed; any skill not named here is unaffected.",
+    ...(added.length ? ["Now available:", ...listed(added)] : []),
+    ...(updated.length ? ["Updated (this description replaces the earlier one):", ...listed(updated)] : []),
+    ...(removed.length ? ["No longer available:", ...removed.map((name) => `- \`${name}\``)] : []),
+    "</system-notice>",
+  ].join("\n");
+  const announced = [...added, ...updated].map(([name, description]) => ({ name, description }));
+  return { type: "custom_message", id, customType: "skill-notice", content, details: details ?? { announced, removed } } as unknown as SessionEntry;
+}
+
 /** Submits a prompt whose system prompt lists `skills` (or is `systemPrompt`) and commits its user message, as OMP does. */
 async function observeCatalog(host: ReturnType<typeof loadExtension>, skills: ReadonlyArray<readonly [string, string]>, systemPrompt = catalogPrompt(skills)) {
   await host.startAgent("Write the tests.", { systemPrompt });
@@ -7614,8 +7644,8 @@ const catalogEntries = (host: ReturnType<typeof loadExtension>) =>
 
 async function lookUp(host: ReturnType<typeof loadExtension>, skill: string) {
   const result = await host.callTool("observer_review", { action: "catalog", skill });
-  const { catalog } = result.details as { catalog: { matches: Array<Record<string, unknown>> } };
-  return { result, text: result.content.map((block) => block.text ?? "").join("\n"), matches: catalog.matches };
+  const { catalog } = result.details as { catalog: { matches: Array<Record<string, unknown>>; gaps: string[] } };
+  return { result, text: result.content.map((block) => block.text ?? "").join("\n"), matches: catalog.matches, gaps: catalog.gaps };
 }
 
 describe("skill catalog observations", () => {
@@ -7647,7 +7677,7 @@ describe("skill catalog observations", () => {
     const [definition, binding] = catalogEntries(host);
     const { result, text, matches } = await lookUp(host, SEAMS[0]);
     expect(result.isError).toBe(false);
-    expect(matches).toEqual([{ observedAt: "user-0", bindingId: binding!.id, definitionId: definition!.id, coverage: "observed", status: "listed", description: SEAMS[1], limitations: expect.any(Array) }]);
+    expect(matches).toEqual([{ observedAt: "user-0", bindingId: binding!.id, definitionId: definition!.id, coverage: "observed", at: "user-0", via: "catalog", status: "listed", description: SEAMS[1], limitations: expect.any(Array) }]);
     expect(text).toContain(`listed as "${SEAMS[1]}"`);
     expect(text).toContain("not proof of what the model received");
     expect(text).not.toContain("Rewritten after capture.");
@@ -7707,7 +7737,7 @@ describe("skill catalog observations", () => {
     await observeCatalog(host, [], ["You are a coding agent with a custom prompt."]);
     const custom = await lookUp(host, SEAMS[0]);
     expect(custom.matches).toEqual([expect.objectContaining({ status: "unknown", coverage: "no-block" })]);
-    expect(custom.text).toContain("unknown (the system prompt had no standard skills block");
+    expect(custom.text).toContain("unknown (the system prompt had no skills block in the standard or bundled custom-prompt form");
     expect(custom.text).not.toMatch(/\bnot listed\b|\babsent\b/);
   });
 
@@ -7739,6 +7769,178 @@ describe("skill catalog observations", () => {
     expect(content).not.toContain(SEAMS[1]);
     expect(content).not.toContain(NOTES[0]);
     expect(host.notices.at(-1)).toMatch(/catalog \d+/);
+  });
+});
+
+describe("qualified skill catalog capture", () => {
+  const SEAMS = ["seam-finder", "Finds test seams before writing tests."] as const;
+  const NOTES = ["release-notes", "Drafts release notes from merged changes."] as const;
+  type Host = ReturnType<typeof loadExtension>;
+  const reply = (id: string) => ({ type: "message", id, message: { role: "assistant", content: [{ type: "text", text: "Done." }] } }) as SessionEntry;
+  const compaction = (id: string, firstKeptEntryId: string, extra: Record<string, unknown> = {}) =>
+    ({ type: "compaction", id, firstKeptEntryId, summary: "Earlier work.", ...extra }) as SessionEntry;
+  const append = (host: Host, ...entries: SessionEntry[]) => host.setBranch([...host.getBranch(), ...entries]);
+  /** Each state the lookup reports: where it took effect, through what, and what it says. */
+  const states = async (host: Host, skill: string) =>
+    (await lookUp(host, skill)).matches.map(({ at, via, status, description }) => ({ at, via, status, ...(description !== undefined && { description }) }));
+
+  it("preserves a custom-prompt skills block's descriptions as rendered, including host shortening", async () => {
+    const host = loadExtension();
+    const shortened = "Finds test seams before writing tests for HTTP clients, queues and…";
+    await observeCatalog(host, [], customCatalogPrompt([[SEAMS[0], shortened], NOTES]));
+    expect(catalogEntries(host)[0]?.data).toMatchObject({ format: "custom", coverage: "observed", entries: [{ name: SEAMS[0], description: shortened }, { name: NOTES[0], description: NOTES[1] }] });
+    const { text } = await lookUp(host, SEAMS[0]);
+    expect(await states(host, SEAMS[0])).toEqual([{ at: "user-0", via: "catalog", status: "listed", description: shortened }]);
+    expect(text).toContain(`listed as "${shortened}"`);
+    expect(await states(host, "missing-skill")).toEqual([{ at: "user-0", via: "catalog", status: "not-listed" }]);
+  });
+
+  it("applies native skill notice additions, updates and removals after the binding at later points, without copying them", async () => {
+    const host = loadExtension();
+    append(host, skillNotice("notice-early", { added: [["early-skill", "Announced before any observation."]] }));
+    await observeCatalog(host, [SEAMS]);
+    const stored = structuredClone(catalogEntries(host));
+    const updated = "Finds seams in legacy code.";
+    append(host, reply("reply-1"), skillNotice("notice-1", { added: [NOTES] }), reply("reply-2"),
+      skillNotice("notice-2", { updated: [[SEAMS[0], updated]] }), skillNotice("notice-3", { removed: [NOTES[0]] }));
+    expect(await states(host, NOTES[0])).toEqual([
+      { at: "user-1", via: "catalog", status: "not-listed" },
+      { at: "notice-1", via: "skill-notice", status: "listed", description: NOTES[1] },
+      { at: "notice-3", via: "skill-notice", status: "not-listed" },
+    ]);
+    expect(await states(host, SEAMS[0])).toEqual([
+      { at: "user-1", via: "catalog", status: "listed", description: SEAMS[1] },
+      { at: "notice-2", via: "skill-notice", status: "listed", description: updated },
+    ]);
+    expect((await lookUp(host, SEAMS[0])).text).toContain(`listed as "${updated}"`);
+    expect(await states(host, "early-skill")).toEqual([{ at: "user-1", via: "catalog", status: "not-listed" }]);
+    expect(catalogEntries(host)).toEqual(stored);
+  });
+
+  it("drops a notice outside a compaction's kept range and reports the window before OMP announces the skill again", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS]);
+    append(host, skillNotice("notice-1", { added: [NOTES] }), reply("reply-1"), compaction("compaction-1", "reply-1"), reply("reply-2"));
+    expect(await states(host, NOTES[0])).toEqual([
+      { at: "user-0", via: "catalog", status: "not-listed" },
+      { at: "notice-1", via: "skill-notice", status: "listed", description: NOTES[1] },
+      { at: "compaction-1", via: "compaction", status: "not-listed" },
+    ]);
+    expect((await lookUp(host, NOTES[0])).text).toMatch(/compaction-1.*out of context.*next user-queued message/);
+    expect(await states(host, SEAMS[0])).toEqual([{ at: "user-0", via: "catalog", status: "listed", description: SEAMS[1] }]);
+    append(host, skillNotice("notice-2", { added: [NOTES] }));
+    expect((await states(host, NOTES[0])).at(-1)).toEqual({ at: "notice-2", via: "skill-notice", status: "listed", description: NOTES[1] });
+
+    const kept = loadExtension();
+    await observeCatalog(kept, [SEAMS]);
+    append(kept, reply("reply-1"), skillNotice("notice-1", { added: [NOTES] }), reply("reply-2"), compaction("compaction-1", "notice-1"), compaction("compaction-2", "reply-2"));
+    expect(await states(kept, NOTES[0])).toEqual([
+      { at: "user-0", via: "catalog", status: "not-listed" },
+      { at: "notice-1", via: "skill-notice", status: "listed", description: NOTES[1] },
+      { at: "compaction-2", via: "compaction", status: "not-listed" },
+    ]);
+  });
+
+  it.each([
+    ["OpenAI remote compaction", compaction("compaction-1", "", { preserveData: { openaiRemoteCompaction: { provider: "openai", replacementHistory: [] } } })],
+    ["Anthropic server compaction", compaction("compaction-1", "", { preserveData: { anthropicCompaction: { provider: "anthropic", content: "Summary." } }, providerReplayThroughEntryId: "reply-1" })],
+    ["a context rollover", compaction("compaction-1", "reply-1", { details: { kind: "experimental-context-rollover" } })],
+  ])("reports notice coverage unknown after %s until a notice names the skill again", async (_label, compacted) => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS]);
+    append(host, skillNotice("notice-1", { added: [NOTES] }), reply("reply-1"), compacted);
+    const held = await lookUp(host, NOTES[0]);
+    expect(held.matches.at(-1)).toMatchObject({ at: "compaction-1", via: "compaction", status: "unknown" });
+    expect(held.text).toMatch(/compaction-1[^\n]*unknown/);
+    expect(await states(host, SEAMS[0])).toEqual([{ at: "user-0", via: "catalog", status: "listed", description: SEAMS[1] }]);
+    append(host, skillNotice("notice-2", { updated: [[NOTES[0], "Drafts notes."]] }));
+    expect((await states(host, NOTES[0])).at(-1)).toEqual({ at: "notice-2", via: "skill-notice", status: "listed", description: "Drafts notes." });
+  });
+
+  it("keeps a notice's rendered description over conflicting structured details and reports the attribution unknown", async () => {
+    const host = loadExtension();
+    await observeCatalog(host, [SEAMS]);
+    append(host, skillNotice("notice-1", { added: [NOTES] }, { announced: [{ name: NOTES[0], description: "Structured, not rendered." }], removed: [SEAMS[0]] }));
+    const notes = await lookUp(host, NOTES[0]);
+    expect((await states(host, NOTES[0])).at(-1)).toEqual({ at: "notice-1", via: "skill-notice", status: "unknown", description: NOTES[1] });
+    expect(notes.text).toMatch(/notice-1[^\n]*attribution is unknown/);
+    expect(notes.text).not.toContain("Structured, not rendered.");
+    expect((await states(host, SEAMS[0])).at(-1)).toEqual({ at: "notice-1", via: "skill-notice", status: "unknown" });
+  });
+
+  it("turns unknown templates and malformed or ambiguous entries into coverage gaps, keeping recognizable entries as partial evidence", async () => {
+    const host = loadExtension();
+    const partialPrompt = catalogPrompt([SEAMS, NOTES]).map((block) => block.replace(`- ${NOTES[0]}:`, `* ${NOTES[0]}:`));
+    await host.startAgent("Write the tests.", { systemPrompt: partialPrompt });
+    await host.commitPrompt("Write the tests.");
+    expect(catalogEntries(host)[0]?.data).toMatchObject({ format: "standard", coverage: "partial", entries: [{ name: SEAMS[0], description: SEAMS[1] }] });
+    expect(await states(host, SEAMS[0])).toEqual([{ at: "user-0", via: "catalog", status: "listed", description: SEAMS[1] }]);
+    expect(await states(host, NOTES[0])).toEqual([{ at: "user-0", via: "catalog", status: "unknown" }]);
+
+    const continued = skillNotice("notice-3", { added: [["helper-one", "First line"], ["helper-two", "Second skill."]] }, { announced: [{ name: "helper-one", description: "First line\ncontinued here" }, { name: "helper-two", description: "Second skill." }], removed: [] });
+    continued.content = String(continued.content).replace("First line", "First line\ncontinued here");
+    append(host,
+      { type: "custom_message", id: "notice-1", customType: "skill-notice", content: "Skills: release-notes" } as SessionEntry,
+      { type: "custom_message", id: "notice-2", customType: "skill-notice" } as SessionEntry,
+      continued);
+    const notes = await lookUp(host, NOTES[0]);
+    expect(notes.result.isError).toBe(false);
+    expect(notes.matches.map(({ at, status }) => [at, status])).toEqual([["user-0", "unknown"], ["notice-1", "unknown"], ["notice-2", "unknown"]]);
+    expect(await states(host, "helper-two")).toEqual([
+      { at: "user-0", via: "catalog", status: "unknown" },
+      { at: "notice-1", via: "skill-notice", status: "unknown" },
+      { at: "notice-2", via: "skill-notice", status: "unknown" },
+      { at: "notice-3", via: "skill-notice", status: "listed", description: "Second skill." },
+    ]);
+    expect((await states(host, "helper-one")).at(-1)).toEqual({ at: "notice-3", via: "skill-notice", status: "unknown", description: "First line" });
+    await observeCatalog(host, [SEAMS]);
+    expect(catalogEntries(host)).toHaveLength(4);
+  });
+
+  it("reports an observable capture failure in the next pass and rebinds unchanged content after it", async () => {
+    const host = loadExtension();
+    host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage, ...fx.skillUrlRead]);
+    await observeCatalog(host, [SEAMS]);
+    expect(catalogEntries(host)).toHaveLength(2);
+    host.failAppend(new Error("disk full"));
+    await observeCatalog(host, [SEAMS, NOTES]);
+    expect(catalogEntries(host)).toHaveLength(2);
+    expect((await lookUp(host, SEAMS[0])).gaps).toEqual([expect.stringContaining("disk full")]);
+    await host.runCommand("observe-report");
+    expect(host.notices.at(-1)).toMatch(/\nSkill catalog observations: [^\n]*capture failed[^\n]*disk full/);
+
+    await observeCatalog(host, [SEAMS]);
+    const entries = catalogEntries(host);
+    expect(entries).toHaveLength(3);
+    expect(entries.at(-1)).toMatchObject({ customType: "skill-observer-catalog-binding", data: { catalogId: (entries[0]!.data as { catalogId: string }).catalogId, afterGap: expect.stringContaining("disk full") } });
+    const recovered = await lookUp(host, SEAMS[0]);
+    expect(recovered.matches).toHaveLength(2);
+    expect(recovered.text).toMatch(/capture failed[^\n]*disk full/);
+    await host.runCommand("observe");
+    expect(String(host.sent.at(-1)?.message.content)).toMatch(/## Skill catalog observations[\s\S]*capture failed[^\n]*disk full/);
+  });
+
+  it("makes no final-delivery claim when a later before_agent_start handler replaces the system prompt", async () => {
+    const host = loadExtension();
+    host.on("before_agent_start", () => ({ systemPrompt: ["A replacement prompt with no skills."] }));
+    await observeCatalog(host, [SEAMS]);
+    expect(host.startResults().at(-1)).toEqual({ systemPrompt: ["A replacement prompt with no skills."] });
+    expect(catalogEntries(host)[0]?.data).toMatchObject({ limitations: [expect.stringContaining("a later hook may replace the system prompt")] });
+    const { text, matches } = await lookUp(host, SEAMS[0]);
+    expect(matches).toEqual([expect.objectContaining({ status: "listed", limitations: [expect.stringContaining("not proof of what the model received")] })]);
+    expect(text).toContain("not proof of what the model received");
+    expect(text).not.toMatch(/\bdelivered\b/);
+  });
+
+  it("binds no discarded preparation to a steering message that arrives before a fresh preparation", async () => {
+    const host = loadExtension();
+    await host.startAgent("Write the tests.", { systemPrompt: catalogPrompt([SEAMS]) });
+    await host.commitPrompt("Also update the changelog.");
+    expect(catalogEntries(host)).toEqual([]);
+    await host.startAgent("Also update the changelog.\n\nAnd the docs.", { systemPrompt: catalogPrompt([NOTES]) });
+    await host.commitPrompt("Also update the changelog.");
+    expect(await states(host, NOTES[0])).toEqual([{ at: "user-1", via: "catalog", status: "listed", description: NOTES[1] }]);
+    expect(await states(host, SEAMS[0])).toEqual([{ at: "user-1", via: "catalog", status: "not-listed" }]);
   });
 });
 

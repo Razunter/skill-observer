@@ -242,7 +242,7 @@ interface PrepareContext {
 }
 
 /** The model uses installed host judge helpers between Prepare and Select; this tool never calls a provider. */
-export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void {
+export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catalogGap: () => string | undefined): void {
   const z = pi.zod;
   const referenceFiles = z.array(z.object({ name: z.string(), body: z.string() }));
   const change = z.union([
@@ -296,7 +296,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Inspect a skill's current guidance before drafting a repair to it: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force), and the reference files requested from its observer reference folder, each with line numbers, `sha256` and `## ` sections, plus the folder's inventory by fingerprint; the successful result is the receipt a candidate `diagnosis` cites by its call ID. With `terms`, inspect searches for a new skill instead: it fails when a skill named `skill` is installed or was created this session, or when the skills directory, managed skills, plugin registry or an enabled plugin's skills exist but can't be read; otherwise it reports each source's coverage and the skills whose name or description holds a term. A fitting match is no new skill: inspect it and repair it. Catalog looks up the skill named exactly `skill` in this branch's skill catalog observations: per observation, its entry, references and whether the observed skills block listed the skill with the description shown then, did not list it, or left it unknown; it never reads installed skills, and no observation means unknown, not absent. An observation is what the system prompt listed at `before_agent_start`, not proof the model received it. Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. Prepare refuses a direct edit of a local or managed skill, an on-read append or a rule without a `diagnosis` naming a successful inspect receipt of its skill from this pass on this branch, its explanation, its behavior delta and citations of places that receipt inspected; Prepare, and Select again before producing its form, refuse it once that skill's inspected sources, rules or reference folder inventory changed: inspect again and prepare again. A new skill needs a `diagnosis` naming its new-skill search from this pass on this branch, why the matches do not fit and its behavior delta; Prepare and Select refuse it once a skill of that name exists or the searched inventory or any searched skill file changed. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither writes, asks, approves nor publishes and never calls a model.",
+    description: "Inspect a skill's current guidance before drafting a repair to it: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force), and the reference files requested from its observer reference folder, each with line numbers, `sha256` and `## ` sections, plus the folder's inventory by fingerprint; the successful result is the receipt a candidate `diagnosis` cites by its call ID. With `terms`, inspect searches for a new skill instead: it fails when a skill named `skill` is installed or was created this session, or when the skills directory, managed skills, plugin registry or an enabled plugin's skills exist but can't be read; otherwise it reports each source's coverage and the skills whose name or description holds a term. A fitting match is no new skill: inspect it and repair it. Catalog looks up the skill named exactly `skill` in this branch's skill catalog observations: per observation, its entry, references and whether the observed skills block listed the skill with the description shown then, did not list it, or left it unknown, then each later change OMP's persisted skill notices and compactions made to it, and known capture gaps; it never reads installed skills, and no observation means unknown, not absent. An observation is what the system prompt listed at `before_agent_start`, not proof the model received it. Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. Prepare refuses a direct edit of a local or managed skill, an on-read append or a rule without a `diagnosis` naming a successful inspect receipt of its skill from this pass on this branch, its explanation, its behavior delta and citations of places that receipt inspected; Prepare, and Select again before producing its form, refuse it once that skill's inspected sources, rules or reference folder inventory changed: inspect again and prepare again. A new skill needs a `diagnosis` naming its new-skill search from this pass on this branch, why the matches do not fit and its behavior delta; Prepare and Select refuse it once a skill of that name exists or the searched inventory or any searched skill file changed. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither writes, asks, approves nor publishes and never calls a model.",
     parameters: z.object({
       action: z.enum(["inspect", "catalog", "prepare", "select"]),
       skill: z.string().optional().describe("Inspect only: the installed skill whose current guidance to read; with `terms`, the name of the proposed new skill. Catalog only: the exact skill name to look up."),
@@ -322,7 +322,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
     }),
     async execute(toolCallId, params, signal, _update, ctx) {
       signal?.throwIfAborted();
-      if (params?.action === "inspect" || params?.action === "catalog") return inspectResult(params, files, ctx);
+      if (params?.action === "inspect" || params?.action === "catalog") return inspectResult(params, files, ctx, catalogGap());
       const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
       const amendmentSections = new Map<string, string[]>();
       try {
@@ -419,15 +419,15 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles): void
   });
 }
 
-/** The inspect action: the receipt in `details.inspection`, and each source's text numbered by line for citing; any unreadable, missing or malformed required source fails it. With `terms`, the new-skill search's receipt in `details.search`. The catalog action: the branch's skill catalog observations of one skill in `details.catalog`. */
-function inspectResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext) {
+/** The inspect action: the receipt in `details.inspection`, and each source's text numbered by line for citing; any unreadable, missing or malformed required source fails it. With `terms`, the new-skill search's receipt in `details.search`. The catalog action: the branch's skill catalog observations of one skill and the known capture gaps, the unrecovered `catalogGap` among them, in `details.catalog`. */
+function inspectResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext, catalogGap: string | undefined) {
   const details: ReviewDetails = { eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] };
   try {
     if (params.action === "catalog") {
       if (params.candidates !== undefined || params.proposals !== undefined || params.terms !== undefined || params.references !== undefined) {
         throw new Error("A catalog lookup takes only the exact skill name in `skill`");
       }
-      const { lookup, text } = lookupCatalog(params.skill, ctx.sessionManager.getBranch());
+      const { lookup, text } = lookupCatalog(params.skill, ctx.sessionManager.getBranch(), catalogGap);
       details.catalog = lookup;
       return { content: [{ type: "text" as const, text }], details, isError: false };
     }
@@ -577,16 +577,16 @@ function createdSkills(branch: readonly SessionEntry[]): string[] {
 }
 
 /**
- * The skills the host's standard `<skills>` block lists as `- name: description`.
- * Any other form, such as a custom prompt's, or no prompt getter is reported as
- * coverage the search lacks, not as an empty catalog.
+ * The skills the host's standard or bundled custom-prompt `<skills>` block
+ * lists. Any other form or no prompt getter is reported as coverage the search
+ * lacks, not as an empty catalog.
  */
 function promptCatalog(systemPrompt: string[] | undefined): { coverage: SourceCoverage; skills: CatalogSkill[] } {
   const base = { source: "prompt catalog", path: "system prompt" };
   if (!systemPrompt) return { coverage: { ...base, status: "unavailable", reason: "the host exposes no system prompt" }, skills: [] };
   const block = parseSkillsBlock(systemPrompt);
   if (block.status === "no-block") return { coverage: { ...base, status: "absent" }, skills: [] };
-  if (block.status === "unsupported") return { coverage: { ...base, status: "unavailable", reason: "its skills block is not the standard `- name: description` list" }, skills: [] };
+  if (block.status === "unsupported") return { coverage: { ...base, status: "unavailable", reason: "its skills block is in neither the standard nor the bundled custom-prompt form" }, skills: [] };
   return { coverage: { ...base, status: "present" }, skills: block.skills };
 }
 

@@ -74,13 +74,18 @@ export interface SessionEntry {
   content?: string;
   /**
    * `rules` on `ttsr-injection` messages and on the amendment reminders this
-   * extension adds; `name` and `path` on `skill-prompt` messages.
+   * extension adds; `name` and `path` on `skill-prompt` messages; `kind` on
+   * `compaction` entries (`experimental-context-rollover`).
    */
-  details?: { rules?: string[]; name?: string; path?: string };
+  details?: { rules?: string[]; name?: string; path?: string; kind?: string };
   /** `ttsr_injection` entries. */
   injectedRules?: string[];
-  /** `compaction` entries: the first entry the compaction kept in context. */
+  /** `compaction` entries: the first entry the compaction kept in context; empty when a provider payload holds the kept turns. */
   firstKeptEntryId?: string;
+  /** `compaction` entries: provider replay payloads (`openaiRemoteCompaction`, `anthropicCompaction`). */
+  preserveData?: Record<string, unknown>;
+  /** Anthropic server `compaction` entries: the last entry its replay payload covers. */
+  providerReplayThroughEntryId?: string;
   /** `custom` entries, which never reach the model: an extension's own records, read according to `customType`. */
   data?: unknown;
 }
@@ -218,6 +223,8 @@ export interface BeforeAgentStartEvent {
 /** A message returned here is appended after the submitted batch, on the same turn. */
 export interface BeforeAgentStartResult {
   message?: CustomMessage;
+  /** Replaces the system prompt for this prompt's requests; later handlers see and may replace it again. */
+  systemPrompt?: string[];
 }
 
 /** Native pre-execution hook, before normal writes can change a reviewed target. */

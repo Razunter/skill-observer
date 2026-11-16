@@ -62,7 +62,7 @@ function fixture() {
   const files = { ledgerFile: () => join(home, "ledger.jsonl"), rulesDir: () => join(home, "rules"), amendmentsDir: () => join(home, "amendments"), referencesDir: () => join(home, "refs") };
   const pi = { zod, registerTool: (value: ToolDefinition<unknown, Details>) => { tools[value.name] = value; }, appendEntry: () => {} } as unknown as ExtensionAPI;
   registerResolveTool(pi, files);
-  registerReviewTool(pi, files);
+  registerReviewTool(pi, files, () => undefined);
   let branch: SessionEntry[] = [{ type: "custom_message", customType: OBSERVATION_MESSAGE_TYPE, content: "Observation pass." }];
   const ctx = { cwd: roots.cwd, sessionManager: { getSessionId: () => "test", getBranch: () => branch } } as unknown as ExtensionContext;
   /** Runs a registered tool, then saves its native call and result on the branch, as OMP does. */
