@@ -750,6 +750,10 @@ function candidateDiagnosis({ skill, kind, diagnosis: draft }: ReviewCandidate &
   }
   const receipt = inspectionReceipt(inspection, context.branch);
   if (receipt.skill !== skill) throw new Error(`inspection \`${inspection}\` read \`${receipt.skill}\`, not \`${skill}\`: inspect \`${skill}\` and cite that receipt`);
+  if (receipt.kind !== kind) {
+    const owner = isPinKind(receipt.kind) ? ", whose fixes are amendment rules, never a direct edit" : "";
+    throw new Error(`inspection \`${inspection}\` read \`${skill}\` as a ${receipt.kind} skill, not ${kind}: propose it as the ${receipt.kind} skill it is${owner}`);
+  }
   checkCurrent(inspection, receipt, context);
   return { inspection, explanation, delta, citations: citations!.map((citation) => checkedCitation(citation, receipt, inspection)) };
 }

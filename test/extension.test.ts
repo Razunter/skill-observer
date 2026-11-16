@@ -7231,6 +7231,66 @@ describe("observer_review inspect and grounded repairs", () => {
       expect(reviewEntries(refused)).toEqual([]);
     }
   });
+
+  /** A description fix for `skill` drafted as a direct edit, citing the inspection `inspection` of its first source. */
+  const descriptionFix = (skill: string, kind: string, inspection: string, source: string, explanation = "The description names reviews but not the session's request; checked lines 1–3.") => ({
+    kind, skill, gist: "Name the request in the description.", priority: "evidence", remedy: "Edit the description so the skill is selected for this request",
+    evidence: [{ quote: "review this diff", count: 1 }],
+    change: { operation: "direct-edit", preview: "- description: Fixture guide.\n+ description: Fixture guide. Use when asked to review a diff." },
+    diagnosis: { inspection, explanation, delta: "A future agent selects the skill for a diff review.", citations: [{ source, lines: { from: 1, to: 3 } }] },
+  });
+  const firstSource = (result: ToolResult<unknown>) => inspectionOf(result)!.sources[0]!.path;
+
+  it("refuses a description fix to an upstream or plugin skill as a direct edit, whatever kind it is labelled, and records no applied answer without an approved rule", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    startPass(host);
+    const guide = await inspect(host);
+    const plugin = await inspect(host, { skill: "ce-code-review" });
+    expect(inspectionOf(plugin.result)?.kind).toBe("plugin");
+    const before = observerBytes(host);
+    const cases: Array<[string, string, typeof guide]> = [
+      [GUIDE, "upstream", guide], [GUIDE, "local", guide], ["ce-code-review", "plugin", plugin], ["ce-code-review", "managed", plugin],
+    ];
+    for (const [skill, kind, { id, result }] of cases) {
+      const label = `${skill} as ${kind}`;
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [descriptionFix(skill, kind, id, firstSource(result))] });
+      expect(prepared.isError, label).toBe(true);
+      expect(reviewEntries(prepared), label).toEqual([]);
+      expect(failures(prepared).join("\n"), label).toMatch(/amendment rules/);
+      if (kind !== "upstream" && kind !== "plugin") continue;
+      const recorded = await resolve(host, [{ skill, kind, gist: "Name the request in the description.", outcome: "applied" }]);
+      expect(recorded.isError, label).toBe(true);
+    }
+    expect(readLedger(host.ledgerFile)).toEqual([]);
+    expect(observerBytes(host)).toEqual(before);
+    expect(readFileSync(guidePath(host), "utf8")).toBe(GUIDE_TEXT);
+  });
+
+  it("asks about a local or managed description fix with its inspection-backed diagnosis and disclosed uncertainty, and records it once applied", async () => {
+    for (const kind of ["local", "managed"] as const) {
+      const host = loadExtension();
+      const skill = "sample-local";
+      writeSkill(join(kind === "local" ? host.skillHome.roots.skillsDir : host.skillHome.roots.managedDir, skill), skill);
+      startPass(host);
+      const { id, result } = await inspect(host, { skill });
+      expect(inspectionOf(result)?.kind, kind).toBe(kind);
+      const uncertain = "Suspected missed trigger: the catalog observed at the request listed this description, which never mentions diffs; the agent may still have skipped it for another reason.";
+      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [descriptionFix(skill, kind, id, firstSource(result), uncertain)] });
+      expect(failures(prepared), kind).toEqual([]);
+      const [entry] = reviewEntries(prepared);
+      const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+      const { askHtml } = JSON.parse(resultText(selection));
+      expect(askHtml, kind).toContain(escapeHtmlText(uncertain));
+      expect(askHtml, kind).toContain("Use when asked to review a diff.");
+      expect(readLedger(host.ledgerFile), kind).toEqual([]);
+
+      askUser(host, selection);
+      const recorded = await resolve(host, [{ proposal: entry!.reference, outcome: "applied" }]);
+      expect(failures(recorded), kind).toEqual([]);
+      expect(readLedger(host.ledgerFile), kind).toEqual([expect.objectContaining({ skill, kind, outcome: "applied", fingerprint: entry!.proposal.fingerprint })]);
+    }
+  });
 });
 
 describe("observer_review new-skill search", () => {
