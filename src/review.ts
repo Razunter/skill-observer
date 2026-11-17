@@ -326,6 +326,9 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
         const guidance = receiptContext(ctx, files);
         if (params?.action === "prepare") {
           if (!Array.isArray(params.candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
+          if ("diagnosis" in params && params.diagnosis !== undefined) {
+            throw new Error("Prepare ignores a `diagnosis` beside `candidates`: move `diagnosis` into each candidate it grounds, beside its `change`");
+          }
           const context: PrepareContext = { ...guidance, cwd: ctx.cwd, agentDir: ompAgentDir(), ledger, amendmentSections };
           details.eligible = prepareProposals(params.candidates, context).map((proposal) => ({
             reference: { reviewToolCallId: toolCallId, candidateId: proposal.candidateId, contentHash: contentHash(proposal) },
@@ -732,9 +735,10 @@ function candidateDiagnosis({ skill, kind, diagnosis: draft }: ReviewCandidate &
     !isNew && !citations && "`citations` of the inspected guidance",
   ].filter((part) => typeof part === "string");
   if (missing.length > 0 || !inspection || !explanation || !delta) {
+    const where = draft === undefined ? " (`diagnosis` is a field of the candidate, beside `change`)" : "";
     throw new Error(isNew
-      ? `the new skill \`${skill}\` needs its candidate diagnosis ${missing.join("; ")}: search for it with observer_review \`action: "inspect"\`, \`skill\` and \`terms\`, and cite that receipt`
-      : `the repair of \`${skill}\` needs its candidate diagnosis ${missing.join("; ")}: inspect the skill with observer_review \`action: "inspect"\` and cite that receipt`);
+      ? `the new skill \`${skill}\` needs its candidate diagnosis${where} ${missing.join("; ")}: search for it with observer_review \`action: "inspect"\`, \`skill\` and \`terms\`, and cite that receipt`
+      : `the repair of \`${skill}\` needs its candidate diagnosis${where} ${missing.join("; ")}: inspect the skill with observer_review \`action: "inspect"\` and cite that receipt`);
   }
   if (isNew) {
     const search = searchReceipt(inspection, context);

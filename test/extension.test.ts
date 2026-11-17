@@ -7176,6 +7176,25 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(failures(outOfRange).join("\n")).toContain("lines 1–99");
   });
 
+  it("names where a diagnosis goes when the call carries it beside the candidates or a candidate has none", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    startPass(host);
+    const { id: inspection } = await inspect(host);
+    const diagnosis = { inspection, explanation: "Checked the Seams section: it has no fixture step.", delta: "A future agent builds fixtures per seam.",
+      citations: [{ source: guidePath(host), section: "Seams" }] };
+    // An explicit undefined `diagnosis` keeps the harness from grounding the draft itself.
+    const draft = { ...onReadCandidate({ skill: GUIDE, gist: "Fixtures per seam.", section: "## Fixtures\n\nOne per seam." }), diagnosis: undefined };
+
+    const topLevel = await host.callTool("observer_review", { action: "prepare", candidates: [draft], diagnosis });
+    expect(topLevel.isError).toBe(true);
+    expect(reviewEntries(topLevel)).toEqual([]);
+    expect(resultText(topLevel)).toContain("move `diagnosis` into each candidate");
+
+    const none = await host.callTool("observer_review", { action: "prepare", candidates: [draft] });
+    expect(failures(none).join("\n")).toContain("`diagnosis` is a field of the candidate, beside `change`");
+  });
+
   it("prepares project proposals without inspection evidence", async () => {
     const host = loadExtension();
     writeFileSync(join(host.skillHome.roots.cwd, "AGENTS.md"), "Guidance.\n");
