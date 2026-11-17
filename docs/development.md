@@ -230,7 +230,7 @@ It writes `observer/<section>-<gate|core>-<n>.md`, one file per fragment, where 
 bun pm pack
 ```
 
-Run this from the source checkout's extension root. It creates `skill-observer-0.2.0.tgz` using the `files` allowlist in `package.json`: runtime source, the hook check script, `observer.md` and its generated `observer/` fragments, reader documentation, the licence and third-party notices, the README, and changelog. It excludes tests, development configuration, and installed dependencies. Packing creates a local archive for distribution checks; it does not publish the package. Normal setup uses `omp install` with the repository URL.
+Run this from the source checkout's extension root. It creates `skill-observer-0.3.0.tgz` using the `files` allowlist in `package.json`: runtime source, the hook check script, `observer.md` and its generated `observer/` fragments, reader documentation, the licence and third-party notices, the README, and changelog. It excludes tests, development configuration, and installed dependencies. Packing creates a local archive for distribution checks; it does not publish the package. Normal setup uses `omp install` with the repository URL.
 
 ### Modules
 

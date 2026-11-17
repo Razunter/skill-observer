@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-11-17
 
 ### Added
 
@@ -32,6 +32,7 @@
 ### Fixed
 
 - A pattern amendment or barrier rule that fires on legitimate output can be fixed by the observer: a rule proposed under the name of the same skill's rule replaces it, previewed as a rewrite, and records the replaced fix as `withdrawn`. Before, Prepare refused any proposal under the existing name ("already holds another proposal's fix"), so the misfiring pattern could only be edited by hand.
+- Prepare refuses a `diagnosis` sent beside `candidates` and says to move it into each candidate; a candidate with no `diagnosis` is told it is a field of the candidate, beside `change`. Before, a top-level `diagnosis` was silently ignored and the refusal only listed the missing fields, so a pass could repeat the mistake until it gave up.
 - `observer_resolve` records approvals on OMP 18.18 and later; it refused every one because the Ask no longer held `questions[]`.
 - The digest's `ask` signals (custom input, an answer off the preselected option) fire for HTML-form results. Results saved before OMP 18.18 are still read.
 - A `SKILL.md` that is a byte-identical copy of an installed skill's entry file counts as that skill: the digest shows its provenance and the skill's on-read amendment is delivered on the read. A copy that differs stays provenance unknown.
