@@ -135,8 +135,8 @@ export type PreparedChange =
   | { operation: "harness"; stage: "removal"; root: string; file: string }
   /** `record`: the amendment already holds the section verbatim, so publication writes nothing and only the ledger changes. */
   | { operation: "on-read-append"; effect: "create" | "append" | "record"; rule: RuleIdentity; target: FileSnapshot; section: string }
-  /** Samples stay in the form the scope sees, as `observer_check` and `observer_resolve` take them. */
-  | { operation: "rule"; rule: RuleIdentity; target: FileSnapshot; body: string; matches: Sample[]; spares: Sample[] }
+  /** Samples stay in the form the scope sees, as `observer_check` and `observer_resolve` take them. `replaces`: the same skill's fix whose rule this one overwrites. */
+  | { operation: "rule"; rule: RuleIdentity; target: FileSnapshot; body: string; matches: Sample[]; spares: Sample[]; replaces?: { fingerprint: string; gist: string } }
   | { operation: "stale-update"; rule: RuleIdentity; target: FileSnapshot; body: string; references?: ReferenceChange }
   | { operation: "stale-delete"; rule: RuleIdentity; target: FileSnapshot; references?: ReferenceChange }
   | { operation: "withdrawal"; withdrawn: { fingerprint: string; gist: string }; effect: "record" }
@@ -972,7 +972,7 @@ function preparedProposal(
         const fix = fixRule({ skill, kind, gist: candidate.gist, rule }, fingerprint, dirs, context.provenance);
         return {
           operation: "rule", ...ruleTarget(fix.rule), body: fix.rule.body.trim(),
-          matches: rule.matches ?? [], spares: rule.spares ?? [],
+          matches: rule.matches ?? [], spares: rule.spares ?? [], ...optional("replaces", fix.replaces),
         };
       }));
     }
@@ -1246,7 +1246,7 @@ function renderPreview(skill: string, kind: ProposalKind, change: ProtectedChang
     case "rule": {
       const samples = (items: readonly Sample[]) => items.map((item) => `- ${JSON.stringify(item)}`).join("\n");
       return [
-        `${change.target.sha256 === null ? "Write" : "Rewrite"} the ${isPinKind(kind) ? "pattern amendment" : "barrier rule"} \`${change.rule.name}\` at \`${change.target.path}\` for ${of}.`,
+        `${change.target.sha256 === null ? "Write" : "Rewrite"} the ${isPinKind(kind) ? "pattern amendment" : "barrier rule"} \`${change.rule.name}\` at \`${change.target.path}\` for ${of}${change.replaces ? `, replacing fix \`${change.replaces.fingerprint}\` (${change.replaces.gist}), which goes out of force` : ""}.`,
         `Scope: ${change.rule.scope}`, `Pattern: ${change.rule.condition}`, `Matches:\n${samples(change.matches)}`, `Spares:\n${samples(change.spares)}`,
         "", change.body,
       ].join("\n");

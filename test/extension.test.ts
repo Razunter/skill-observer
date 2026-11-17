@@ -3645,6 +3645,50 @@ describe("observer_resolve with upstream fixes", () => {
     expect(rulesWritten(host)).toEqual([]);
     expect(existsSync(dirname(host.rulesDir) + "/escape.md")).toBe(false);
   });
+
+  describe("replacing a pattern amendment under its name", () => {
+    const narrower: PatternRule = { ...bailRule, pattern: "--bail(?![\\w-])", matches: [{ command: "bun run test --bail" }], spares: [{ command: "bun run test --bail-on-skip" }] };
+    const gist = "Run the whole file; --bail-on-skip stays allowed.";
+    /** `tdd-no-bail` applied by an earlier pass, and the user's approval of a narrower pattern under its name. */
+    const approvedReplacement = async () => {
+      const host = loadExtension();
+      await amend(host, "tdd", bailRule);
+      const file = join(host.rulesDir, "tdd-no-bail.md");
+      const replaced = readRule(file).frontmatter.fingerprint;
+      const [applied] = await approveRules(host, [{ skill: "tdd", kind: "upstream", gist, rule: narrower }]);
+      if (!applied) throw new Error("no applied answer");
+      return { host, file, replaced, applied };
+    };
+
+    it.skipIf(!ompAvailable)("rewrites the rule pinned to the skill and records the replaced fix as withdrawn when the file is as Prepare read it", async () => {
+      const { host, file, replaced, applied } = await approvedReplacement();
+
+      const result = await resolve(host, [applied]);
+
+      expect(result.isError).toBeFalsy();
+      const records = ledgerRecords(host.ledgerFile);
+      expect(readRule(file).frontmatter).toMatchObject({
+        condition: narrower.pattern, description: gist, amends: "tdd", skillHash: currentSkillHash(host, "tdd"), fingerprint: records.at(-1)?.fingerprint,
+      });
+      expect(records).toEqual([
+        expect.objectContaining({ fingerprint: replaced, outcome: "applied", rule: file }),
+        expect.objectContaining({ fingerprint: replaced, outcome: "withdrawn", kind: "upstream", gist: "Gist of tdd-no-bail.", rule: file }),
+        expect.objectContaining({ outcome: "applied", gist, rule: file }),
+      ]);
+    }, 30_000);
+
+    it.skipIf(!ompAvailable)("writes and records nothing when the rule changed after Prepare read it", async () => {
+      const { host, file, applied } = await approvedReplacement();
+      appendFileSync(file, "\nThe user's own line.\n");
+      const before = observerBytes(host);
+
+      const result = await resolve(host, [applied]);
+
+      expect(result.isError).toBe(true);
+      expect(failures(result)).toEqual([expect.stringContaining("changed since Prepare")]);
+      expect(observerBytes(host)).toEqual(before);
+    }, 30_000);
+  });
 });
 
 describe("withdrawing applied fixes", () => {
@@ -4349,6 +4393,43 @@ describe("observer_resolve with barrier rules for local and managed skills", () 
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain(foreign);
   });
+
+  it.skipIf(!ompAvailable)("replaces the skill's own barrier rule under its name with a new proposal's pattern, and records the replaced fix as withdrawn", async () => {
+    const host = loadExtension();
+    await host.callTool("observer_resolve", { outcomes: [await barrierFix(host, "ce-commit-jj", "local")] });
+    const file = join(host.rulesDir, "jj-not-git.md");
+    const replaced = readRule(file).frontmatter.fingerprint;
+    const narrower = { pattern: "\\bgit commit(?=\\s)", matches: [{ command: 'git commit -m "wip"' }], spares: [{ command: "git commit-tree HEAD^{tree}" }] };
+    const gist = "Commit with jj, not git; plumbing commands stay allowed.";
+
+    const prepared = await prepareRules(host, [{ skill: "ce-commit-jj", kind: "local", gist, rule: { ...JJ_NOT_GIT, ...narrower } }]);
+    expect(prepared.isError).toBeFalsy();
+    expect(String(reviewEntries(prepared)[0]?.proposal.preview)).toContain(`Rewrite the barrier rule \`jj-not-git\` at \`${file}\` for \`ce-commit-jj\` (local), replacing fix \`${replaced}\` (Commit with jj, not git.)`);
+
+    const result = await host.callTool("observer_resolve", { outcomes: [await barrierFix(host, "ce-commit-jj", "local", narrower, gist)] });
+
+    expect(result.isError).toBeFalsy();
+    const { frontmatter } = readRule(file);
+    const records = ledgerRecords(host.ledgerFile);
+    expect(frontmatter).toMatchObject({ condition: narrower.pattern, description: gist, fingerprint: records.at(-1)?.fingerprint });
+    expect(records.slice(1)).toEqual([
+      expect.objectContaining({ fingerprint: replaced, outcome: "withdrawn", gist: "Commit with jj, not git.", rule: file }),
+      expect.objectContaining({ outcome: "applied", gist, rule: file }),
+    ]);
+  }, 30_000);
+
+  it.skipIf(!ompAvailable)("prepares no barrier rule under the name of another skill's barrier rule, and leaves it untouched", async () => {
+    const host = loadExtension();
+    await host.callTool("observer_resolve", { outcomes: [await barrierFix(host, "ce-commit-jj", "local")] });
+    const file = join(host.rulesDir, "jj-not-git.md");
+    const before = readFileSync(file, "utf8");
+
+    const result = await prepareRules(host, [{ skill: "implement-spec", kind: "managed", gist: "Commit with jj in specs.", rule: JJ_NOT_GIT }]);
+
+    expect(readFileSync(file, "utf8")).toBe(before);
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain("pick another name");
+  }, 30_000);
 });
 
 describe("proposal approval of pattern amendments and barrier rules", () => {

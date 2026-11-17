@@ -1,9 +1,10 @@
-import { addToSkillAmendment, checkNameFree, checkRuleWritable, rulePath, type RuleDirs, skillAmendment, skillAmendmentDescription, skillAmendmentFingerprint, skillAmendmentName, skillPin, writeObserverRule, type ObserverRule } from "./amendments.js";
+import { addToSkillAmendment, checkNameFree, checkRuleWritable, isOnReadAmendment, readOwnRule, rulePath, type RuleDirs, skillAmendment, skillAmendmentDescription, skillAmendmentFingerprint, skillAmendmentName, skillPin, writeObserverRule, type ObserverRule } from "./amendments.js";
 import type { ProvenanceResolver } from "./provenance.js";
 import { type PatternDraft, replayCase, type ReplayCase } from "./replay.js";
 import type { ProposalAnswer } from "./resolve.js";
 
-export interface FixRule { rule: ObserverRule; replay?: ReplayCase; section?: true }
+/** `replaces`: the fix of the same skill whose pattern rule, under this rule's name, this one overwrites. */
+export interface FixRule { rule: ObserverRule; replay?: ReplayCase; section?: true; replaces?: { fingerprint: string; gist: string } }
 
 /** What a fix's rule is built from: a pattern rule's name, body, pattern and samples, or, without a pattern, an on-read fix's section. */
 export interface FixDraft extends Omit<PatternDraft, "pattern" | "name"> {
@@ -70,13 +71,18 @@ export function fixRule(answer: Pick<ProposalAnswer, "skill" | "kind" | "gist"> 
     fingerprint,
     body: draft.body,
   };
-  checkRuleWritable(rule);
-  return { rule, replay: check };
+  // A new proposal for the same skill under its pattern rule's name revises that rule; the fix it held goes out of force.
+  const existing = readOwnRule(path, draft.name);
+  const replaces = existing && existing.fingerprint !== fingerprint && existing.amends === skill.name && !isOnReadAmendment(existing)
+    ? { fingerprint: existing.fingerprint, gist: existing.description }
+    : undefined;
+  checkRuleWritable(rule, replaces?.fingerprint);
+  return { rule, replay: check, ...(replaces && { replaces }) };
 }
 
 /** The validated rule writer for an applied answer: the file it names, and whether it changed. */
 export function publishFix(fix: FixRule): { path: string; written: boolean } {
   if (fix.section) return addToSkillAmendment(fix.rule);
-  writeObserverRule(fix.rule);
+  writeObserverRule(fix.rule, fix.replaces?.fingerprint);
   return { path: fix.rule.path, written: true };
 }

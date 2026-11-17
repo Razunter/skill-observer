@@ -13,6 +13,8 @@ An upstream skill is tracked in `~/.agents/.skill-lock.json`. A plugin skill com
 
 A rule name is unique across both directories. A write using a name held by a file in the other directory is reported as not recorded.
 
+A pattern amendment or barrier rule proposed under the name of the same skill's marked pattern rule replaces it. This is how a pattern that fires on legitimate output gets fixed. The preview reads `Rewrite`, naming the fix it replaces. On Apply, the file is overwritten and the replaced fix is recorded as `withdrawn` before the new fix's `applied` record. The name stays refused for another skill's rule, an on-read amendment, or a file without the marker.
+
 A barrier rule's `scope` sets where its pattern watches for the mistake: `text`, the default, for the agent's text, or `tool:<name>` with a lowercase tool name, as in `tool:bash`, for one tool's calls. TTSR matches tool patterns against the call's arguments as JSON, except for `edit` and `write`, where it matches the resulting file content. Other scope forms, including path globs, lists, `thinking`, and any tool, are refused.
 
 ## The skill's on-read amendment

@@ -99,7 +99,7 @@ export function parseFrontmatter(text: string): { frontmatter: Record<string, st
 }
 
 /** Reads the rule at `path` when this extension wrote it; `undefined` for a missing or foreign file. */
-function readOwnRule(path: string, name: string): ObserverRule | undefined {
+export function readOwnRule(path: string, name: string): ObserverRule | undefined {
   if (!existsSync(path)) return undefined;
   const parsed = parseFrontmatter(readFileSync(path, "utf8"));
   if (!parsed || parsed.frontmatter.generatedBy !== MARKER) return undefined;
@@ -294,20 +294,20 @@ export const frontmatterField = (key: string, value: string) => `${key}: ${JSON.
 
 /**
  * Throws when writing `rule` would overwrite a file this extension didn't
- * write, or its own rule for another proposal.
+ * write, or its own rule for another proposal than the one it `replaces`.
  */
-export function checkRuleWritable(rule: Pick<ObserverRule, "name" | "path" | "fingerprint">): void {
+export function checkRuleWritable(rule: Pick<ObserverRule, "name" | "path" | "fingerprint">, replaces?: string): void {
   if (!existsSync(rule.path)) return;
   const existing = readOwnRule(rule.path, rule.name);
   if (!existing) throw foreignRule(rule.path);
-  if (existing.fingerprint !== rule.fingerprint) {
+  if (existing.fingerprint !== rule.fingerprint && existing.fingerprint !== replaces) {
     throw new Error(`rule \`${rule.name}\` already holds another proposal's fix; pick another name`);
   }
 }
 
-/** Writes a new rule, or rewrites the one an earlier pass wrote for the same proposal. */
-export function writeObserverRule(rule: ObserverRule): void {
-  checkRuleWritable(rule);
+/** Writes a new rule, or rewrites the one an earlier pass wrote for the same proposal or for the fix it `replaces`. */
+export function writeObserverRule(rule: ObserverRule, replaces?: string): void {
+  checkRuleWritable(rule, replaces);
   const text = [
     "---",
     frontmatterField("name", rule.name),

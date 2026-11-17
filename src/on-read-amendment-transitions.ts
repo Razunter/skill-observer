@@ -288,6 +288,11 @@ function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[]
       }
       // A section the amendment already held changed no file, so it is no publication.
       if (written) publications.push({ operation: fix.section ? "on-read-append" : "rule", skill: answer.skill, rule, fingerprint });
+      // The fix whose rule this one overwrote, of the same skill, goes out of force; its rule's description is its gist.
+      if (fix.replaces) {
+        const { fingerprint: replaced, gist: replacedGist } = fix.replaces;
+        records.push({ fingerprint: replaced, skill: answer.skill, kind: answer.kind, gist: replacedGist, outcome: "withdrawn", rule, timestamp, sessionId });
+      }
     } else if (withdrawn) {
       const { rule: file, body } = withdrawn;
       try {
