@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The `/observe` review form leads each proposal with a one-line headline: the action and target in the legend (such as `Add on-read fix · tdd (upstream)` or `Rewrite barrier rule`), the gist in bold, the question as a heading, then the options. Details follow below as labelled paragraphs (Problem, Effect, Remedy, Evidence, Grounds or Searched), then the change preview under its own heading. The line saying a noted answer is asked again now sits after the options, in italics. Cited guidance is grouped by file, shown by its last two path segments with `L34`, `L34–44` and `§ Section` places, without the inspection ID.
+- The legend, gist, remedy, explanation and delta render inline `code`, `**bold**` and `*italic*`. Prepare refuses a candidate whose `remedy`, `diagnosis.explanation` or `diagnosis.delta` bolds more than two phrases.
+- Previews show paths under the home directory as `~/…`, and cut each rule `Matches:`/`Spares:` sample line to 200 characters. Written content is unchanged.
+- The status line reads `skill-observer: N skill correction(s) → /observe` (and likewise for workflows without a skill and pending observations).
+- The pass summary reports dismissed signals as one line, counted and grouped by reason, instead of listing them.
+
 ## 0.3.0 - 2026-11-17
 
 ### Added

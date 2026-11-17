@@ -343,7 +343,7 @@ describe("status hint", () => {
     });
     host.setBranch([...fx.plainUserMessage, ...fx.ruleViolationInterrupt]);
     await host.endTurn();
-    expect(host.statusTexts()).toEqual(["1 skill correction · /observe"]);
+    expect(host.statusTexts()).toEqual(["skill-observer: 1 skill correction → /observe"]);
   }, 30_000);
 
   it("points at /observe when a marked rule watching another tool's calls fires", async () => {
@@ -355,7 +355,7 @@ describe("status hint", () => {
     );
     host.setBranch([...fx.plainUserMessage, ...fx.ruleViolationInterrupt]);
     await host.endTurn();
-    expect(host.statusTexts()).toEqual(["1 skill correction · /observe"]);
+    expect(host.statusTexts()).toEqual(["skill-observer: 1 skill correction → /observe"]);
   });
 
   it.each([
@@ -505,7 +505,7 @@ describe("/observe", () => {
     await host.endTurn();
 
     expect(existsSync(join(host.rulesDir, "use-ask-tool-for-questions.md"))).toBe(false);
-    expect(host.statusTexts()).toEqual(["1 skill correction · /observe"]);
+    expect(host.statusTexts()).toEqual(["skill-observer: 1 skill correction → /observe"]);
   });
 
   it("puts the text typed after /observe into the pass as a user note ahead of the digest", async () => {
@@ -791,6 +791,9 @@ async function prepareAndSelect(host: ReturnType<typeof loadExtension>, candidat
   expect(prepared.isError).toBeFalsy();
   return host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map((entry) => entry.reference), ...select });
 }
+
+/** A path as a preview names it: under the home directory, which each host points at its temp skill home, as `~`. */
+const shown = (path: string) => path.replace(homedir(), "~");
 
 const referencesDir = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.home, ".omp/agent/skill-observer/references");
 /** Every file this extension owns under the agent dir, with its text, so a read-only review can be shown to change none. */
@@ -1172,7 +1175,7 @@ describe("observer_review prepared proposals", () => {
       rule: expect.objectContaining({ name: "tdd-amendment", path: amendment, amends: "tdd" }),
       target: { path: amendment, sha256: sha256(amendment) },
     });
-    expect(append?.proposal.preview).toBe(`Append this section to the on-read amendment \`${amendment}\` of \`tdd\` (upstream):\n\n## Seams\n\nName the seam first.`);
+    expect(append?.proposal.preview).toBe(`Append this section to the on-read amendment \`${shown(amendment)}\` of \`tdd\` (upstream):\n\n## Seams\n\nName the seam first.`);
     const patternPath = join(host.rulesDir, "use-ask-tool.md");
     expect(pattern?.proposal.change).toEqual({
       operation: "rule", body: "Ask with the ask tool.", matches: ["Shall I go on?"], spares: ["I went on."],
@@ -1181,7 +1184,7 @@ describe("observer_review prepared proposals", () => {
       target: { path: patternPath, sha256: null },
     });
     expect(pattern?.proposal.preview).toBe([
-      `Write the pattern amendment \`use-ask-tool\` at \`${patternPath}\` for \`tdd\` (upstream).`,
+      `Write the pattern amendment \`use-ask-tool\` at \`${shown(patternPath)}\` for \`tdd\` (upstream).`,
       "Scope: text", "Pattern: \\?\\s*$", 'Matches:\n- "Shall I go on?"', 'Spares:\n- "I went on."', "", "Ask with the ask tool.",
     ].join("\n"));
     expect(barrier?.proposal.change).toMatchObject({ operation: "rule", rule: { name: "no-todo-echo", scope: "tool:bash", amends: "ce-commit-jj" },
@@ -1195,6 +1198,31 @@ describe("observer_review prepared proposals", () => {
     }
     expect(JSON.parse(resultText(result)).eligible.map((entry: ReviewEntry) => entry.reference)).toEqual([append, pattern, barrier].map((entry) => entry?.reference));
     expect(ownedFiles(host)).toEqual(before);
+  });
+
+  it("cuts each rule sample line in the preview to 200 characters, while the change keeps the whole sample", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const long = `${"a".repeat(300)}?`;
+    const result = await host.callTool("observer_review", { action: "prepare", candidates: [
+      { kind: "upstream", skill: "tdd", gist: "Ask with the ask tool", priority: "evidence", remedy,
+        change: { operation: "rule", name: "use-ask-tool", body: "Ask with the ask tool.", pattern: "\\?\\s*$", matches: [long], spares: ["I went on."] } },
+    ] });
+    expect(failures(result)).toEqual([]);
+    const [entry] = reviewEntries(result);
+    expect(entry?.proposal.change).toMatchObject({ matches: [long] });
+    expect(entry?.proposal.preview.split("\n")).toContain(`- "${"a".repeat(196)}…`);
+  });
+
+  it.each([
+    ["remedy", { remedy: "**One**, **two** and **three**" }],
+    ["diagnosis.explanation", { diagnosis: { explanation: "**One**, **two** and **three**" } }],
+    ["diagnosis.delta", { diagnosis: { delta: "**One**, **two** and **three**" } }],
+  ])("refuses a candidate whose %s bolds more than two phrases", async (field, fields) => {
+    const host = loadExtension();
+    startPass(host);
+    const result = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...onReadCandidate({ gist: "Name the seam", section: SEAMS }), ...fields }] });
+    expect(failures(result)).toEqual([`\`${field}\` bolds 3 phrases; bold at most two`]);
   });
 
   it("suppresses a declined proposal whose target is no longer writable, and prepares the rest", async () => {
@@ -1220,7 +1248,7 @@ describe("observer_review prepared proposals", () => {
     ] });
     const [entry] = reviewEntries(prepared);
     expect(entry?.proposal.change).toMatchObject({ effect: "record", section: SEAMS, target: { path: file, sha256: sha256(file) } });
-    expect(entry?.proposal.preview).toBe(`The on-read amendment \`${file}\` of \`tdd\` (upstream) already holds this section, so only the proposal ledger changes:\n\n${SEAMS}`);
+    expect(entry?.proposal.preview).toBe(`The on-read amendment \`${shown(file)}\` of \`tdd\` (upstream) already holds this section, so only the proposal ledger changes:\n\n${SEAMS}`);
     const [answer] = await approveOnRead(host, [{ gist: "Seams again", section: `\n${SEAMS}\n` }]);
     const resolved = await host.callTool("observer_resolve", { outcomes: [answer] });
     expect(resolved.isError).toBeFalsy();
@@ -1273,7 +1301,7 @@ describe("observer_review prepared proposals", () => {
       operation: "stale-update", rule: tddRule, target: tddTarget, body: `## Reds\n\nWhen red, read \`${reds}\`.`,
       references: { ...releasedTdd, write: [{ name: "reds.md", body: "Red first." }] },
     });
-    expect(update?.preview).toBe(`Update the stale amendment \`tdd-amendment\` at \`${tdd}\` of \`tdd\` (upstream), pinned to the skill as installed now. New body:\n\n## Reds\n\nWhen red, read \`${reds}\`.\n\nReference file \`${reds}\`:\n\nRed first.\n\nDeletes reference files \`${oldReference}\`.`);
+    expect(update?.preview).toBe(`Update the stale amendment \`tdd-amendment\` at \`${shown(tdd)}\` of \`tdd\` (upstream), pinned to the skill as installed now. New body:\n\n## Reds\n\nWhen red, read \`${reds}\`.\n\nReference file \`${shown(reds)}\`:\n\nRed first.\n\nDeletes reference files \`${shown(oldReference)}\`.`);
     expect(rewrite?.proposal.change).toEqual({ operation: "withdrawal", withdrawn: tddFix, effect: "rewrite", rule: tddRule, target: tddTarget, body: "## Left\n\nThe rest." });
     expect(compaction?.proposal.change).toEqual({
       operation: "compaction", rule: expect.objectContaining({ name: "domain-modeling-amendment", path: domain }), target: { path: domain, sha256: sha256(domain) },
@@ -1281,9 +1309,9 @@ describe("observer_review prepared proposals", () => {
       references: { folder: join(referencesDir(host), "domain-modeling"), before: [{ path: notes, sha256: sha256(notes) }], write: [{ name: "kept.md", body: "Kept." }], remove: ["notes.md"] },
     });
     expect(compaction?.proposal.candidateId).toBe(`compaction:${amendments.compactionFingerprint("domain-modeling", "Body of domain-modeling-amendment.")}`);
-    expect(compaction?.proposal.preview).toContain(`Reference file \`${kept}\`:\n\nKept.\n\nDeletes reference files \`${notes}\`.`);
+    expect(compaction?.proposal.preview).toContain(`Reference file \`${shown(kept)}\`:\n\nKept.\n\nDeletes reference files \`${shown(notes)}\`.`);
     expect(remove?.change).toEqual({ operation: "stale-delete", rule: tddRule, target: tddTarget, references: releasedTdd });
-    expect(remove?.preview).toBe(`Delete the stale amendment \`tdd-amendment\` at \`${tdd}\` of \`tdd\` (upstream); the fixes it holds go out of force.\n\nDeletes reference files \`${oldReference}\`.`);
+    expect(remove?.preview).toBe(`Delete the stale amendment \`tdd-amendment\` at \`${shown(tdd)}\` of \`tdd\` (upstream); the fixes it holds go out of force.\n\nDeletes reference files \`${shown(oldReference)}\`.`);
     expect(deletion?.proposal.change).toEqual({ operation: "withdrawal", withdrawn: tddFix, effect: "delete", rule: tddRule, target: tddTarget, references: releasedTdd });
     expect(record?.proposal).toMatchObject({ candidateId: `withdrawal:${gone.fingerprint}`, change: { operation: "withdrawal", withdrawn: { fingerprint: gone.fingerprint, gist: "Gone fix" }, effect: "record" } });
     expect(ownedFiles(host)).toEqual(before);
@@ -1357,27 +1385,30 @@ describe("observer_review prepared proposals", () => {
     expect(json).not.toContain("Seams");
     // Pins the hash, with the temp home masked: Prepare keeps amendment sections out of the proposal.
     expect(createHash("sha256").update(json.replaceAll(host.skillHome.home, "<home>")).digest("hex"))
-      .toBe("3e72a9cf4d3594e1e03b1cd80a36740037905b977ba53865ff32a622d9f2560a");
+      .toBe("9b7475f73a21df123d098f59b350f20df2a1d781c058bc5658272c152addc5c6");
   });
 
-  it("returns one Ask form showing each selected proposal's preview whole, escaped and with hidden whitespace marked, with no option preselected", async () => {
+  it("returns one Ask form that leads each fieldset with its action, gist and question, then details with inline formatting, then the preview whole, escaped and with hidden whitespace marked, with no option preselected", async () => {
     const host = loadExtension();
     const long = `A long line ${"that keeps going ".repeat(20)}to its end.`;
-    const selection = await prepareAndSelect(host, [{ kind: "local", skill: "ce-commit-jj", gist: "Use <jj> & not git", priority: "evidence", remedy: "Edit the skill",
-      change: { operation: "direct-edit", preview: `- if (a < b && c > d)\n    x  y\t\na\tb c \n\n${long}` }, evidence: [{ quote: "git commit <again>", count: 2, source: "user" }] }]);
+    const selection = await prepareAndSelect(host, [{ kind: "local", skill: "ce-commit-jj", gist: "Use <jj> & not git", priority: "evidence",
+      remedy: "Run `jj <cmd>` **first**; leave personas/*.md, *.test.*, **/*.ts and *this* alone; **use `jj`** \"*quoted*\"",
+      change: { operation: "direct-edit", preview: `- if (a < b && c > d)\n    x  y\t\na\tb c \n\n${long}` }, evidence: [{ quote: "git commit <again> *as is*", count: 2, source: "user" }] }]);
     const { candidateId } = reviewEntries(selection, "selected")[0]!.proposal;
     const { askHtml } = JSON.parse(resultText(selection));
     expect(askHtml).toBe([
       "<form>", "<fieldset>",
-      "<legend>`ce-commit-jj` (local): Use &lt;jj&gt; &amp; not git</legend>",
-      "<p>Edit the skill</p>",
-      "<p>Diagnosis: The inspected guidance does not cover this; its sections hold no such step.</p>",
-      "<p>Behavior change: A future agent takes the drafted step.</p>",
-      `<p>Cited guidance, inspection observer_review-call-1: ${join(host.skillHome.roots.skillsDir, "ce-commit-jj/SKILL.md")} lines 1–1</p>`,
-      "<ul>", '<li>"git commit &lt;again&gt;" (×2, user)</li>', "</ul>",
-      `<p>- if (a &lt; b &amp;&amp; c &gt; d)<br>····x··y→<br>a→b c·<br><br>${long}</p>`,
-      "<p><b>Apply this change?</b></p>",
+      "<legend>Edit · <code>ce-commit-jj</code> (local)</legend>",
+      "<p><b>Use &lt;jj&gt; &amp; not git</b></p>",
+      "<h4>Apply this change?</h4>",
       ...["Apply", "Later", "Decline"].map((label) => `<label><input type="radio" name="${candidateId}" value="${candidateId}=${label}" required>${label}</label>`),
+      "<p><b>Problem:</b> The inspected guidance does not cover this; its sections hold no such step.</p>",
+      "<p><b>Effect:</b> A future agent takes the drafted step.</p>",
+      "<p><b>Remedy:</b> Run <code>jj &lt;cmd&gt;</code> <b>first</b>; leave personas/*.md, *.test.*, **/*.ts and <i>this</i> alone; <b>use <code>jj</code></b> \"<i>quoted</i>\"</p>",
+      "<p><b>Evidence:</b></p>", "<ul>", "<li>“git commit &lt;again&gt; *as is*” <b>×2</b> · user</li>", "</ul>",
+      "<p><b>Grounds:</b> <code>ce-commit-jj/SKILL.md</code> L1</p>",
+      "<h4>Change</h4>",
+      `<p>- if (a &lt; b &amp;&amp; c &gt; d)<br>····x··y→<br>a→b c·<br><br>${long}</p>`,
       "</fieldset>", "</form>",
     ].join("\n"));
     expect(askHtml).not.toMatch(/<pre|checked/);
@@ -1548,12 +1579,12 @@ describe("proposal approval of on-read appends", () => {
     return { call, result, args, details: result.message.details as AskDetails };
   };
 
-  it("appends exactly the prepared section the form showed above the Apply the user chose", async () => {
+  it("appends exactly the prepared section the form showed with the Apply the user chose", async () => {
     const { host, applied } = await approved();
     const result = await resolve(host, [applied]);
     expect(result.isError).toBeFalsy();
     expect(savedAsk({ host, applied }).args.html)
-      .toContain(`<p>Create the on-read amendment \`${amendment(host)}\` of \`tdd\` (upstream) with this section:<br><br>## Seams<br><br>Name the seam first.</p>`);
+      .toContain(`<p>Create the on-read amendment \`${shown(amendment(host))}\` of \`tdd\` (upstream) with this section:<br><br>## Seams<br><br>Name the seam first.</p>`);
     expect(readRule(amendment(host)).body).toBe("## Seams\n\nName the seam first.");
     expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({
       skill: "tdd", kind: "upstream", gist: "Name the seam", outcome: "applied", fingerprint: proposalFingerprint("tdd", "Name the seam"),
@@ -2495,14 +2526,14 @@ describe("observer hook and companion intents", () => {
     expect(selection.isError).toBeFalsy();
     const [project, global, edited, companion] = reviewEntries(selection, "selected").map(({ proposal }) => proposal);
     const { askHtml } = JSON.parse(resultText(selection));
-    expect(askHtml).toContain(`<legend>\`skill-observer-${project!.fingerprint}.ts\` (project hook): Block git commit here</legend>`);
-    expect(askHtml).toContain(`<legend>\`skill-observer-${global!.fingerprint}.ts\` (global hook): Block git commit everywhere</legend>`);
-    expect(askHtml).toContain("<legend>`mine.ts` (global hook): Fix my hand-written hook</legend>");
-    expect(askHtml).toContain("<legend>`skill-observer-companion` (companion extension): Register a jj tool</legend>");
-    expect(project!.preview).toContain(join(projectHooks(host), `skill-observer-${project!.fingerprint}.ts`));
-    expect(global!.preview).toContain(join(agentDir(host), "hooks/pre", `skill-observer-${global!.fingerprint}.ts`));
-    expect(edited!.preview).toContain(join(agentDir(host), "hooks/pre/mine.ts"));
-    expect(companion!.preview).toContain(join(agentDir(host), "extensions/skill-observer-companion"));
+    expect(askHtml).toContain(`<legend>Plan hook change · <code>skill-observer-${project!.fingerprint}.ts</code> (project hook)</legend>\n<p><b>Block git commit here</b></p>`);
+    expect(askHtml).toContain(`<legend>Plan hook change · <code>skill-observer-${global!.fingerprint}.ts</code> (global hook)</legend>`);
+    expect(askHtml).toContain("<legend>Plan hook change · <code>mine.ts</code> (global hook)</legend>");
+    expect(askHtml).toContain("<legend>Plan companion change · <code>skill-observer-companion</code> (companion extension)</legend>");
+    expect(project!.preview).toContain(shown(join(projectHooks(host), `skill-observer-${project!.fingerprint}.ts`)));
+    expect(global!.preview).toContain(shown(join(agentDir(host), "hooks/pre", `skill-observer-${global!.fingerprint}.ts`)));
+    expect(edited!.preview).toContain(shown(join(agentDir(host), "hooks/pre/mine.ts")));
+    expect(companion!.preview).toContain(shown(join(agentDir(host), "extensions/skill-observer-companion")));
     for (const line of ["Event: tool_call for bash", "Predicate: the command runs `git commit` in a jj repository", "Action: block the call and name `jj commit`",
       "Mistake sample: git commit -m fix", "Legitimate sample: jj commit -m fix", "Scope: every jj repository",
       "Why each lower rung fails: A barrier rule only reminds; no project check runs before the commit."]) {
@@ -2633,8 +2664,8 @@ describe("observer hook and companion intents", () => {
       const candidate = code("project-hooks", "Block git commit here", approval, [{ path: file, text: hookText }]);
       const { selection, entry } = await askCode(host, candidate);
       const { askHtml } = JSON.parse(resultText(selection));
-      expect(askHtml).toContain(`<legend>\`${file}\` (project hook): Block git commit here</legend>`);
-      expect(askHtml).toContain(join(projectHooks(host), file));
+      expect(askHtml).toContain(`<legend>Write hook code · <code>${file}</code> (project hook)</legend>`);
+      expect(askHtml).toContain(shown(join(projectHooks(host), file)));
       expect(askHtml).toContain('export default function (pi) {<br>··pi.on("tool_call", (event) =&gt; event.input.command?.startsWith("git commit")');
       expect(askHtml).toContain(`Check command: ${hookCheck(file).command}`);
       expect(askHtml).toContain("mistake git commit -m fix: blocked<br>legitimate jj commit -m fix: untouched");
@@ -2793,7 +2824,7 @@ describe("observer hook and companion intents", () => {
       writeFileSync(join(hooks, "mine.ts"), "export default function () {}\n");
       const { approval: intentApproval } = await askIntent(host, intent("global-hooks", "Fix my hand-written hook", { path: "mine.ts" }));
       const { selection, approval } = await askCode(host, code("global-hooks", "Fix my hand-written hook", intentApproval, [{ path: "mine.ts", text: hookText }], { path: "mine.ts" }));
-      expect(JSON.parse(resultText(selection)).askHtml).toContain(`Replace \`${join(hooks, "mine.ts")}\``);
+      expect(JSON.parse(resultText(selection)).askHtml).toContain(`Replace \`${shown(join(hooks, "mine.ts"))}\``);
       const receipts = publish(host, join(hooks, "mine.ts"), hookText, hooks);
       const result = await resolve(host, [applied(approval, { ...receipts, files: [{ path: "mine.ts", afterHash: sha(hookText) }] })]);
       expect(failures(result)).toEqual([]);
@@ -2854,8 +2885,8 @@ describe("observer hook and companion intents", () => {
       const { proposal, approval: intentApproval } = await askIntent(host, intent("companion", "Register a jj tool"));
       const { selection, approval } = await askCode(host, companionCode(intentApproval, companionFiles));
       const { askHtml } = JSON.parse(resultText(selection));
-      expect(askHtml).toContain("<legend>`skill-observer-companion` (companion extension): Register a jj tool</legend>");
-      for (const { path } of companionFiles) expect(askHtml).toContain(`Create \`${join(companionDir(host), path)}\` with:`);
+      expect(askHtml).toContain("<legend>Write companion code · <code>skill-observer-companion</code> (companion extension)</legend>");
+      for (const { path } of companionFiles) expect(askHtml).toContain(`Create \`${shown(join(companionDir(host), path))}\` with:`);
       expect(askHtml).toContain("pi.registerTool({ name: \"jj_status\" });");
       expect(askHtml).toContain("it(\"registers jj_status\"");
       expect(askHtml).toContain('"omp": { "extensions": ["./index.ts"] }');
@@ -2879,7 +2910,7 @@ describe("observer hook and companion intents", () => {
       const changed = [{ path: "index.ts", text: entry.replace("jj_status", "jj_log") }];
       const { approval: intentApproval } = await askIntent(host, intent("companion", "Register a jj tool"));
       const { selection, approval } = await askCode(host, companionCode(intentApproval, changed));
-      expect(JSON.parse(resultText(selection)).askHtml).toContain(`Replace \`${join(companionDir(host), "index.ts")}\` with:`);
+      expect(JSON.parse(resultText(selection)).askHtml).toContain(`Replace \`${shown(join(companionDir(host), "index.ts"))}\` with:`);
       expect(failures(await resolve(host, [applied(approval, publishAll(host, companionDir(host), changed))]))).toEqual([]);
     });
 
@@ -2971,8 +3002,8 @@ describe("observer hook and companion intents", () => {
       const file = handWritten(host, "project-hooks");
       const { selection } = await askIntent(host, removal("project-hooks", "mine.ts"));
       const { askHtml } = JSON.parse(resultText(selection));
-      expect(askHtml).toContain("<legend>`mine.ts` (project hook): Remove the misfiring hook</legend>");
-      expect(askHtml).toContain(file);
+      expect(askHtml).toContain("<legend>Remove hook · <code>mine.ts</code> (project hook)</legend>");
+      expect(askHtml).toContain(shown(file));
       expect(askHtml).toContain('export default function (pi) {<br>→pi.on("tool_call", () =&gt; ({ block: true }));<br>}');
       expect(askHtml).toContain(">Apply</label>");
       expect(askHtml).toContain(">Decline</label>");
@@ -6948,11 +6979,11 @@ describe("observations", () => {
     await first.callTool("observe", { text: OBSERVATION });
     await first.callTool("observe", { text: "The pre-commit hook runs the native suite." });
     await first.endTurn();
-    expect(first.statusTexts()).toEqual(["2 pending observations · /observe"]);
+    expect(first.statusTexts()).toEqual(["skill-observer: 2 pending observations → /observe"]);
     const second = loadExtension({ skillHome: first.skillHome });
     second.setBranch(fx.plainUserMessage);
     await second.emit("session_start");
-    expect(second.statusTexts()).toEqual(["2 pending observations · /observe"]);
+    expect(second.statusTexts()).toEqual(["skill-observer: 2 pending observations → /observe"]);
     await second.runCommand("observe");
     expect(second.statusTexts()).toEqual([]);
   });
@@ -6962,7 +6993,7 @@ describe("observations", () => {
     host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
     await host.callTool("observe", { text: OBSERVATION });
     await host.endTurn();
-    expect(host.statusTexts()).toEqual(["1 skill correction · /observe"]);
+    expect(host.statusTexts()).toEqual(["skill-observer: 1 skill correction → /observe"]);
   });
 
   it("counts pending observations in /observe-report, never their text, and marks none shown", async () => {
@@ -7115,7 +7146,7 @@ describe("observer_review inspect and grounded repairs", () => {
     const diagnosis = {
       inspection, explanation: "The guide names seams but says nothing on fixtures; checked its Seams section and the amendment: neither covers fixtures.",
       delta: "A future agent builds one fixture per seam.",
-      citations: [{ source: guidePath(host), lines: { from: 6, to: 8 } }, { source: amendment, section: "Seam names" }],
+      citations: [{ source: guidePath(host), lines: { from: 6, to: 8 } }, { source: amendment, section: "Seam names" }, { source: guidePath(host), lines: { from: 2, to: 2 } }],
     };
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{
       ...onReadCandidate({ skill: GUIDE, gist: "One fixture per seam.", section: "## Fixtures\n\nBuild one fixture per seam." }), diagnosis }] });
@@ -7129,8 +7160,8 @@ describe("observer_review inspect and grounded repairs", () => {
     const { askHtml } = JSON.parse(resultText(selection));
     expect(askHtml).toContain(escapeHtmlText(diagnosis.explanation));
     expect(askHtml).toContain(diagnosis.delta);
-    expect(askHtml).toContain(`${guidePath(host)} lines 6–8`);
-    expect(askHtml).toContain(`${amendment} § Seam names`);
+    const lastTwoSegments = (path: string) => path.split("/").slice(-2).join("/");
+    expect(askHtml).toContain(`<p><b>Grounds:</b> <code>${lastTwoSegments(guidePath(host))}</code> L6–8, L2; <code>${lastTwoSegments(amendment)}</code> § Seam names</p>`);
     expect(askHtml.split(diagnosis.delta)).toHaveLength(2);
     expect(askHtml).not.toContain("Name the seam before the first test.");
     expect(observerBytes(host)).toEqual(before);
@@ -7624,7 +7655,7 @@ describe("observer_review new-skill search", () => {
     expect(failures(selection)).toEqual([]);
     const { askHtml } = JSON.parse(resultText(selection));
     expect(askHtml).toContain("sample-deploy only deploys notes someone already drafted.");
-    expect(askHtml).toContain(`Searched current skills, inspection ${id}, for: Release Notes; matches: sample-deploy, prompt-only`);
+    expect(askHtml).toContain("<p><b>Searched:</b> Release Notes · matches: sample-deploy, prompt-only</p>");
     const approval = { proposal: entry!.reference, selectionToolCallId, askToolCallId: askUser(host, selection) };
     expect(observerBytes(host)).toEqual(before);
 
@@ -7755,7 +7786,7 @@ describe("approval compatibility under the evidence gate", () => {
   const amendment = (host: ReturnType<typeof loadExtension>) => join(host.amendmentsDir, "tdd-amendment.md");
   const tddSkill = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.roots.skillsDir, "tdd", "SKILL.md");
   const prepare = (host: ReturnType<typeof loadExtension>, candidates: unknown[]) => host.callTool("observer_review", { action: "prepare", candidates });
-  const DIAGNOSIS_LINE = /<p>(?:Diagnosis: |Behavior change: |Cited guidance, inspection )[^\n]*\n/g;
+  const DIAGNOSIS_LINE = /<p><b>(?:Problem|Effect|Grounds|Searched):<\/b>[^\n]*\n/g;
   const sha = (text: string) => createHash("sha256").update(text).digest("hex");
 
   function savedBeforeGate(host: ReturnType<typeof loadExtension>) {

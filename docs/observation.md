@@ -4,7 +4,7 @@ How `/observe` uses session evidence to review skills and project-environment fi
 
 ## Hints
 
-After each turn, the extension rebuilds the session digest from the current branch of the session. The status line shows `N skill correction(s) · /observe` once the branch has a correction-class skill signal, and `N workflow(s) without a skill · /observe` once it has a workflow outline and no correction. With neither, it shows `N pending observation(s) · /observe` while the project has [pending observations](#observations). Correction-class signals are:
+After each turn, the extension rebuilds the session digest from the current branch of the session. The status line shows `skill-observer: N skill correction(s) → /observe` once the branch has a correction-class skill signal, and `skill-observer: N workflow(s) without a skill → /observe` once it has a workflow outline and no correction. With neither, it shows `skill-observer: N pending observation(s) → /observe` while the project has [pending observations](#observations). Correction-class signals are:
 
 - a steering message you typed while the agent was working;
 - a rule violation: a TTSR rule firing on the agent's text or a tool call, whether it interrupts or is injected into a tool result. Every TTSR rule this extension writes is a barrier rule or pattern amendment, so each firing is a violation; on-read amendments never reach TTSR (see [Delivering on-read amendments](amendments.md#delivering-on-read-amendments));

@@ -11,6 +11,7 @@
  */
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join, sep } from "node:path";
 import {
   compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, parseFrontmatter, readObserverRule, readOnReadAmendments, readSkillRules,
@@ -266,8 +267,12 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
     z.object({ operation: z.enum(["harness"]), stage: z.enum(["removal"]) })
       .describe("Deletes the hook file the target names, in either hooks directory, hand-written ones included: asked once, showing the file as it stands, with Apply and Decline. After Apply the pass deletes the file itself; observer_resolve records the removal once it is gone."),
   ]);
+  const formatting = " Inline `code` and up to two **bold** phrases render in the form.";
   const draft = {
-    gist: z.string(), priority: z.enum(PRIORITIES), remedy: z.string(), change,
+    gist: z.string().describe("One sentence leading with what changes; inline `code` renders in the form."),
+    priority: z.enum(PRIORITIES),
+    remedy: z.string().describe(`How the change fixes the finding and how its effect will show; the form already names the target and kind.${formatting}`),
+    change,
     evidence: z.array(z.object({ quote: z.string(), count: z.number(), source: z.string().optional(), occurrenceIds: z.array(z.string()).optional() })).optional(),
     fingerprint: z.string().optional(),
     reconciles: z.object({
@@ -278,8 +283,8 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
     }).optional().describe("On-read append or rule only: revises an approved proposal, in the same pass, by the note the user attached to its Apply (read from the Ask; a section, or a rule's body, pattern and samples, not its name), for a target that changed after its Prepare, or both. The main agent's reconciliation, not the user's approval: a change that would drop or rewrite the target's new content, or delete a target, needs a new proposal and Ask."),
     diagnosis: z.object({
       inspection: z.string().describe("The ID of this pass's observer_review inspect call of the candidate's skill, whose receipt the citations name; for a new skill, of its new-skill search."),
-      explanation: z.string().describe("Why the inspected guidance does not already address the finding (missing, unclear or ignored), with the check that could have shown otherwise and its result; for a new skill, why each search match does not fit."),
-      delta: z.string().describe("One sentence: what a future agent will do differently."),
+      explanation: z.string().describe(`Why the inspected guidance does not already address the finding (missing, unclear or ignored), with the check that could have shown otherwise and its result; for a new skill, why each search match does not fit.${formatting}`),
+      delta: z.string().describe(`One sentence: what a future agent will do differently.${formatting}`),
       citations: z.array(z.object({
         source: z.string().describe("A source `path` the inspection receipt lists."),
         lines: z.object({ from: z.number(), to: z.number() }).optional().describe("1-based inclusive lines of that source as inspected."),
@@ -612,9 +617,14 @@ function preparedSummary({ reference, proposal }: PreparedEntry, amendmentSectio
 /**
  * The one form an observation pass asks with: a fieldset per proposal, in
  * order, whose radio group is named by the proposal's candidate ID. No option
- * is preselected, so the user chooses each answer. A preview sits in a `<p>`
- * with `<br>` line breaks because the host cuts each `<pre>` line at the dialog
- * width; the whitespace a `<p>` collapses is shown as marks instead.
+ * is preselected, so the user chooses each answer. The legend, gist and
+ * question come first so a proposal can be decided from them; the host takes
+ * the text block right before a radio group as its question, so the question
+ * heading sits directly above the options. Details follow as labelled
+ * paragraphs, then the preview. A preview sits in a `<p>` with `<br>` line
+ * breaks because the host cuts each `<pre>` line at the dialog width; the
+ * whitespace a `<p>` collapses is shown as marks instead. Model prose renders
+ * its inline markup; previews and evidence quotes show their text verbatim.
  */
 export function renderAskHtml(proposals: readonly PreparedProposal[]): string {
   return ["<form>", ...proposals.map(renderFieldset), "</form>"].join("\n");
@@ -632,35 +642,84 @@ function renderFieldset(proposal: PreparedProposal): string {
   // Approval of these takes no note, so a noted answer becomes a new Prepare and Ask.
   const notedAsksAgain = isStale ? "An Update or Delete with a note is asked again."
     : ["withdrawal", "compaction", "harness"].includes(proposal.change.operation) ? "An Apply with a note is asked again." : undefined;
-  const evidence = proposal.evidence.map(({ quote, count, source }) => `<li>${escapeHtml(`"${quote}" (×${count}${source ? `, ${source}` : ""})`)}</li>`);
+  const evidence = proposal.evidence.map(({ quote, count, source }) => `<li>“${escapeHtml(quote)}” <b>×${count}</b>${source ? ` · ${escapeHtml(source)}` : ""}</li>`);
   const name = escapeHtml(proposal.candidateId).replace(/"/g, "&quot;");
+  const { diagnosis } = proposal;
   return [
     "<fieldset>",
-    `<legend>${escapeHtml(`${targetLabel(proposal)}: ${proposal.gist}`)}</legend>`,
-    `<p>${escapeHtml(proposal.remedy)}</p>`,
-    ...(proposal.diagnosis ? renderDiagnosis(proposal.diagnosis) : []),
-    ...(evidence.length > 0 ? ["<ul>", ...evidence, "</ul>"] : []),
-    ...previews,
-    ...(notedAsksAgain ? [`<p>${notedAsksAgain}</p>`] : []),
-    // The host reports the text block right before a group as the answer's question.
-    `<p><b>${isStale ? "Keep, update or delete this stale amendment?" : "Apply this change?"}</b></p>`,
+    `<legend>${inline(`${actionLabel(proposal)} · ${targetLabel(proposal)}`)}</legend>`,
+    `<p><b>${inline(proposal.gist)}</b></p>`,
+    `<h4>${isStale ? "Keep, update or delete this stale amendment?" : "Apply this change?"}</h4>`,
     // The host reports text typed into the group's Other row as an option's label when it equals that option's value, so no value is a bare label.
     ...labels.map((label) => `<label><input type="radio" name="${name}" value="${name}=${label}" required>${label}</label>`),
+    ...(notedAsksAgain ? [`<p><i>${notedAsksAgain}</i></p>`] : []),
+    ...(diagnosis ? [`<p><b>Problem:</b> ${inline(diagnosis.explanation)}</p>`, `<p><b>Effect:</b> ${inline(diagnosis.delta)}</p>`] : []),
+    `<p><b>Remedy:</b> ${inline(proposal.remedy)}</p>`,
+    ...(evidence.length > 0 ? ["<p><b>Evidence:</b></p>", "<ul>", ...evidence, "</ul>"] : []),
+    ...(diagnosis ? [renderGrounds(diagnosis)] : []),
+    "<h4>Change</h4>",
+    ...previews,
     "</fieldset>",
   ].join("\n");
 }
 
-function renderDiagnosis({ inspection, explanation, delta, citations, search }: CandidateDiagnosis): string[] {
-  const place = ({ source, lines, section }: Citation) => `${source}${lines ? ` lines ${lines.from}–${lines.to}` : ""}${section ? ` § ${section}` : ""}`;
-  const grounds = search
-    ? `Searched current skills, inspection ${inspection}, for: ${search.terms.join(", ")}; matches: ${search.matches.join(", ") || "none"}`
-    : `Cited guidance, inspection ${inspection}: ${citations.map(place).join("; ")}`;
-  return [
-    `<p>${escapeHtml(`Diagnosis: ${explanation}`)}</p>`,
-    `<p>${escapeHtml(`Behavior change: ${delta}`)}</p>`,
-    `<p>${escapeHtml(grounds)}</p>`,
-  ];
+/** The legend's action: what Apply does to which kind of target. */
+function actionLabel(proposal: PreparedProposal): string {
+  if ("alternatives" in proposal) return "Stale amendment";
+  const { change } = proposal;
+  switch (change.operation) {
+    case "on-read-append":
+      return change.effect === "record" ? "Record on-read fix" : "Add on-read fix";
+    case "rule":
+      return `${change.target.sha256 === null ? "Add" : "Rewrite"} ${isPinKind(proposal.kind) ? "pattern amendment" : "barrier rule"}`;
+    case "direct-edit":
+      return proposal.kind === "new" ? "Create skill" : "Edit";
+    case "harness": {
+      const isCompanion = proposal.kind === "harness" && proposal.target.root === "companion";
+      if (change.stage === "removal") return "Remove hook";
+      return change.stage === "intent" ? `Plan ${isCompanion ? "companion" : "hook"} change` : `Write ${isCompanion ? "companion" : "hook"} code`;
+    }
+    case "withdrawal":
+      return "Withdraw fix";
+    case "compaction":
+      return "Compact on-read amendment";
+  }
 }
+
+/** The guidance a diagnosis rests on: each cited source once, by its last two path segments, with every place cited in it. */
+function renderGrounds({ citations, search }: CandidateDiagnosis): string {
+  if (search) return `<p><b>Searched:</b> ${escapeHtml(search.terms.join(", "))} · matches: ${escapeHtml(search.matches.join(", ") || "none")}</p>`;
+  const places = new Map<string, string[]>();
+  for (const { source, lines, section } of citations) {
+    const span = lines && (lines.from === lines.to ? `L${lines.from}` : `L${lines.from}–${lines.to}`);
+    const place = [span, section !== undefined && `§ ${escapeHtml(section)}`].filter(Boolean).join(" ");
+    const cited = places.get(source) ?? [];
+    if (cited.length === 0) places.set(source, cited);
+    cited.push(place);
+  }
+  const sources = [...places].map(([source, cited]) => `<code>${escapeHtml(source.split(sep).slice(-2).join("/"))}</code> ${cited.join(", ")}`);
+  return `<p><b>Grounds:</b> ${sources.join("; ")}</p>`;
+}
+
+/**
+ * Model prose with its inline markup rendered: `code` spans, `**bold**` and
+ * `*italic*`. Emphasis must open and close on a letter, digit or code span, so
+ * globs such as `personas/*.md`, `*.test.*` or `**\/*.ts` stay literal. Code
+ * spans stand in as `\0n\0` while emphasis is matched, so bold may wrap one.
+ */
+function inline(text: string): string {
+  const codes: string[] = [];
+  // A literal NUL would collide with the placeholders; it is a control character no form prose needs, so it is dropped.
+  return escapeHtml(text.replaceAll("\0", ""))
+    .replace(CODE_SPAN, (span) => `\0${codes.push(`<code>${span.slice(1, -1)}</code>`) - 1}\0`)
+    .replace(BOLD, "<b>$1</b>")
+    .replace(ITALIC, "$1<i>$2</i>")
+    .replace(/\0(\d+)\0/g, (_, index: string) => codes[Number(index)]!);
+}
+
+const CODE_SPAN = /`[^`\n]+`/g;
+const BOLD = /\*\*(?=[\p{L}\p{N}\0])(.+?)(?<=[\p{L}\p{N}\0])\*\*/gu;
+const ITALIC = /(^|[\s([{"'“‘])\*(?=[\p{L}\p{N}\0])([^*]*?[\p{L}\p{N}\0])\*(?=$|[\s.,;:!?)\]}"'”’])/gu;
 
 /** Marks the whitespace of a preview line that the host's form would hide: `·` per space of an indent, a trailing run or a run of two or more, `→` per tab. */
 const markHiddenWhitespace = (line: string) => line.replace(/^ +| +$| {2,}/g, (run) => "·".repeat(run.length)).replace(/\t/g, "→");
@@ -869,6 +928,11 @@ function checkedCandidate(candidate: ReviewCandidate, context: PrepareContext): 
   if (!candidate || typeof candidate.gist !== "string" || !candidate.gist.trim() || !PRIORITIES.includes(candidate.priority) ||
       typeof candidate.remedy !== "string" || !candidate.remedy.trim() || !candidate.change || !OPERATIONS.includes(candidate.change.operation)) {
     throw new Error("each review candidate needs gist, priority, remedy and an exact change");
+  }
+  // The form already shows the gist bold; more than two bold phrases in the details stop standing out.
+  for (const [field, text] of [["remedy", candidate.remedy], ["diagnosis.explanation", candidate.diagnosis?.explanation], ["diagnosis.delta", candidate.diagnosis?.delta]]) {
+    const bolds = typeof text === "string" ? text.replace(CODE_SPAN, "\0").match(BOLD)?.length ?? 0 : 0;
+    if (bolds > 2) throw new Error(`\`${field}\` bolds ${bolds} phrases; bold at most two`);
   }
   if (candidate.evidence !== undefined && (!Array.isArray(candidate.evidence) || candidate.evidence.some((item) => !item ||
       typeof item.quote !== "string" || !item.quote.trim() || !Number.isInteger(item.count) || item.count < 1 ||
@@ -1084,8 +1148,8 @@ function proposalIdentity(candidate: ReviewCandidate, ledger: readonly LedgerRec
 /** The intent-stage preview: where the hook or companion change goes, its description, and what Apply authorises. */
 function intentPreview(target: HarnessTarget, fingerprint: string, intent: HarnessIntent, { cwd, agentDir }: PrepareContext): string {
   const dirs = harnessRootDirs(cwd, agentDir);
-  const where = target.root === "companion" ? `The companion extension \`${dirs.companion}\``
-    : `The ${HARNESS_ROOT_NAMES[target.root]} \`${join(dirs[target.root], hookPath(target, fingerprint))}\``;
+  const where = target.root === "companion" ? `The companion extension \`${tildePath(dirs.companion)}\``
+    : `The ${HARNESS_ROOT_NAMES[target.root]} \`${tildePath(join(dirs[target.root], hookPath(target, fingerprint)))}\``;
   return [
     `${where}:`, "", ...INTENT_LINES.map(([field, label]) => `${label}: ${intent[field].trim()}`), "",
     "Apply authorises drafting only: the drafted code and its check result are shown and asked again before any file is written.",
@@ -1110,9 +1174,9 @@ function codeStage(target: HarnessTarget, fingerprint: string, draft: Extract<Ch
   if (isCompanion) checkCompanionCommand(command);
   else checkHookCommand(command, root, files[0]!.path);
   const preview = [
-    ...files.flatMap(({ path, text }) => [`${existsSync(join(root, path)) ? "Replace" : "Create"} \`${join(root, path)}\` with:`, "", text, ""]),
+    ...files.flatMap(({ path, text }) => [`${existsSync(join(root, path)) ? "Replace" : "Create"} \`${tildePath(join(root, path))}\` with:`, "", text, ""]),
     `Check command: ${command}`, "Check result:", output, "",
-    `Apply writes this code and reruns the check in the foreground in \`${root}\`. A written ${isCompanion ? "companion file" : "hook"} acts only after omp restarts.`,
+    `Apply writes this code and reruns the check in the foreground in \`${tildePath(root)}\`. A written ${isCompanion ? "companion file" : "hook"} acts only after omp restarts.`,
   ].join("\n");
   // The Ask form collapses whitespace, so a carriage return would be written without ever being shown.
   if (preview.includes("\r")) throw new Error("the code or its check output holds a carriage return, which the Ask preview would not show; send it with `\\n` line ends only");
@@ -1188,7 +1252,7 @@ interface HookRemoval { target: HarnessTarget; fingerprint: string; root: string
 function removalStage({ target, root, file }: HookRemoval): { change: Extract<PreparedChange, { stage: "removal" }>; preview: string } {
   if (!existsSync(file)) throw new Error(`there is no hook file \`${file}\` to remove`);
   const preview = [
-    `Delete the ${HARNESS_ROOT_NAMES[target.root]} \`${file}\`, which holds:`, "", readFileSync(file, "utf8"), "",
+    `Delete the ${HARNESS_ROOT_NAMES[target.root]} \`${tildePath(file)}\`, which holds:`, "", readFileSync(file, "utf8"), "",
     "Apply lets the agent delete this file; the removal is recorded once it is gone. A removed hook stops acting only after omp restarts.",
   ].join("\n");
   return { change: { operation: "harness", stage: "removal", root, file }, preview };
@@ -1241,42 +1305,55 @@ function releasedReferences(dirs: RuleDirs, referencesDir: string, rule: Observe
 /** The deterministic human-readable preview of a protected change; every written byte of instruction content appears verbatim. */
 function renderPreview(skill: string, kind: ProposalKind, change: ProtectedChange): string {
   const of = `\`${skill}\` (${kind})`;
+  const path = "target" in change ? tildePath(change.target.path) : undefined;
   switch (change.operation) {
     case "on-read-append":
-      if (change.effect === "record") return `The on-read amendment \`${change.target.path}\` of ${of} already holds this section, so only the proposal ledger changes:\n\n${change.section}`;
+      if (change.effect === "record") return `The on-read amendment \`${path}\` of ${of} already holds this section, so only the proposal ledger changes:\n\n${change.section}`;
       return change.effect === "create"
-        ? `Create the on-read amendment \`${change.target.path}\` of ${of} with this section:\n\n${change.section}`
-        : `Append this section to the on-read amendment \`${change.target.path}\` of ${of}:\n\n${change.section}`;
+        ? `Create the on-read amendment \`${path}\` of ${of} with this section:\n\n${change.section}`
+        : `Append this section to the on-read amendment \`${path}\` of ${of}:\n\n${change.section}`;
     case "rule": {
-      const samples = (items: readonly Sample[]) => items.map((item) => `- ${JSON.stringify(item)}`).join("\n");
+      // Samples feed only the replay check and are never written, so a long one is cut rather than shown whole.
+      const samples = (items: readonly Sample[]) => items.map((item) => {
+        const line = `- ${JSON.stringify(item)}`;
+        return line.length > SAMPLE_LINE_LIMIT ? `${line.slice(0, SAMPLE_LINE_LIMIT - 1)}…` : line;
+      }).join("\n");
       return [
-        `${change.target.sha256 === null ? "Write" : "Rewrite"} the ${isPinKind(kind) ? "pattern amendment" : "barrier rule"} \`${change.rule.name}\` at \`${change.target.path}\` for ${of}${change.replaces ? `, replacing fix \`${change.replaces.fingerprint}\` (${change.replaces.gist}), which goes out of force` : ""}.`,
+        `${change.target.sha256 === null ? "Write" : "Rewrite"} the ${isPinKind(kind) ? "pattern amendment" : "barrier rule"} \`${change.rule.name}\` at \`${path}\` for ${of}${change.replaces ? `, replacing fix \`${change.replaces.fingerprint}\` (${change.replaces.gist}), which goes out of force` : ""}.`,
         `Scope: ${change.rule.scope}`, `Pattern: ${change.rule.condition}`, `Matches:\n${samples(change.matches)}`, `Spares:\n${samples(change.spares)}`,
         "", change.body,
       ].join("\n");
     }
     case "stale-update":
-      return `Update the stale amendment \`${change.rule.name}\` at \`${change.target.path}\` of ${of}, pinned to the skill as installed now. New body:\n\n${change.body}${renderReferences(change.references)}`;
+      return `Update the stale amendment \`${change.rule.name}\` at \`${path}\` of ${of}, pinned to the skill as installed now. New body:\n\n${change.body}${renderReferences(change.references)}`;
     case "stale-delete":
-      return `Delete the stale amendment \`${change.rule.name}\` at \`${change.target.path}\` of ${of}; the fixes it holds go out of force.${renderReferences(change.references)}`;
+      return `Delete the stale amendment \`${change.rule.name}\` at \`${path}\` of ${of}; the fixes it holds go out of force.${renderReferences(change.references)}`;
     case "withdrawal": {
       const fix = `Withdraw fix \`${change.withdrawn.fingerprint}\` (${change.withdrawn.gist}) of ${of}`;
       if (change.effect === "record") return `${fix}; its rule file is already gone, so only the proposal ledger changes.`;
-      if (change.effect === "delete") return `${fix}: delete \`${change.target.path}\`.${renderReferences(change.references)}`;
-      return `${fix}: rewrite \`${change.target.path}\` without it. New body:\n\n${change.body}${renderReferences(change.references)}`;
+      if (change.effect === "delete") return `${fix}: delete \`${path}\`.${renderReferences(change.references)}`;
+      return `${fix}: rewrite \`${path}\` without it. New body:\n\n${change.body}${renderReferences(change.references)}`;
     }
     case "compaction": {
       const includes = change.includes.length > 0 ? change.includes.map((fingerprint) => `\`${fingerprint}\``).join(", ") : "none";
-      return `Compact the on-read amendment \`${change.target.path}\` of ${of}, covering this pass's on-read fixes ${includes}. New body:\n\n${change.body}${renderReferences(change.references)}`;
+      return `Compact the on-read amendment \`${path}\` of ${of}, covering this pass's on-read fixes ${includes}. New body:\n\n${change.body}${renderReferences(change.references)}`;
     }
   }
 }
 
 function renderReferences(change: ReferenceChange | undefined): string {
   if (!change) return "";
-  const written = change.write.map(({ name, body }) => `\n\nReference file \`${join(change.folder, name)}\`:\n\n${body}`).join("");
-  const removed = change.remove.length > 0 ? `\n\nDeletes reference files ${change.remove.map((name) => `\`${join(change.folder, name)}\``).join(", ")}.` : "";
+  const written = change.write.map(({ name, body }) => `\n\nReference file \`${tildePath(join(change.folder, name))}\`:\n\n${body}`).join("");
+  const removed = change.remove.length > 0 ? `\n\nDeletes reference files ${change.remove.map((name) => `\`${tildePath(join(change.folder, name))}\``).join(", ")}.` : "";
   return `${written}${removed}`;
+}
+
+const SAMPLE_LINE_LIMIT = 200;
+
+/** A path a preview names, with the home directory shown as `~` so the dialog line stays short. */
+function tildePath(path: string): string {
+  const home = homedir();
+  return path === home || path.startsWith(`${home}${sep}`) ? `~${path.slice(home.length)}` : path;
 }
 
 function contentHash(proposal: PreparedProposal): string {
