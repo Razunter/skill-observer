@@ -177,6 +177,8 @@ interface BashResultDetails {
   /** Presence denotes an unfinished job/service rather than a foreground receipt. */
   async?: unknown;
   service?: unknown;
+  toolCommands?: { tool: string; mode: "help" | "execute"; exitCode: number }[];
+  trace?: { v: number; status?: number; script: string; units: { nodes: { k: string; res?: string; runs?: number }[] }[] };
 }
 
 /** Tool-result details, read according to `toolName`. */
@@ -310,7 +312,7 @@ export interface ToolDefinition<TParams, TDetails> {
   parameters: Schema;
   /** Approval tier; OMP defaults to `exec`. */
   approval?: "read" | "write" | "exec";
-  /** `essential` lists the tool top-level; OMP's default for extension tools, `discoverable`, mounts it as an `xd://` device. */
+  /** `essential` stays top-level; `discoverable` can be mounted as a shell command. */
   loadMode?: "essential" | "discoverable";
   /** Registered but left out of the active set until the extension calls `setActiveTools`. */
   defaultInactive?: boolean;
@@ -352,7 +354,7 @@ export interface ExtensionAPI {
   ): void;
   registerCommand(name: string, options: { description?: string; handler: CommandHandler }): void;
   registerTool<TParams, TDetails>(tool: ToolDefinition<TParams, TDetails>): void;
-  /** Names of the tools the model can call now, top-level and `xd://` devices alike. */
+  /** Enabled tool names, including tools mounted as shell commands. */
   getActiveTools(): string[];
   /** Every configured tool with its supplier, read from the host's registry at call time. */
   getAllTools(): ToolInfo[];

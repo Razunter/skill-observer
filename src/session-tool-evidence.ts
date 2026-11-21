@@ -3,7 +3,7 @@
  * call ID with their origin and branch position. Native records are the saved
  * transcript; hook records are this extension's copies of every call its tool
  * hooks see, which include calls the transcript does not show as its own, such
- * as nested `eval` calls and device dispatches. Records are kept as found,
+ * as nested `eval` calls and shell command dispatches. Records are kept as found,
  * contradictions included. The digest view, the strict completed-call lookup
  * and native placement each apply their own policy to them, and none is built
  * on another.
@@ -52,7 +52,7 @@ export interface SessionToolEvidence {
   /**
    * The branch as the session digest reads it: hook records become ordinary
    * messages in branch order, each call ID keeps its first request and first
-   * outcome whatever their origin, a device dispatch shows only its inner tool,
+   * outcome whatever their origin, pure tool dispatches show their inner tools,
    * and `eval` and parallel wrappers give way to the structured calls they
    * carry. Lossy on purpose, so never receipt evidence; executable source stays
    * opaque.
@@ -160,8 +160,16 @@ function projectDigestEntries(
   byPosition: readonly EntryRecords[],
   byId: ReadonlyMap<string, IdRecords>,
 ): SessionEntry[] {
+  const shellWrappers = new Set<string>();
+  for (const [id, records] of byId) {
+    const outer = records.results.find((result) => digestName(result.name) === "bash");
+    if (!outer) continue;
+    const command = records.calls.find((call) => digestName(call.name) === "bash")?.args.command;
+    if (isPureToolCommandRun(outer, command, byId)) shellWrappers.add(id);
+  }
   // A device dispatch runs its inner tool under the outer call's ID and that hook fires last, so the last hook name per ID is the leaf.
   const isDispatchLayer = (id: string, name: string) => {
+    if (name === "bash" && shellWrappers.has(id)) return true;
     const leaf = byId.get(id)?.calls.findLast((call) => call.origin === "hook")?.name;
     return leaf !== undefined && digestName(leaf) !== name;
   };
@@ -175,8 +183,10 @@ function projectDigestEntries(
       const use = item as { id?: string; toolCallId?: string; recipient_name?: string; parameters?: ToolArguments };
       const id = use.toolCallId ?? use.id;
       if (typeof use.recipient_name !== "string" || !id || requested.has(id)) return [];
+      const name = digestName(use.recipient_name);
+      if (isDispatchLayer(id, name)) return [];
       requested.add(id);
-      return [{ type: "toolCall", id, name: digestName(use.recipient_name), arguments: use.parameters }];
+      return [{ type: "toolCall", id, name, arguments: use.parameters }];
     });
   };
   const projectCall = (block: ContentBlock): ContentBlock[] => {
@@ -211,6 +221,32 @@ function projectDigestEntries(
     }
     if (message?.role === "toolResult") return [{ ...entry, type: "message", message: { ...message, toolName: digestName(message.toolName) } }];
     return [entry];
+  });
+}
+
+function isPureToolCommandRun(outer: ToolResultEvidence, command: unknown, byId: ReadonlyMap<string, IdRecords>): boolean {
+  const { toolCommands, trace } = outer.details ?? {};
+  if (!Array.isArray(toolCommands) || !toolCommands.length || trace?.v !== 1 ||
+      trace.status !== toolCommands.at(-1)?.exitCode || (trace.status !== 0) !== outer.isError ||
+      typeof command !== "string" || trace.script !== command || !Array.isArray(trace.units)) return false;
+  // shortcut: keep bash for possible redirects or expansions until the trace can rule out their effects.
+  if (/[<>`$*?\[~]|[@+!]\(/u.test(command)) return false;
+  let runs = 0;
+  for (const unit of trace.units) {
+    if (!Array.isArray(unit?.nodes)) return false;
+    for (const node of unit.nodes) {
+      if (node?.k === "and_or" || node?.k === "pipeline" || node?.k === "word") continue;
+      if (node?.k !== "simple" || node.res !== "device" || node.runs !== 1) return false;
+      runs++;
+    }
+  }
+  return runs === toolCommands.length && toolCommands.every((dispatch, index) => {
+    if (dispatch?.mode !== "execute" || typeof dispatch.tool !== "string" || ![0, 1].includes(dispatch.exitCode)) return false;
+    const inner = byId.get(`${outer.id}:cmd:${index}`);
+    const call = inner?.calls.find((record) => record.origin === "hook" && record.name === dispatch.tool);
+    if (!inner || !call) return false;
+    return inner.results.some((result) => result.origin === "hook" && result.name === dispatch.tool &&
+      result.position > call.position && result.position < outer.position && result.isError === (dispatch.exitCode !== 0));
   });
 }
 

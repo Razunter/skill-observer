@@ -673,6 +673,62 @@ describe("observation evidence boundaries", () => {
   });
   const device = { path: "xd://read", content: '{"path":"notes.md"}' };
 
+  it.each([
+    ["pure", "demo --value checked", ["device"], false, false, ["demo"]],
+    ["mixed", "demo --value checked; printf done", ["device", "intrinsic"], false, false, ["demo", "bash"]],
+    ["changed directory", "cd subdir && demo --value checked", ["device"], false, false, ["demo", "bash"]],
+    ["pathname expansion", "demo --value *.md", ["device"], false, false, ["demo", "bash"]],
+    ["extended pathname expansion", "demo --value @(a.md|b.md)", ["device"], false, false, ["demo", "bash"]],
+    ["redirected", "demo --value checked > out.txt", ["device"], false, false, ["demo", "bash"]],
+    ["failed", "demo --value checked", ["device"], true, true, ["demo"]],
+    ["shell failure", "! demo --value checked", ["device"], false, true, ["demo", "bash"]],
+    ["missing inner result", "demo --value checked", ["device"], undefined, false, ["bash"]],
+  ] as const)("counts shell command work in the digest without changing receipts: %s", (_, command, resolutions, innerError, shellError, tools) => {
+    const outer = { command };
+    const inner = { value: "checked" };
+    const child = "shell:cmd:0";
+    const shellResult = result("shell", "bash", shellError);
+    Object.assign(shellResult.message!, { details: {
+      toolCommands: [{ tool: "demo", mode: "execute", exitCode: innerError ? 1 : 0 }],
+      trace: { v: 1, status: shellError ? 1 : 0, script: command.replace("cd subdir && ", ""), units: [
+        { nodes: resolutions.map(res => ({ k: "simple", res, runs: 1 })) },
+      ] },
+    } });
+    const entries = [
+      hookCall("shell", "bash", outer), call("shell", "bash", outer),
+      ...(innerError === undefined ? [] : [hookCall(child, "demo", inner), hookResult(child, "demo", inner, innerError)]),
+      shellResult,
+    ];
+    expect(buildDigest(entries, env).toolExercises?.map(exercise => exercise.tool)).toEqual(tools);
+    const evidence = sessionToolEvidence(entries);
+    expect(evidence.completedCall("shell").result.origin).toBe("native");
+    expect(evidence.isNativeCall(child, "demo")).toBe(false);
+  });
+
+  it("does not list a pure bash dispatch as unfinished work inside a structured parallel call", () => {
+    const bash = { command: "demo --value checked" };
+    const demo = { value: "checked" };
+    const digest = buildDigest([
+      { type: "message", id: "prompt", message: { role: "user", content: "Do the work" } },
+      call("parallel", "multi_tool_use.parallel", { tool_uses: [
+        { toolCallId: "shell", recipient_name: "functions.bash", parameters: bash },
+        { toolCallId: "search", recipient_name: "functions.grep", parameters: { pattern: "example" } },
+        { toolCallId: "locate", recipient_name: "functions.find", parameters: { pattern: "*.md" } },
+      ] }),
+      hookCall("shell", "bash", bash),
+      hookCall("shell:cmd:0", "demo", demo), hookResult("shell:cmd:0", "demo", demo),
+      { type: "custom", customType: "skill-observer-tool-result", data: {
+        toolCallId: "shell", toolName: "bash", input: bash, isError: false, details: {
+          toolCommands: [{ tool: "demo", mode: "execute", exitCode: 0 }],
+          trace: { v: 1, status: 0, script: bash.command, units: [{ nodes: [{ k: "simple", res: "device", runs: 1 }] }] },
+        },
+      } },
+      result("search", "grep"),
+      result("locate", "find"),
+    ], env);
+    expect(digest.signals).toContainEqual(expect.objectContaining({ kind: "workflow", calls: ['grep "example" ok', 'find "*.md" ok', "demo ok"] }));
+  });
+
   it("projects native, hook, device, nested eval and parallel records into one chronology of leaf calls", () => {
     const digest = buildDigest([
       { type: "message", id: "prompt", message: { role: "user", content: "Do the work" } },

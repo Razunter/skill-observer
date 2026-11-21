@@ -11,6 +11,10 @@
 - The pass summary reports dismissed signals as one line, counted and grouped by reason, instead of listing them.
 - Proposal decisions and observations now share a profile-local SQLite database. Resolve records each accepted batch in one transaction. Reports do not write or consume state. A new recording within 30 days of being shown carries its prior shown date. Existing profiles must [run the migration](docs/setup.md#migrate-existing-observer-state) before using the upgraded extension. The script leaves the original JSONL files unchanged.
 
+### Fixed
+
+- The session digest shows only the inner tools when the records show that `bash` did no other work. It still shows mixed shell work. Approval receipts are unchanged.
+
 ## 0.3.0 - 2026-11-17
 
 ### Added
