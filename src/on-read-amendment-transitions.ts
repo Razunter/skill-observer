@@ -34,7 +34,7 @@ import {
 import { IN_FORCE_OUTCOMES, laterReoffer, type LedgerRecord, type ProposalKind, type SkillLedgerRecord, STALE_OUTCOMES } from "./ledger.js";
 import type { SessionEntry } from "./omp.js";
 import type { ProvenanceResolver } from "./provenance.js";
-import { type ApprovalEvidence, approvedChange, type ApprovedChange, approvedDirectEdit, TargetChangedError } from "./proposal-approval.js";
+import { type ApprovalEvidence, approvedChange, type ApprovedChange, TargetChangedError } from "./proposal-approval.js";
 import { type FixRule, publishFix } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, readReferenceFiles, type ReferenceFile, replaceReferenceFiles } from "./references.js";
 import { describeVerdict, type ReplayCase, type Verdict } from "./replay.js";
@@ -60,7 +60,7 @@ export interface ValidatedAnswer {
   fingerprint: string;
   fix?: FixRule;
   withdrawal?: WithdrawalChange;
-  directEdit?: string;
+  directEdit?: SkillLedgerRecord;
 }
 
 /** One call's answers that change rules and on-read amendments. */
@@ -85,8 +85,7 @@ export interface AmendmentResolution {
   /** In the order carried out. */
   records: SkillLedgerRecord[];
   /** In the order made. */
-  publications: Publication[];
-  directEdits: Map<SkillLedgerRecord, string>;
+  publications: Map<SkillLedgerRecord, Publication>;
   /** Answers that wrote and recorded nothing, each with the reason. */
   failures: string[];
   /** Whether a failure is an approval whose target changed since it was prepared. */
@@ -103,12 +102,15 @@ export interface AmendmentLedger {
   forRule(name: string): readonly LedgerRecord[];
 }
 
+type SkillIdentity = Pick<SkillLedgerRecord, "fingerprint" | "skill">;
+type ClaimSkill = (identities: readonly SkillIdentity[]) => string | undefined;
+
 interface ApprovedResolution {
   answers: readonly ValidatedAnswer[];
   stale: readonly StaleAnswer[];
   compactions: readonly CompactionAnswer[];
   result: AmendmentResolution;
-  resolve(eligible: ReadonlySet<ValidatedAnswer>, latest: AmendmentLedger): void;
+  prepare(eligible: ReadonlySet<ValidatedAnswer>, latest: AmendmentLedger, claim: ClaimSkill): () => void;
 }
 
 /** Capture compaction identity before any changes and check approvals again after replay. */
@@ -129,7 +131,7 @@ export function onReadAmendmentTransitions(invocation: AmendmentInvocation, cont
     replays: invocation.answers.map(({ fix }) => fix?.replay),
     settle(verdicts: readonly (Verdict | undefined)[], branch: readonly SessionEntry[], fresh = false): ApprovedResolution {
       const failures = [...compactionFailures];
-      const resolution: AmendmentResolution = { records: [], publications: [], directEdits: new Map(), failures, targetChanged, cleanup: [], deferred: [], approvals: [] };
+      const resolution: AmendmentResolution = { records: [], publications: new Map(), failures, targetChanged, cleanup: [], deferred: [], approvals: [] };
       const checked = <T>(items: readonly T[], approval: (item: T) => Approved | undefined, labelItem: (item: T) => string): Checked<T>[] =>
         items.flatMap((item) => {
           try {
@@ -144,8 +146,7 @@ export function onReadAmendmentTransitions(invocation: AmendmentInvocation, cont
         if (fresh && withdrawal) {
           throw new Error(`the ledger holds no applied fix under fingerprint \`${answer.fingerprint}\``);
         }
-        if (directEdit) approvedDirectEdit(answer.approval, branch);
-        else if (answer.approval) return approvedChange(answer, branch);
+        if (!directEdit && answer.approval) return approvedChange(answer, branch);
       }, ({ answer }) => label(answer));
       const stale = checked(invocation.stale, (answer) => {
         const approval = answer.action === "keep" ? undefined : approvedChange(answer, branch);
@@ -160,9 +161,15 @@ export function onReadAmendmentTransitions(invocation: AmendmentInvocation, cont
         stale: stale.map(({ item }) => item),
         compactions: compact.map(({ item }) => item.answer),
         result: resolution,
-        resolve(eligible, latest) {
+        prepare(eligible, latest, claim) {
           const answers = scheduleAnswers(approved.filter(({ item }) => eligible.has(item)), byAnswer, latest, context, failures);
-          carryOut(answers, stale, compact, latest, context, resolution);
+          const stalePlans = scheduleStale(stale, latest, context, claim, failures);
+          const compactPlans = compact.filter(({ item }) => {
+            const refusal = claim([item]);
+            if (refusal) failures.push(`compaction of \`${item.skill}\`: ${refusal}`);
+            return !refusal;
+          });
+          return () => carryOut(answers, stalePlans, compactPlans, context, resolution);
         },
       };
     },
@@ -221,14 +228,61 @@ interface ScheduledAnswer {
   fingerprint: string;
   fix?: FixRule;
   withdrawn?: Withdrawal;
-  directEdit?: string;
+  directEdit?: SkillLedgerRecord;
   approval?: Approved;
   verdict?: Verdict;
 }
 
+interface ScheduledStale extends Checked<StaleAnswer> {
+  rule: ObserverRule;
+  records: SkillLedgerRecord[];
+}
+
+function scheduleStale(
+  stale: readonly Checked<StaleAnswer>[], latest: AmendmentLedger, context: AmendmentContext,
+  claim: ClaimSkill, failures: string[],
+): ScheduledStale[] {
+  const { dirs, provenance, timestamp, sessionId } = context;
+  return stale.flatMap((checked): ScheduledStale[] => {
+    const { item: answer } = checked;
+    const label = `stale \`${answer.rule}\` (${answer.action})`;
+    let rule: ObserverRule;
+    let kind: PinKind;
+    try {
+      rule = staleRule(answer, dirs);
+      const { kind: current } = provenance.byName(rule.amends);
+      kind = isPinKind(current) ? current : "upstream";
+    } catch (error) {
+      failures.push(`${label}: ${(error as Error).message}`);
+      return [];
+    }
+    const records: SkillLedgerRecord[] = [{
+      fingerprint: rule.fingerprint, skill: rule.amends, kind, gist: rule.description,
+      outcome: STALE_OUTCOMES[answer.action], rule: rule.path, timestamp, sessionId,
+    }];
+    if (answer.action === "delete" && isOnReadAmendment(rule)) {
+      for (const fix of fixesInForce(latest, rule.name)) {
+        if (fix.fingerprint === rule.fingerprint) continue;
+        const { fingerprint, skill, kind, gist } = fix;
+        if (skill !== rule.amends) {
+          failures.push(`${label}: \`${fingerprint}\` belongs to another skill`);
+          return [];
+        }
+        records.push({ fingerprint, skill, kind, gist, outcome: "deleted", rule: rule.path, timestamp, sessionId });
+      }
+    }
+    const refusal = claim(records);
+    if (refusal) {
+      failures.push(`${label}: ${refusal}`);
+      return [];
+    }
+    return [{ ...checked, rule, records }];
+  });
+}
+
 function carryOut(
-  answers: readonly ScheduledAnswer[], stale: readonly Checked<StaleAnswer>[], compactions: readonly Checked<Compaction>[],
-  latest: AmendmentLedger, context: AmendmentContext, resolution: AmendmentResolution,
+  answers: readonly ScheduledAnswer[], stale: readonly ScheduledStale[], compactions: readonly Checked<Compaction>[],
+  context: AmendmentContext, resolution: AmendmentResolution,
 ): void {
   const { dirs, referencesDir, provenance, timestamp, sessionId } = context;
   const { records, publications, failures, cleanup, deferred, approvals } = resolution;
@@ -237,32 +291,19 @@ function carryOut(
   const staleChanged = new Set<string>();
   const withdrawalChanged = new Set<string>();
   // Stale answers go first, so this call's additions land on the body they leave, and an addition after a stale delete creates the amendment again.
-  for (const { item: answer, approval } of stale) {
-    const fixes = answer.action === "delete" ? fixesInForce(latest, answer.rule) : [];
+  for (const { item: answer, approval, rule, records: settled } of stale) {
     try {
-      const { rule, kind, cleanupFailure } = settleStale(answer, approval?.change, dirs, referencesDir, provenance);
+      // A preceding stale answer may already have changed or deleted this file.
+      const current = staleRule(answer, dirs);
+      if (current.path !== rule.path || current.fingerprint !== rule.fingerprint || current.amends !== rule.amends) {
+        throw new Error(`\`${answer.rule}\` changed identity before it could be settled`);
+      }
+      const cleanupFailure = settleStale(current, approval?.change, dirs, referencesDir, provenance);
       if (cleanupFailure) cleanup.push(`stale \`${answer.rule}\` (delete): ${cleanupFailure}`);
       if (approval) approvals.push(approval.evidence);
-      publications.push({ operation: `stale-${answer.action}`, skill: rule.amends, rule: rule.path, fingerprint: rule.fingerprint });
-      records.push({
-        fingerprint: rule.fingerprint,
-        skill: rule.amends,
-        kind,
-        gist: rule.description,
-        outcome: STALE_OUTCOMES[answer.action],
-        rule: rule.path,
-        timestamp,
-        sessionId,
-      });
-      if (!isOnReadAmendment(rule) || answer.action === "keep") continue;
-      staleChanged.add(rule.amends);
-      if (answer.action !== "delete") continue;
-      // The fixes inside go with the file, so an amendment created again under the same name doesn't bring them back.
-      for (const fix of fixes) {
-        if (fix.fingerprint === rule.fingerprint) continue;
-        const { fingerprint, skill, kind: fixKind, gist } = fix;
-        records.push({ fingerprint, skill, kind: fixKind, gist, outcome: "deleted", rule: rule.path, timestamp, sessionId });
-      }
+      publications.set(settled[0]!, { operation: `stale-${answer.action}`, skill: rule.amends, rule: rule.path, fingerprint: rule.fingerprint });
+      records.push(...settled);
+      if (isOnReadAmendment(rule) && answer.action !== "keep") staleChanged.add(rule.amends);
     } catch (error) {
       failures.push(`stale \`${answer.rule}\` (${answer.action}): ${(error as Error).message}`);
     }
@@ -275,6 +316,7 @@ function carryOut(
   for (const { answer, fingerprint, fix, directEdit, withdrawn, verdict, approval } of order) {
     let outcome = answer.outcome;
     let rule: string | undefined;
+    let publication: Publication | undefined;
     if (verdict && verdict.verdict !== "passed") {
       // Nothing unchecked reaches disk: the answer comes back as a Later entry at a pass where the check passes.
       deferred.push(`${label(answer)}: ${describeVerdict(verdict)}`);
@@ -289,7 +331,7 @@ function carryOut(
         continue;
       }
       // A section the amendment already held changed no file, so it is no publication.
-      if (written) publications.push({ operation: fix.section ? "on-read-append" : "rule", skill: answer.skill, rule, fingerprint });
+      if (written) publication = { operation: fix.section ? "on-read-append" : "rule", skill: answer.skill, rule, fingerprint };
       // The fix whose rule this one overwrote, of the same skill, goes out of force; its rule's description is its gist.
       if (fix.replaces) {
         const { fingerprint: replaced, gist: replacedGist } = fix.replaces;
@@ -313,7 +355,7 @@ function carryOut(
             const cleanupFailure = deleteRule(file, withdrawn.released === true, dirs, referencesDir);
             if (cleanupFailure) cleanup.push(`${label(answer)}: ${cleanupFailure}`);
           }
-          publications.push({ operation: "withdrawal", skill: file.amends, rule: file.path, fingerprint });
+          publication = { operation: "withdrawal", skill: file.amends, rule: file.path, fingerprint };
         }
         if (file && isOnReadAmendment(file)) withdrawalChanged.add(file.amends);
         if (approval) approvals.push(approval.evidence);
@@ -326,7 +368,7 @@ function carryOut(
     // A withdrawal is recorded as the fix it takes back was, so the ledger keeps one skill, kind and gist per fingerprint.
     const { skill, kind, gist } = withdrawn?.record ?? answer;
     const { evidence } = answer;
-    const record: SkillLedgerRecord = {
+    const record: SkillLedgerRecord = directEdit ?? {
       fingerprint,
       skill,
       kind,
@@ -339,7 +381,7 @@ function carryOut(
       sessionId,
     };
     records.push(record);
-    if (directEdit !== undefined) resolution.directEdits.set(record, directEdit);
+    if (publication) publications.set(record, publication);
     if (fix?.section && outcome === "applied") additions.push(record);
   }
 
@@ -372,9 +414,10 @@ function carryOut(
         failures.push(`compaction of \`${skill}\`: ${(error as Error).message}`);
         continue;
       }
-      publications.push({ operation: "compaction", skill, rule, fingerprint });
     }
-    records.push({ fingerprint, skill, kind, gist, outcome, ...(rule && { rule }), compaction: true, timestamp, sessionId });
+    const record: SkillLedgerRecord = { fingerprint, skill, kind, gist, outcome, ...(rule && { rule }), compaction: true, timestamp, sessionId };
+    records.push(record);
+    if (rule) publications.set(record, { operation: "compaction", skill, rule, fingerprint });
   }
 }
 
@@ -516,33 +559,25 @@ function compaction(answer: CompactionAnswer, branch: readonly SessionEntry[], a
 }
 
 /**
- * Re-pins a stale amendment rule, or rewrites or deletes it as `change`, the
- * alternative the user approved, prepared it, and returns the rule as it was,
- * with what it is pinned to. Deleting a skill's on-read amendment deletes its
- * reference files, and a failure to, once the rule is gone, comes back as
- * `cleanupFailure`; an update of it that carries reference files replaces them.
+ * Re-pins a stale amendment, or rewrites or deletes it as the approved `change`
+ * prepared it. Returns a reference cleanup failure after deleting the rule.
  */
 function settleStale(
-  answer: StaleAnswer,
+  rule: ObserverRule,
   change: ApprovedChange | undefined,
   dirs: RuleDirs,
   referencesDir: string,
   provenance: ProvenanceResolver,
-): { rule: ObserverRule; kind: PinKind; cleanupFailure?: string } {
-  const rule = staleRule(answer, dirs);
-  const { kind: current } = provenance.byName(rule.amends);
-  // shortcut: a skill that left the upstream and plugin kinds is recorded as upstream; read the ledger's kind if that ever matters.
-  const kind: PinKind = isPinKind(current) ? current : "upstream";
+): string | undefined {
   if (change?.operation === "stale-delete") {
-    const cleanupFailure = deleteRule(rule, change.references !== undefined, dirs, referencesDir);
-    return { rule, kind, ...(cleanupFailure && { cleanupFailure }) };
+    return deleteRule(rule, change.references !== undefined, dirs, referencesDir);
   }
   const body = change?.operation === "stale-update" ? change.body : undefined;
   const references = change?.operation === "stale-update" ? change.references : undefined;
   const writeBody = () => repinAmendmentRule(rule, provenance, body);
   if (references) replaceReferenceFiles(referencesDir, rule.amends, references.write, writeBody);
   else writeBody();
-  return { rule, kind };
+  return undefined;
 }
 
 function staleRule(answer: StaleAnswer, dirs: RuleDirs): ObserverRule {

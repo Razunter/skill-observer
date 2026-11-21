@@ -10,7 +10,7 @@ import { registerResolveTool } from "../src/resolve.js";
 import { registerReviewTool } from "../src/review.js";
 import { OBSERVATION_MESSAGE_TYPE } from "../src/digest.js";
 import type { AskDetails, ExtensionAPI, ExtensionContext, Schema, SessionEntry, ToolDefinition, ToolResultDetails } from "../src/omp.js";
-import { type Evidence, harnessFingerprint, type HarnessLedgerRecord, putLedgerRecords, readLedger, type LedgerRecord } from "../src/ledger.js";
+import { type Evidence, harnessFingerprint, hookFileKey, projectFingerprint, proposalFingerprint, putLedgerRecords, readLedger, removalFingerprint, type HarnessLedgerRecord, type LedgerRecord } from "../src/ledger.js";
 import { readObserverStore, writeObserverStore } from "../src/observer-store.js";
 import { markObservationsShown, readPendingObservations, recordObservation } from "../src/observations.js";
 import * as amendments from "../src/amendments.js";
@@ -113,6 +113,31 @@ function fixture() {
   };
   return { files, roots, run, add, approve, withdraw, compaction, saveTool, branch: () => branch };
 }
+
+async function publishDirectEdit(f: ReturnType<typeof fixture>) {
+  const skill = "ce-commit-jj";
+  const gist = "Edit the commit skill";
+  const [approval] = await f.approve([{
+    kind: "local", skill, gist, priority: "evidence", remedy: "Fix",
+    change: { operation: "direct-edit", preview: "+ Use jj." },
+  }]);
+  const path = join(f.roots.skillsDir, skill, "SKILL.md");
+  const content = `${readFileSync(path, "utf8")}\nUse jj.\n`;
+  writeFileSync(path, content);
+  f.saveTool("edit-skill", "write", { path, content });
+  return { path, content, outcome: { kind: "local", skill, gist, outcome: "applied", approval, publication: { writeToolCallId: "edit-skill" } } };
+}
+
+function publishProjectEdit(f: ReturnType<typeof fixture>) {
+  const target = { scope: "project", root: f.roots.cwd, path: "config.txt", mechanism: "configure build" } as const;
+  const path = join(target.root, target.path);
+  const content = "new config\n";
+  writeFileSync(path, content);
+  f.saveTool("write-config", "write", { path, content });
+  f.saveTool("check-config", "bash", { command: "cat config.txt", cwd: f.roots.cwd }, { exitCode: 0 });
+  return { path, outcome: { kind: "project", target, gist: "Update config", outcome: "applied",
+    publication: { writeToolCallId: "write-config", checkToolCallIds: ["check-config"], afterHash: createHash("sha256").update(content).digest("hex") } } };
+}
 const toolCall = (id: string, name: string, args: Record<string, unknown>): SessionEntry =>
   ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } });
 it("refuses Resolve on an unmigrated profile even when its legacy proposal ledger is empty", async () => {
@@ -198,9 +223,14 @@ it("rechecks affected decisions after replay without refusing independent answer
     evidence: [{ quote: "Hook no longer needed", count: 1 }],
   }]);
   rmSync(hook);
+  const direct = await publishDirectEdit(f);
+  const project = publishProjectEdit(f);
+  const directFingerprint = proposalFingerprint(direct.outcome.skill, direct.outcome.gist);
+  const scopedFingerprint = projectFingerprint(project.outcome.target);
   vi.stubEnv("PATH", "");
   const pending = f.run({ outcomes: [
     ...outcomes,
+    direct.outcome, project.outcome,
     { kind: "harness", outcome: "applied", approval: removal },
     { skill: "ce-commit-jj", kind: "local", gist: "Commit with jj", outcome: "applied", approval: barrier },
     { skill: "tdd", kind: "upstream", gist: "Wrong owner", fingerprint: "claimed", outcome: "later" },
@@ -215,6 +245,8 @@ it("rechecks affected decisions after replay without refusing independent answer
     other("applied", { outcome: "applied" }),
     other("evidence", { evidence: newEvidence }),
     lateHook,
+    other(directFingerprint, { evidence: oldEvidence }),
+    other(scopedFingerprint, { evidence: oldEvidence }),
   ];
   const writer = spawnSync(process.execPath, ["--no-env-file", "-e", `
     import { putLedgerRecords } from "./src/ledger.ts";
@@ -227,8 +259,14 @@ it("rechecks affected decisions after replay without refusing independent answer
   expect(result.details.failures).toEqual(expect.arrayContaining([
     expect.stringContaining("belongs to another skill"), expect.stringContaining("also holds `dependent`"),
   ]));
-  expect(result.details.failures).toHaveLength(2);
   expect(result.details.deferred).toHaveLength(1);
+  const text = result.content[0]!.text;
+  expect(text).toMatch(/Unrecorded publication[\s\S]*belongs to another/);
+  expect(text).toContain(`\`${direct.path}\``);
+  expect(text).toContain(`\`${project.path}\``);
+  expect(text).toMatch(/Don.t call `observer_resolve` again[\s\S]*redo/);
+  expect(result.details.failures).toHaveLength(4);
+  expect(readFileSync(direct.path, "utf8")).toBe(direct.content);
   expect(result.content[0]?.text).toContain("1 Decline(s) of a fix in force");
   expect(result.details.records).toMatchObject([
     { fingerprint: existingHook.fingerprint, outcome: "withdrawn" }, { fingerprint: lateHook.fingerprint, outcome: "withdrawn" },
@@ -238,13 +276,38 @@ it("rechecks affected decisions after replay without refusing independent answer
   expect(result.details.recording.rows).toEqual(["recorded", "recorded", "recorded", "recorded", "recorded"]);
   expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")?.body).toContain("First fix");
   const final = readLedger(file);
+  for (const fingerprint of [scopedFingerprint, directFingerprint]) {
+    expect(final.find((record) => record.fingerprint === fingerprint)).toMatchObject({ skill: "tdd", evidence: oldEvidence });
+  }
   expect(final.find(({ fingerprint }) => fingerprint === outsideHook.fingerprint)).toMatchObject({ outcome: "applied" });
-  expect(final.slice(-7)).toMatchObject([
+  expect(final.slice(-9)).toMatchObject([
     { fingerprint: "claimed", skill: "domain-modeling" }, { fingerprint: "applied", outcome: "applied" },
+    { fingerprint: directFingerprint }, { fingerprint: scopedFingerprint },
     { fingerprint: existingHook.fingerprint, outcome: "withdrawn" }, { fingerprint: lateHook.fingerprint, outcome: "withdrawn" },
     { gist: "Commit with jj", outcome: "later" }, { fingerprint: "evidence", evidence: newEvidence },
     { gist: "Independent", outcome: "declined" },
   ]);
+});
+
+it("refuses a claimed hook removal identity without reporting the absent hook as published", async () => {
+  const f = fixture();
+  const target = { scope: "harness", root: "project-hooks", project: f.roots.cwd, path: "fixture.ts", mechanism: "Remove hook" } as const;
+  const dir = join(f.roots.cwd, ".omp/hooks/pre");
+  const path = join(dir, target.path);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path, "export default function () {}\n");
+  const [approval] = await f.approve([{
+    kind: "harness", target, gist: "Remove hook", priority: "evidence", remedy: "Retire fixture hook",
+    change: { operation: "harness", stage: "removal" }, evidence: [{ quote: "Hook no longer needed", count: 1 }],
+  }]);
+  // A missing file can support recording an approved removal, not prove who removed it.
+  rmSync(path);
+  const fingerprint = removalFingerprint(hookFileKey(target, "")!);
+  const claim = { skill: "tdd", kind: "upstream", gist: "Bind the fingerprint", outcome: "later", fingerprint };
+  const result = await f.run({ outcomes: [claim, { kind: "harness", outcome: "applied", approval }] });
+  expect(result.details.failures).toEqual([expect.stringContaining("belongs to another target")]);
+  expect(readLedger(f.files.storeFile())).toMatchObject([claim]);
+  expect(result.content[0]?.text).not.toContain("Unrecorded publication");
 });
 /** Writes half the data to a rule file, as a full disk would, then fails. */
 function failRuleWriteMidway(rulesDir: string) {
@@ -449,6 +512,25 @@ it("rolls back a deletion's record and all its generated records without restori
   expect(existsSync(`${file}-journal`)).toBe(false);
 });
 
+it("reports the current withdrawal path when commit fails without changing the saved historical path", async () => {
+  const f = fixture();
+  await f.add("first");
+  const file = f.files.storeFile();
+  const [record] = readLedger(file);
+  if (!record?.rule) throw new Error("missing applied rule");
+  const actual = record.rule;
+  const historical = join(f.files.rulesDir(), basename(actual));
+  writeObserverStore(file, new Date(), (db) => putLedgerRecords(db, [{ ...record, rule: historical }]));
+  const outcomes = await f.withdraw(readLedger(file), () => ({ body: "" }));
+  const result = await withReadLock(file, () => f.run({ outcomes }));
+  expect(existsSync(actual)).toBe(false);
+  expect(result.details.records).toMatchObject([{ outcome: "withdrawn", rule: historical }]);
+  expect(readLedger(file)).toMatchObject([{ outcome: "applied", rule: historical }]);
+  expect(result.content[0]?.text).toContain(`\`${actual}\``);
+  expect(result.content[0]?.text).toContain("Unrecorded publication");
+  expect(result.content[0]?.text).not.toContain("Wrote nothing");
+});
+
 it.each(["corrupt", "locked", "writer locked"])("reports a verified external publication but makes no rule changes on a %s store", async (fault) => {
   const f = fixture();
   const file = f.files.storeFile();
@@ -518,6 +600,27 @@ it("keeps a rolled-back compaction's failure and reference files when the ledger
   expect(readdirSync(join(f.files.referencesDir(), "tdd"))).toEqual(["old.md"]);
   expect(result.details.publications).toEqual([]);
   expect(result.details.recording.rows).toEqual(["unrecorded"]);
+});
+
+it.each(["unreadable", "other skill"])("leaves a compaction's body and references unchanged when its fingerprint is %s", async fault => {
+  const f = fixture();
+  await f.add("first");
+  const file = f.files.storeFile();
+  const amendment = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!;
+  const before = readFileSync(amendment.path);
+  replaceReferenceFiles(f.files.referencesDir(), "tdd", [{ name: "old.md", body: "Original bytes" }]);
+  const [approval] = await f.approve([f.compaction("Compacted body", [])]);
+  const fingerprint = amendments.compactionFingerprint("tdd", amendment.body);
+  const claim = { skill: "domain-modeling", kind: "upstream", gist: "Other skill", fingerprint, outcome: "later" };
+  await f.run({ outcomes: [claim] });
+  if (fault === "unreadable") writeObserverStore(file, new Date(), (db) =>
+    db.query("UPDATE proposals SET record = '{' WHERE fingerprint = ?").run(fingerprint));
+  const result = await f.run({ outcomes: [], compactions: [{ skill: "tdd", outcome: "applied", approval }] });
+  expect(result.isError).toBe(true);
+  expect(result.details.publications).toEqual([]);
+  expect(readFileSync(amendment.path)).toEqual(before);
+  expect(readFileSync(join(f.files.referencesDir(), "tdd", "old.md"), "utf8")).toBe("Original bytes\n");
+  if (fault === "other skill") expect(readLedger(file).at(-1)).toMatchObject(claim);
 });
 it("lists a Later replay deferral and a Decline apart from the unrecorded publication when the ledger commit fails", async () => {
   const f = fixture();
@@ -594,6 +697,42 @@ it("re-pins a stale Keep from the file's own bytes, leaving body and reference b
   expect(readFileSync(reference)).toEqual(referenceBefore);
   expect(amendments.findStaleAmendments(dirs, createProvenanceResolver(f.roots))).toEqual([]);
   expect(readLedger(f.files.storeFile())).toMatchObject([{ fingerprint: "fp-tdd", skill: "tdd", kind: "upstream", outcome: "kept", rule: path }]);
+});
+
+it.each(["unreadable", "other skill", "same batch"])("does not re-pin a stale amendment when the fingerprint is %s", async fault => {
+  const f = fixture();
+  const { path } = staleAmendment(f.files);
+  const before = readFileSync(path);
+  const claim = { skill: "domain-modeling", kind: "upstream", gist: "Other skill", fingerprint: "fp-tdd", outcome: "later" };
+  if (fault !== "same batch") await f.run({ outcomes: [claim] });
+  if (fault === "unreadable") {
+    writeObserverStore(f.files.storeFile(), new Date(), (db) => db.run("UPDATE proposals SET record = '{' WHERE fingerprint = 'fp-tdd'"));
+  }
+  const result = await f.run({ outcomes: fault === "same batch" ? [claim] : [], stale: [{ rule: "tdd-amendment", action: "keep" }] });
+  expect(result.isError).toBe(true);
+  expect(readFileSync(path)).toEqual(before);
+  expect(result.details.publications).toEqual([]);
+  if (fault !== "unreadable") expect(readLedger(f.files.storeFile())).toMatchObject([claim]);
+});
+
+it("reports a verified direct edit when a withdrawal dependency cannot be decoded", async () => {
+  const f = fixture();
+  await f.add("first");
+  const file = f.files.storeFile();
+  const [record] = readLedger(file);
+  if (record?.kind !== "upstream" || !record.rule) throw new Error("missing amendment");
+  const outcomes = await f.withdraw([record], () => ({ body: "" }));
+  const direct = await publishDirectEdit(f);
+  writeObserverStore(file, new Date(), (db) => {
+    putLedgerRecords(db, [{ ...record, fingerprint: "dependent" }]);
+    db.run("UPDATE proposals SET record = '{' WHERE fingerprint = 'dependent'");
+  });
+  const result = await f.run({ outcomes: [...outcomes, direct.outcome] });
+  expect(result.details.recording.error).toBeTruthy();
+  expect(result.content[0]?.text).toMatch(/Unrecorded publication[\s\S]*SKILL\.md/);
+  expect(result.content[0]?.text).toContain(`\`${direct.path}\``);
+  expect(existsSync(record.rule)).toBe(true);
+  expect(readFileSync(direct.path, "utf8")).toBe(direct.content);
 });
 it.each([
   ["a body", { body: "## Seams\n\nRewritten." }],
