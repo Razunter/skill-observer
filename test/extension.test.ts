@@ -7416,7 +7416,10 @@ describe("observations", () => {
     vi.setSystemTime(T0);
     const host = loadExtension();
     const file = host.observationsFile;
-    const remarks = Array.from({ length: 80 }, (_, i) => `Observation ${i} ${"keeps a comparable amount of evidence ".repeat(10)}end`);
+    // Four-byte characters fill SQLite pages without more writes or exceeding the observation limit.
+    const evidence = "💬".repeat(480);
+    const remarks = Array.from({ length: 8 }, (_, i) => `Observation ${i} ${evidence}`);
+    const date = today();
     const samples = [];
     for (let cycle = 1; cycle <= 3; cycle++) {
       for (const text of remarks) {
@@ -7425,27 +7428,32 @@ describe("observations", () => {
       }
       const recorded = storeBytes(file);
       await host.runCommand("observe");
-      expect(observationLines(host, cycle)).toHaveLength(remarks.length);
+      const recurrence = cycle === 1 ? "" : `; recorded again after being shown on ${date}`;
+      expect(observationLines(host, cycle)).toEqual(remarks.map((text) => `- ${text} (count 2, last recorded ${date}${recurrence})`));
       const shown = storeBytes(file);
       expect(storedObservationCount(file)).toBe(remarks.length);
-      expect(readFileSync(file).includes(remarks[0]!)).toBe(false);
+      const acknowledged = readFileSync(file);
+      for (const text of remarks) expect(acknowledged.includes(text)).toBe(false);
       samples.push({ recorded, shown });
     }
-    await host.callTool("observe", { text: "Unshown expired observation" });
+    for (let i = 0; i < 4; i++) {
+      expect((await host.callTool("observe", { text: `Unshown expired ${i} ${evidence}` })).isError).toBeFalsy();
+    }
     vi.setSystemTime(T0 + 30 * DAY);
     host.setBranch(fx.plainUserMessage);
     const beforePrune = readFileSync(file);
     await host.runCommand("observe-report");
     expect(host.notices.at(-1)).toBe("No skill evidence on this branch.");
     expect(readFileSync(file)).toEqual(beforePrune);
+    const reported = storeBytes(file);
     const otherProject = join(host.skillHome.home, "other-project");
     mkdirSync(otherProject);
     host.setCwd(otherProject);
-    await host.callTool("observe", { text: "Current observation" });
+    expect((await host.callTool("observe", { text: "Current observation" })).isError).toBeFalsy();
     const pruned = storeBytes(file);
     expect(storedObservationCount(file)).toBe(1);
     expect(pruned["observer.sqlite"]).toBeLessThan(beforePrune.length);
-    for (const sample of [...samples.flatMap(({ recorded, shown }) => [recorded, shown]), pruned]) {
+    for (const sample of [...samples.flatMap(({ recorded, shown }) => [recorded, shown]), reported, pruned]) {
       expect(Object.entries(sample).filter(([name]) => name !== "observer.sqlite").map(([, bytes]) => bytes)).toEqual([0, 0, 0]);
     }
     console.info("Observation churn bytes", JSON.stringify({ samples, beforePrune: beforePrune.length, pruned }));
