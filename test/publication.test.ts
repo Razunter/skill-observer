@@ -1,4 +1,5 @@
 import { Database } from "bun:sqlite";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { PathLike } from "node:fs";
@@ -9,7 +10,7 @@ import { registerResolveTool } from "../src/resolve.js";
 import { registerReviewTool } from "../src/review.js";
 import { OBSERVATION_MESSAGE_TYPE } from "../src/digest.js";
 import type { AskDetails, ExtensionAPI, ExtensionContext, Schema, SessionEntry, ToolDefinition, ToolResultDetails } from "../src/omp.js";
-import { type Evidence, readLedger, type LedgerRecord } from "../src/ledger.js";
+import { type Evidence, harnessFingerprint, type HarnessLedgerRecord, putLedgerRecords, readLedger, type LedgerRecord } from "../src/ledger.js";
 import { readObserverStore, writeObserverStore } from "../src/observer-store.js";
 import { markObservationsShown, readPendingObservations, recordObservation } from "../src/observations.js";
 import * as amendments from "../src/amendments.js";
@@ -122,6 +123,15 @@ it("refuses Resolve on an unmigrated profile even when its legacy proposal ledge
   expect(result.content[0]?.text).toContain("scripts/migrate-observer-store.ts");
   expect(existsSync(f.files.storeFile())).toBe(false);
 });
+it("does not initialize a fresh store for an empty or refused Resolve", async () => {
+  const f = fixture();
+  const empty = await f.run({ outcomes: [] });
+  expect(empty.isError).toBe(false);
+  const refused = await f.run({ outcomes: [], stale: [{ rule: "missing-amendment", action: "keep" }] });
+  expect(refused.details.failures).toEqual([expect.stringContaining("no rule named")]);
+  expect(refused.details.records).toEqual([]);
+  expect(existsSync(f.files.storeFile())).toBe(false);
+});
 it.each(["later", "declined"])("binds an existing fingerprint to its skill for %s while accepting a reworded gist", async outcome => {
   const f = fixture(); await f.add("first");
   const original = readLedger(f.files.storeFile())[0]!;
@@ -149,6 +159,92 @@ it("lets a later skill claim a fingerprint whose first claimant failed validatio
   ] });
   expect(result.details.failures).toHaveLength(1);
   expect(readLedger(f.files.storeFile())).toMatchObject([{ fingerprint: "shared", skill: "domain-modeling", outcome: "later" }]);
+});
+it("rechecks affected decisions after replay without refusing independent answers", async () => {
+  const f = fixture();
+  await f.add("First fix");
+  const file = f.files.storeFile();
+  const [first] = readLedger(file);
+  if (!first || first.kind === "project" || first.kind === "harness") throw new Error("missing applied skill fix");
+  const other = (fingerprint: string, fields: Partial<typeof first> = {}): typeof first =>
+    ({ ...first, fingerprint, gist: fingerprint, rule: undefined, outcome: "later", ...fields });
+  const oldEvidence = [{ quote: "before replay", count: 1 }];
+  const newEvidence = [{ quote: "during replay", count: 2 }];
+  const hookDir = join(f.roots.cwd, ".omp/hooks/pre");
+  const hook = join(hookDir, "fixture.ts");
+  mkdirSync(hookDir, { recursive: true });
+  writeFileSync(hook, "export default function () {}\n");
+  const hookDecision = (project: string, mechanism: string): HarnessLedgerRecord => {
+    const target = { scope: "harness", root: "project-hooks", project, path: "fixture.ts", mechanism } as const;
+    return { kind: "harness", target, fingerprint: harnessFingerprint(target), gist: mechanism, outcome: "applied", timestamp: first.timestamp, sessionId: first.sessionId };
+  };
+  const existingHook = hookDecision(f.roots.cwd, "First hook decision");
+  const lateHook = hookDecision(f.roots.cwd, "Second hook decision");
+  const outsideHook = hookDecision(join(f.roots.cwd, "..", "another"), "Different project");
+  writeObserverStore(file, new Date(), (db) => putLedgerRecords(db, [
+    other("evidence", { evidence: oldEvidence }),
+    existingHook, outsideHook,
+    ...Array.from({ length: 64 }, (_, i) => other(`unrelated-${i}`, { rule: `/old/other-${i}.md` })),
+  ]));
+  const outcomes = await f.withdraw([first], () => ({ body: "" }));
+  const [barrier] = await f.approve([{
+    kind: "local", skill: "ce-commit-jj", gist: "Commit with jj", priority: "evidence", remedy: "Fix",
+    change: { operation: "rule", name: "jj-not-git", body: "Use jj.", pattern: "\\bgit commit\\b", scope: "tool:bash",
+      matches: [{ command: "git commit -m x" }], spares: [{ command: "jj commit -m x" }] },
+  }]);
+  const [removal] = await f.approve([{
+    kind: "harness", target: { scope: "harness", root: "project-hooks", path: basename(hook), mechanism: "Remove hook" },
+    gist: "Remove hook", priority: "evidence", remedy: "Retire fixture hook", change: { operation: "harness", stage: "removal" },
+    evidence: [{ quote: "Hook no longer needed", count: 1 }],
+  }]);
+  rmSync(hook);
+  vi.stubEnv("PATH", "");
+  const pending = f.run({ outcomes: [
+    ...outcomes,
+    { kind: "harness", outcome: "applied", approval: removal },
+    { skill: "ce-commit-jj", kind: "local", gist: "Commit with jj", outcome: "applied", approval: barrier },
+    { skill: "tdd", kind: "upstream", gist: "Wrong owner", fingerprint: "claimed", outcome: "later" },
+    { skill: "tdd", kind: "upstream", gist: "Keep applied", fingerprint: "applied", outcome: "declined" },
+    { skill: "tdd", kind: "upstream", gist: "Reuse fresh evidence", fingerprint: "evidence", outcome: "later" },
+    { skill: "tdd", kind: "upstream", gist: "Independent", outcome: "declined" },
+  ] });
+  // A separate process must be able to commit while Resolve is waiting on replay.
+  const concurrent = [
+    other("dependent", { outcome: "applied", rule: `/previous/location/${basename(first.rule!)}` }),
+    other("claimed", { skill: "domain-modeling" }),
+    other("applied", { outcome: "applied" }),
+    other("evidence", { evidence: newEvidence }),
+    lateHook,
+  ];
+  const writer = spawnSync(process.execPath, ["--no-env-file", "-e", `
+    import { putLedgerRecords } from "./src/ledger.ts";
+    import { writeObserverStore } from "./src/observer-store.ts";
+    const [file, rows] = process.argv.slice(1);
+    writeObserverStore(file, new Date(), (db) => putLedgerRecords(db, JSON.parse(rows)));
+  `, file, JSON.stringify(concurrent)], { encoding: "utf8" });
+  expect(writer.status, writer.stderr).toBe(0);
+  const result = await pending;
+  expect(result.details.failures).toEqual(expect.arrayContaining([
+    expect.stringContaining("belongs to another skill"), expect.stringContaining("also holds `dependent`"),
+  ]));
+  expect(result.details.failures).toHaveLength(2);
+  expect(result.details.deferred).toHaveLength(1);
+  expect(result.content[0]?.text).toContain("1 Decline(s) of a fix in force");
+  expect(result.details.records).toMatchObject([
+    { fingerprint: existingHook.fingerprint, outcome: "withdrawn" }, { fingerprint: lateHook.fingerprint, outcome: "withdrawn" },
+    { gist: "Commit with jj", outcome: "later" },
+    { fingerprint: "evidence", evidence: newEvidence }, { gist: "Independent", outcome: "declined" },
+  ]);
+  expect(result.details.recording.rows).toEqual(["recorded", "recorded", "recorded", "recorded", "recorded"]);
+  expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")?.body).toContain("First fix");
+  const final = readLedger(file);
+  expect(final.find(({ fingerprint }) => fingerprint === outsideHook.fingerprint)).toMatchObject({ outcome: "applied" });
+  expect(final.slice(-7)).toMatchObject([
+    { fingerprint: "claimed", skill: "domain-modeling" }, { fingerprint: "applied", outcome: "applied" },
+    { fingerprint: existingHook.fingerprint, outcome: "withdrawn" }, { fingerprint: lateHook.fingerprint, outcome: "withdrawn" },
+    { gist: "Commit with jj", outcome: "later" }, { fingerprint: "evidence", evidence: newEvidence },
+    { gist: "Independent", outcome: "declined" },
+  ]);
 });
 /** Writes half the data to a rule file, as a full disk would, then fails. */
 function failRuleWriteMidway(rulesDir: string) {
@@ -353,7 +449,7 @@ it("rolls back a deletion's record and all its generated records without restori
   expect(existsSync(`${file}-journal`)).toBe(false);
 });
 
-it.each(["corrupt", "locked"])("reports a verified external publication but makes no rule changes on a %s store at open", async (fault) => {
+it.each(["corrupt", "locked", "writer locked"])("reports a verified external publication but makes no rule changes on a %s store", async (fault) => {
   const f = fixture();
   const file = f.files.storeFile();
   const [approval] = await f.approve([{ kind: "upstream", skill: "tdd", gist: "first", priority: "evidence", remedy: "Fix", change: { operation: "on-read-append", section: "## first\nFix first." } }]);
@@ -367,7 +463,7 @@ it.each(["corrupt", "locked"])("reports a verified external publication but make
   else {
     writeObserverStore(file, new Date(), () => {});
     lock = new Database(file, { create: false });
-    lock.run("BEGIN EXCLUSIVE");
+    lock.run(fault === "writer locked" ? "BEGIN IMMEDIATE" : "BEGIN EXCLUSIVE");
   }
   try {
     const result = await f.run({ outcomes: [
@@ -378,7 +474,15 @@ it.each(["corrupt", "locked"])("reports a verified external publication but make
     expect(result.isError).toBe(true);
     expect(result.details.publications).toEqual([]);
     expect(result.details.recording.rows).toEqual(["unrecorded"]);
-    expect(result.content[0]?.text).toMatch(/Could not read the observer store[\s\S]*Unrecorded publication[\s\S]*config\.txt/);
+    const text = result.content[0]?.text;
+    expect(text).toMatch(/Unrecorded publication[\s\S]*config\.txt/);
+    if (fault === "writer locked") {
+      expect(result.details.recording.error).toMatch(/locked|busy/i);
+      expect(result.details.failures).toEqual([expect.stringContaining("not attempted")]);
+      expect(text).not.toContain("Could not read the observer store");
+    } else {
+      expect(text).toContain("Could not read the observer store");
+    }
     expect(readFileSync(path, "utf8")).toBe(bytes);
     expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")).toBeUndefined();
   } finally {

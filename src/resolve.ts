@@ -14,6 +14,7 @@
  * model with the normal tools; this tool only records them.
  */
 
+import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
 import { join, relative } from "node:path";
 import { isPinKind, type RuleDirs } from "./amendments.js";
@@ -41,11 +42,11 @@ import {
   type ProposalOutcome,
   proposalFingerprint,
   putLedgerRecords,
-  readLedger,
+  readLedgerDecision,
   STALE_ACTIONS,
   type StaleAction,
 } from "./ledger.js";
-import { ObserverCommitUnknownError, writeObserverStore } from "./observer-store.js";
+import { ObserverCommitUnknownError, readObserverStore, writeObserverStore } from "./observer-store.js";
 import type { ExtensionAPI, SessionEntry } from "./omp.js";
 import { onReadAmendmentTransitions, type Publication, type ValidatedAnswer } from "./on-read-amendment-transitions.js";
 import { createProvenanceResolver, defaultSkillRoots, type ProvenanceResolver } from "./provenance.js";
@@ -170,16 +171,15 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
     ...(answer.outcome === "applied" && { publication: answer.publication }), timestamp, sessionId };
 }
 
-/**
- * One identity's records for the pass, under its prepared proposal's identity,
- * gist and evidence, never its description or code: `applied` once the
- * approved code is published; otherwise `later` or `declined`. A Later of the
- * code says a draft existed, since it comes back as an intent question.
- */
-function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly LedgerRecord[], branch: readonly SessionEntry[], timestamp: string, sessionId: string): {
-  records: HarnessLedgerRecord[];
+interface HarnessRemoval { root: string; file: string }
+interface PreparedRecord {
+  record: LedgerRecord;
   publishedFiles?: string[];
-} {
+  removal?: HarnessRemoval & { approval: ProposalAnswerRef };
+}
+
+/** A hook or companion answer keeps its prepared identity. An applied removal expands to all affected fixes at recording time. */
+function harnessRecord(answer: HarnessAnswer, cwd: string, branch: readonly SessionEntry[], timestamp: string, sessionId: string): PreparedRecord {
   if (!PROPOSAL_OUTCOMES.includes(answer.outcome)) throw new Error("a harness answer is `applied`, `later` or `declined`");
   if (answer.outcome === "applied") {
     if (answer.approval === undefined || answer.proposal !== undefined) {
@@ -187,10 +187,16 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
     }
     const { proposal, change, answeredAt } = approvedHarness(answer.approval, ["code", "removal"], branch);
     const identity = harnessIdentity(proposal);
-    if (change.stage === "removal") return { records: removalRecords(identity, change, ledger, timestamp, sessionId) };
+    if (change.stage === "removal") {
+      checkRemovedHook(change);
+      return {
+        record: { ...identity, outcome: "withdrawn", timestamp, sessionId },
+        publishedFiles: [change.file], removal: { ...change, approval: answer.approval },
+      };
+    }
     checkHarnessPublication(change, answer.publication, cwd, branch, answeredAt);
     return {
-      records: [{ ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId }],
+      record: { ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId },
       publishedFiles: change.files.map(({ path }) => join(change.root, path)),
     };
   }
@@ -203,29 +209,30 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
   const note = answer.outcome === "later" && answer.reoffer === undefined ? laterNote(answer.proposal, evidence) : undefined;
   const reoffer = answer.reoffer ?? note;
   const drafted = "change" in proposal && proposal.change.operation === "harness" && proposal.change.stage === "code";
-  return { records: [{
+  return { record: {
     ...harnessIdentity(proposal), outcome: answer.outcome,
     ...laterReoffer({ outcome: answer.outcome, reoffer: drafted ? `A draft existed: its code was shown and answered Later; ask the intent again before drafting anew.${reoffer === undefined ? "" : ` ${reoffer}`}` : reoffer }),
     timestamp, sessionId,
-  }] };
+  } };
 }
 
-/**
- * A hook removal, recorded only once its file is gone, since the pass deletes
- * it: as a withdrawal of every record that holds a hook at that file in force,
- * or, for a hook no pass recorded, under the removal's own identity.
- */
-function removalRecords(removal: HarnessIdentity, { root, file }: { root: string; file: string }, ledger: readonly LedgerRecord[], timestamp: string, sessionId: string): HarnessLedgerRecord[] {
+function checkRemovedHook({ root, file }: HarnessRemoval): void {
   // A folder replaced by a symlink since Prepare would let another file's absence pass for this hook's.
   const path = relative(root, file);
   if (canonicalMissingPath(root) !== root) throw new Error(`\`${root}\` no longer resolves to the hooks directory where the user approved removing \`${file}\``);
   if (canonicalPathIn(root, path, `\`${file}\``) !== path) throw new Error(`\`${file}\` now resolves to another file in its hooks directory than the one the user approved removing`);
   if (existsSync(file)) throw new Error(`\`${file}\` is still there: after the user's Apply, delete it with your own tools, then record its removal; this tool deletes nothing`);
-  const at = hookFileKey(removal.target, removal.fingerprint);
-  const inForce = ledger.filter((record): record is HarnessLedgerRecord =>
-    record.kind === "harness" && IN_FORCE_OUTCOMES.has(record.outcome) && hookFileKey(record.target, record.fingerprint) === at);
-  const withdrawn = inForce.length > 0 ? inForce.map(({ target, fingerprint, gist }) => ({ ...removal, target, fingerprint, gist })) : [removal];
-  return withdrawn.map((identity) => ({ ...identity, outcome: "withdrawn", timestamp, sessionId }));
+}
+
+/** A removed hook withdraws every fix for its scoped file, or uses its own identity if it held none. */
+function removalRecords(db: Database, record: HarnessLedgerRecord): HarnessLedgerRecord[] {
+  const at = hookFileKey(record.target, record.fingerprint);
+  if (at === undefined) return [record];
+  const inForce = db.query<{ record: string }, [string]>(
+    "SELECT record FROM proposals WHERE hook_file_key = ? ORDER BY answer_order",
+  ).all(at).map(({ record }) => JSON.parse(record) as LedgerRecord).filter((candidate): candidate is HarnessLedgerRecord =>
+    candidate.kind === "harness" && IN_FORCE_OUTCOMES.has(candidate.outcome) && hookFileKey(candidate.target, candidate.fingerprint) === at);
+  return inForce.length > 0 ? inForce.map(({ target, fingerprint, gist }) => ({ ...record, target, fingerprint, gist })) : [record];
 }
 
 type HarnessIdentity = Pick<HarnessLedgerRecord, "kind" | "target" | "fingerprint" | "gist" | "evidence">;
@@ -363,53 +370,48 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const referencesDir = files.referencesDir();
       const ledger = files.storeFile();
       const records: LedgerRecord[] = [];
+      const outsideAmendments: PreparedRecord[] = [];
       const external = new Map<LedgerRecord, readonly string[]>();
-      const directEdits = new Map<string, string>();
       const failures: string[] = [];
       const kept: string[] = [];
       let targetChanged = false;
       const label = (answer: CitingAnswer | ProjectAnswer | HarnessAnswer) => answer.kind === "project" ? `\`${answer.target?.path}\` (${answer.gist})`
         : answer.kind === "harness" || answer.gist === undefined ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
-      // The latest record per fingerprint wins: it holds the fix a withdrawal takes back, and the evidence an answer citing nothing keeps.
-      const latest = new Map<string, LedgerRecord>();
+      // Fail visibly on an unreadable or unmigrated store without making any internal publication.
       let openError: string | undefined;
+      let storeExists = false;
       try {
-        for (const record of readLedger(ledger)) latest.set(record.fingerprint, record);
+        storeExists = readObserverStore(ledger, () => true) === true;
       } catch (error) {
         openError = error instanceof Error ? error.message : String(error);
       }
+      const notAttempted = "not attempted because the observer store could not start recording";
 
-      // Fingerprint ownership binds across this call too: a later answer must not overwrite an earlier one's skill.
-      const claimed = new Map<string, string>();
       const validated = params.outcomes.flatMap((sent): ValidatedAnswer[] => {
+        if (openError !== undefined && (sent.outcome !== "applied" ||
+          (sent.kind !== "project" && sent.kind !== "harness" && sent.publication === undefined))) {
+          failures.push(`${label(sent)}: ${notAttempted}`);
+          return [];
+        }
         if (sent.kind === "project") {
-          if (openError !== undefined && sent.outcome !== "applied") return [];
           try {
             const record = projectRecord(sent, ctx.cwd, ctx.sessionManager.getBranch(), timestamp, sessionId);
-            records.push(record);
-            if (record.publication) external.set(record, [join(record.target.root, record.target.path)]);
+            outsideAmendments.push({ record, ...(record.publication && { publishedFiles: [join(record.target.root, record.target.path)] }) });
           }
           catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
           return [];
         }
         if (sent.kind === "harness") {
-          if (openError !== undefined && (sent.outcome !== "applied" || sent.publication === undefined)) return [];
           try {
-            const { records: answered, publishedFiles } = harnessRecords(sent, ctx.cwd, [...latest.values()], ctx.sessionManager.getBranch(), timestamp, sessionId);
-            const repeated = answered.find((record) => records.some((other) => other.kind === "harness" && other.fingerprint === record.fingerprint));
-            if (repeated) throw new Error(`this call already answers \`${repeated.fingerprint}\`: send one answer per hook or companion identity`);
-            records.push(...answered);
-            if (publishedFiles) external.set(answered[0]!, publishedFiles);
-          }
-          catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
+            outsideAmendments.push(harnessRecord(sent, ctx.cwd, ctx.sessionManager.getBranch(), timestamp, sessionId));
+          } catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
           return [];
         }
-        if (openError !== undefined && (sent.outcome !== "applied" || sent.publication === undefined)) return [];
         let shown: CitingAnswer = sent;
         try {
           const answer = citedAnswer(sent, ctx.sessionManager.getBranch());
           shown = answer;
-          if ("target" in answer || latest.get(answer.fingerprint ?? "")?.target !== undefined) {
+          if ("target" in answer) {
             throw new Error("a project or harness identity cannot be submitted as a global skill answer");
           }
           const installed = sent.proposal === undefined && sent.approval === undefined && answer.kind !== "new" ? provenance.byName(answer.skill).kind : "unknown";
@@ -423,7 +425,10 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           }
           // An upstream or plugin fix is always a rule; a local, managed or new one is a barrier rule when it cites only the approval of its prepared rule, else an edit the model made.
           const isDirectEdit = answer.outcome === "applied" && !isPinKind(answer.kind) && (answer.approval === undefined || answer.publication !== undefined);
-          if (openError !== undefined && !isDirectEdit) return [];
+          if (openError !== undefined && !isDirectEdit) {
+            failures.push(`${label(answer)}: ${notAttempted}`);
+            return [];
+          }
           const published = isDirectEdit ? checkDirectEdit(answer, provenance, ctx.cwd, ctx.sessionManager.getBranch()) : undefined;
           if (!isDirectEdit && answer.publication !== undefined) throw new Error("`publication` comes only with an applied local, managed or new skill direct edit");
           const writesRule = answer.outcome === "applied" && !isDirectEdit;
@@ -432,20 +437,10 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           }
           const approved = writesRule || withdraws ? approvedChange(answer, ctx.sessionManager.getBranch()) : undefined;
           const fingerprint = approved?.evidence.fingerprint ?? (answer.fingerprint || proposalFingerprint(answer.skill, answer.gist));
-          const historical = latest.get(fingerprint);
-          const historicalOwner = historical?.target !== undefined ? undefined : historical?.skill ?? answer.skill;
-          const owner = claimed.get(fingerprint) ?? historicalOwner;
-          if (owner !== answer.skill) throw new Error("proposal fingerprint belongs to another skill");
-          if (answer.outcome === "declined" && historical !== undefined && IN_FORCE_OUTCOMES.has(historical.outcome)) {
-            kept.push(`${label(answer)}, fingerprint \`${fingerprint}\``);
-            return [];
-          }
           const change = approved?.change;
-          const checked: ValidatedAnswer = isDirectEdit ? { answer, fingerprint, directEdit: true }
+          const checked: ValidatedAnswer = published !== undefined ? { answer, fingerprint, directEdit: published }
             : change?.operation === "withdrawal" ? { answer, fingerprint, withdrawal: change }
             : { answer, fingerprint, fix: change && fixRule({ ...answer, rule: fixDraft(change) }, fingerprint, dirs, provenance) };
-          claimed.set(fingerprint, answer.skill);
-          if (published !== undefined) directEdits.set(fingerprint, published);
           return [checked];
         } catch (error) {
           targetChanged ||= error instanceof TargetChangedError;
@@ -455,37 +450,137 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           return [];
         }
       });
+      const stale = openError === undefined ? params.stale ?? [] : [];
+      const compactions = openError === undefined ? params.compactions ?? [] : [];
       const transitions = onReadAmendmentTransitions(
-        { answers: validated, stale: openError === undefined ? params.stale ?? [] : [], compactions: openError === undefined ? params.compactions ?? [] : [] },
-        { dirs, referencesDir, latest, provenance, branch: ctx.sessionManager.getBranch(), timestamp, sessionId },
+        { answers: validated, stale, compactions },
+        { dirs, referencesDir, provenance, branch: ctx.sessionManager.getBranch(), timestamp, sessionId },
       );
       const verdicts = await Promise.all(transitions.replays.map((check) => (check ? replay(check, signal) : undefined)));
       // A cancelled call turns every replay into `unchecked`; nothing after this point waits, so stop before anything is written.
       signal?.throwIfAborted();
-      // Approvals are checked again from the branch and the targets as they are now, with nothing awaited before the writes: during the replay wait the user may have spoken, the pass ended or a target changed. Any later change to a target is this call's own composition.
-      const resolution = transitions.resolve(verdicts, ctx.sessionManager.getBranch());
-      const { records: carriedOut, publications, failures: refused, cleanup, deferred, approvals } = resolution;
-      records.push(...carriedOut);
-      failures.push(...refused);
-      targetChanged ||= resolution.targetChanged;
-
-      for (const record of records) {
-        const carried = record.evidence ? undefined : latest.get(record.fingerprint)?.evidence;
-        if (carried) record.evidence = carried;
-      }
+      // Do not initialize a fresh profile for retracted or invalid approvals.
+      const branch = ctx.sessionManager.getBranch();
+      const fresh = openError === undefined && !storeExists && !existsSync(ledger);
+      let settled = fresh ? transitions.settle(verdicts, branch, true) : undefined;
+      const hasAmendmentWork = settled
+        ? settled.answers.length + settled.stale.length + settled.compactions.length > 0
+        : validated.length + stale.length + compactions.length > 0;
       const recording: ResolveDetails["recording"] = { rows: [] };
       let status: Recording = "recorded";
+      let started = false;
       if (openError !== undefined) {
         status = "unrecorded";
         recording.error = `Could not read the observer store: ${openError}`;
-      } else if (records.length > 0) {
+      } else if (outsideAmendments.length > 0 || hasAmendmentWork) {
         try {
-          writeObserverStore(ledger, now, (db) => putLedgerRecords(db, records));
+          writeObserverStore(ledger, now, (db) => {
+            // Recheck approval targets after taking the writer lock too: a process could change them while it is busy.
+            const approved = transitions.settle(verdicts, branch);
+            settled = approved;
+            const decisions = new Map<string, LedgerRecord | undefined>();
+            const byRule = new Map<string, LedgerRecord[]>();
+            const latest = {
+              get(fingerprint: string) {
+                if (!decisions.has(fingerprint)) decisions.set(fingerprint, readLedgerDecision(db, fingerprint));
+                return decisions.get(fingerprint);
+              },
+              forRule(name: string) {
+                let current = byRule.get(name);
+                if (!current) {
+                  current = db.query<{ record: string }, [string]>(
+                    "SELECT record FROM proposals WHERE rule_name = ? ORDER BY answer_order",
+                  ).all(name).map(({ record }) => JSON.parse(record) as LedgerRecord);
+                  byRule.set(name, current);
+                }
+                return current;
+              },
+            };
+            const claimed = new Map<string, string>();
+            const eligible = new Set<ValidatedAnswer>();
+            for (const entry of approved.answers) {
+              const { answer, fingerprint, fix } = entry;
+              const historical = latest.get(fingerprint);
+              const owner = claimed.get(fingerprint) ?? historical?.skill;
+              const replacement = fix?.replaces && latest.get(fix.replaces.fingerprint);
+              if (historical?.target !== undefined) {
+                failures.push(`${label(answer)}: a project or harness identity cannot be submitted as a global skill answer`);
+              } else if ((owner !== undefined && owner !== answer.skill) ||
+                         (replacement && (replacement.target !== undefined || replacement.skill !== answer.skill))) {
+                failures.push(`${label(answer)}: proposal fingerprint belongs to another skill`);
+              } else if (answer.outcome === "declined" && historical && IN_FORCE_OUTCOMES.has(historical.outcome)) {
+                kept.push(`${label(answer)}, fingerprint \`${fingerprint}\``);
+              } else {
+                claimed.set(fingerprint, answer.skill);
+                eligible.add(entry);
+              }
+            }
+            const harnessAnswered = new Set<string>();
+            for (const { record: first, publishedFiles, removal } of outsideAmendments) {
+              if (removal) {
+                try {
+                  approvedHarness(removal.approval, ["removal"], branch);
+                  checkRemovedHook(removal);
+                } catch (error) {
+                  failures.push(`${targetLabel(first)}: ${(error as Error).message}`);
+                  continue;
+                }
+              }
+              const current = removal && first.kind === "harness" ? removalRecords(db, first) : [first];
+              const repeated = current.find((record) => record.kind === "harness" && harnessAnswered.has(record.fingerprint));
+              if (repeated) {
+                failures.push(`${targetLabel(first)}: this call already answers \`${repeated.fingerprint}\`: send one answer per hook or companion identity`);
+                continue;
+              }
+              records.push(...current);
+              for (const record of current) if (record.kind === "harness") harnessAnswered.add(record.fingerprint);
+              if (publishedFiles) external.set(current[0]!, publishedFiles);
+            }
+            for (const { action, rule } of approved.stale) if (action === "delete") latest.forRule(rule);
+            started = true;
+            try {
+              approved.resolve(eligible, latest);
+            } finally {
+              records.push(...approved.result.records);
+              for (const [record, path] of approved.result.directEdits) external.set(record, [path]);
+            }
+            for (const record of records) {
+              const carried = record.evidence ? undefined : latest.get(record.fingerprint)?.evidence;
+              if (carried) record.evidence = carried;
+            }
+            if (records.length > 0) putLedgerRecords(db, records);
+          });
         } catch (error) {
           status = error instanceof ObserverCommitUnknownError ? "unknown" : "unrecorded";
           recording.error = error instanceof Error ? error.message : String(error);
         }
       }
+      const approved = settled ?? transitions.settle(verdicts, branch);
+      const { publications, cleanup, deferred, approvals } = approved.result;
+      if (recording.error !== undefined && !started) {
+        records.length = 0;
+        external.clear();
+        for (const { rule, action } of params.stale ?? []) failures.push(`stale \`${rule}\` (${action}): ${notAttempted}`);
+        for (const { skill } of params.compactions ?? []) failures.push(`compaction of \`${skill}\`: ${notAttempted}`);
+        for (const { record, publishedFiles } of outsideAmendments) {
+          if (!publishedFiles && openError !== undefined) continue;
+          records.push(record);
+          if (publishedFiles) external.set(record, publishedFiles);
+        }
+        for (const entry of approved.answers) {
+          const { answer, fingerprint, directEdit } = entry;
+          if (directEdit === undefined) {
+            failures.push(`${label(answer)}: ${notAttempted}`);
+            continue;
+          }
+          const { skill, kind, gist, outcome, evidence } = answer;
+          const record: LedgerRecord = { skill, kind, gist, fingerprint, outcome, ...(evidence?.length && { evidence }), timestamp, sessionId };
+          records.push(record);
+          external.set(record, [directEdit]);
+        }
+      }
+      failures.push(...approved.result.failures);
+      targetChanged ||= approved.result.targetChanged;
       recording.rows = records.map(() => status);
       const line = (record: LedgerRecord) => {
         const written = record.kind !== "project" && record.compaction && record.rule ? readReferenceFiles(referencesDir, record.skill) : [];
@@ -495,6 +590,14 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           referenceFilesSentence(written)
         );
       };
+      const publicationLine = (record: LedgerRecord) => {
+        const paths = external.get(record);
+        if (!paths) return line(record);
+        const receipt = record.kind === "project" || record.kind === "harness"
+          ? `Published files: ${paths.map((path) => `\`${path}\``).join(", ")}`
+          : `Publication: \`${paths[0]}\``;
+        return `${line(record)} ${receipt}.`;
+      };
       const recorded = status === "recorded" ? records.map(line) : [];
       const text = [`Recorded ${recorded.length} outcome(s) in \`${ledger}\`:`, ...recorded];
       const unsettled = recording.error !== undefined;
@@ -503,21 +606,18 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           "",
           `Recording in the proposal ledger failed: ${recording.error}. No publication was undone. Don't call \`observer_resolve\` again for the outcomes below or redo their changes.`,
         );
-        if (openError !== undefined) text.push("Resolve stopped before making any rule or amendment changes.");
+        if (!started) text.push("Resolve stopped before making any rule or amendment changes.");
         if (status === "unknown") {
-          text.push(`Recording unknown, ${records.length} outcome(s). Inspect the ledger to determine whether the batch committed:`, ...records.map(line));
+          text.push(`Recording unknown, ${records.length} outcome(s). Inspect the ledger to determine whether the batch committed:`, ...records.map(publicationLine));
         } else {
           const internal = publications.slice();
           const unrecorded: string[] = [];
           const noPublication: string[] = [];
           for (const record of records) {
-            const paths = external.get(record);
-            const direct = record.outcome === "applied" && record.rule === undefined ? directEdits.get(record.fingerprint) : undefined;
             const publication = internal.findIndex((change) => matchesPublication(change, record));
             if (publication >= 0) internal.splice(publication, 1);
-            if (direct !== undefined) directEdits.delete(record.fingerprint);
-            if (paths !== undefined || direct !== undefined || publication >= 0) {
-              unrecorded.push(line(record) + (paths ? ` Published files: ${paths.map((path) => `\`${path}\``).join(", ")}.` : direct ? ` Publication: \`${direct}\`.` : ""));
+            if (external.has(record) || publication >= 0) {
+              unrecorded.push(publicationLine(record));
             } else {
               noPublication.push(line(record));
             }
@@ -556,13 +656,13 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         text.push(...cleanup.map((failure) => `- ${failure}`));
       }
       if (failures.length > 0) {
-        text.push("", openError !== undefined ? `Other refusals, ${failures.length} answer(s):` : `Not recorded, ${failures.length} answer(s); fix each and call again with only these:`);
+        text.push("", unsettled ? `Other refusals, ${failures.length} answer(s):` : `Not recorded, ${failures.length} answer(s); fix each and call again with only these:`);
         text.push(...failures.map((failure) => `- ${failure}`));
       }
       const guidance: ToolResultCondition[] = [];
       if (unsettled) guidance.push("ledger-recording-failed");
       if (cleanup.length > 0) guidance.push("cleanup-failed");
-      if (targetChanged && openError === undefined) guidance.push("changed-target");
+      if (targetChanged && !unsettled) guidance.push("changed-target");
       if (guidance.length > 0) text.push("", whatToDoNow(guidance));
       return {
         content: [{ type: "text", text: text.join("\n") }],

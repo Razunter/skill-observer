@@ -44,8 +44,6 @@ import type { CompactionAnswer, ProposalAnswer, StaleAnswer } from "./resolve.js
 export interface AmendmentContext {
   dirs: RuleDirs;
   referencesDir: string;
-  /** The latest ledger record per fingerprint as the call began. */
-  latest: ReadonlyMap<string, LedgerRecord>;
   /** Created for this call. */
   provenance: ProvenanceResolver;
   /** The session branch as the call began, holding the approvals its answers cite. */
@@ -62,7 +60,7 @@ export interface ValidatedAnswer {
   fingerprint: string;
   fix?: FixRule;
   withdrawal?: WithdrawalChange;
-  directEdit?: true;
+  directEdit?: string;
 }
 
 /** One call's answers that change rules and on-read amendments. */
@@ -88,6 +86,7 @@ export interface AmendmentResolution {
   records: SkillLedgerRecord[];
   /** In the order made. */
   publications: Publication[];
+  directEdits: Map<SkillLedgerRecord, string>;
   /** Answers that wrote and recorded nothing, each with the reason. */
   failures: string[];
   /** Whether a failure is an approval whose target changed since it was prepared. */
@@ -99,34 +98,90 @@ export interface AmendmentResolution {
   approvals: ApprovalEvidence[];
 }
 
-/**
- * One call's transitions, checked before anything is written. `replays` holds
- * each answer's replay check; `resolve` takes their verdicts in that order and
- * the branch as it is after waiting for them, checks every approval again from
- * it, and carries out the phases. Nothing it does waits, so the approvals it
- * checks still hold at each write.
- */
-export interface AmendmentTransitions {
-  replays: readonly (ReplayCase | undefined)[];
-  resolve(verdicts: readonly (Verdict | undefined)[], branch: readonly SessionEntry[]): AmendmentResolution;
+export interface AmendmentLedger {
+  get(fingerprint: string): LedgerRecord | undefined;
+  forRule(name: string): readonly LedgerRecord[];
 }
 
-/**
- * Checks one call's amendment changes against the ledger and the files as
- * they are when it begins: each withdrawal's write, that withdrawals of one
- * amendment agree on its new body and reference files, that no deletion
- * leaves another fix in force to come back with a new file, and each
- * compaction's identity, taken from the amendment's body before this call's
- * changes. Refused answers become failures.
- */
-export function onReadAmendmentTransitions(invocation: AmendmentInvocation, context: AmendmentContext): AmendmentTransitions {
-  const { dirs, referencesDir, latest, provenance } = context;
-  const failures: string[] = [];
+interface ApprovedResolution {
+  answers: readonly ValidatedAnswer[];
+  stale: readonly StaleAnswer[];
+  compactions: readonly CompactionAnswer[];
+  result: AmendmentResolution;
+  resolve(eligible: ReadonlySet<ValidatedAnswer>, latest: AmendmentLedger): void;
+}
+
+/** Capture compaction identity before any changes and check approvals again after replay. */
+export function onReadAmendmentTransitions(invocation: AmendmentInvocation, context: AmendmentContext) {
+  const { dirs, provenance } = context;
+  const compactionFailures: string[] = [];
   let targetChanged = false;
-  const prepared = invocation.answers.flatMap(({ answer, fingerprint, fix, withdrawal: change, directEdit }): ScheduledAnswer[] => {
-    if (!change) return [{ answer, fingerprint, fix, ...(directEdit && { directEdit }) }];
+  const compactions = invocation.compactions.flatMap((answer): Compaction[] => {
     try {
-      return [{ answer, fingerprint, withdrawn: preparedWithdrawal(answer, change, latest, dirs, referencesDir) }];
+      return [compaction(answer, context.branch, dirs.amendmentsDir, provenance)];
+    } catch (error) {
+      targetChanged ||= error instanceof TargetChangedError;
+      compactionFailures.push(`compaction of \`${answer.skill}\`: ${(error as Error).message}`);
+      return [];
+    }
+  });
+  return {
+    replays: invocation.answers.map(({ fix }) => fix?.replay),
+    settle(verdicts: readonly (Verdict | undefined)[], branch: readonly SessionEntry[], fresh = false): ApprovedResolution {
+      const failures = [...compactionFailures];
+      const resolution: AmendmentResolution = { records: [], publications: [], directEdits: new Map(), failures, targetChanged, cleanup: [], deferred: [], approvals: [] };
+      const checked = <T>(items: readonly T[], approval: (item: T) => Approved | undefined, labelItem: (item: T) => string): Checked<T>[] =>
+        items.flatMap((item) => {
+          try {
+            return [{ item, approval: approval(item) }];
+          } catch (error) {
+            resolution.targetChanged ||= error instanceof TargetChangedError;
+            failures.push(`${labelItem(item)}: ${(error as Error).message}`);
+            return [];
+          }
+        });
+      const approved = checked(invocation.answers, ({ answer, directEdit, withdrawal }) => {
+        if (fresh && withdrawal) {
+          throw new Error(`the ledger holds no applied fix under fingerprint \`${answer.fingerprint}\``);
+        }
+        if (directEdit) approvedDirectEdit(answer.approval, branch);
+        else if (answer.approval) return approvedChange(answer, branch);
+      }, ({ answer }) => label(answer));
+      const stale = checked(invocation.stale, (answer) => {
+        const approval = answer.action === "keep" ? undefined : approvedChange(answer, branch);
+        if (fresh) staleRule(answer, dirs);
+        return approval;
+      }, (answer) => `stale \`${answer.rule}\` (${answer.action})`);
+      const compact = checked(compactions, ({ answer }) => answer.outcome === "applied" ? approvedChange(answer, branch) : undefined,
+        ({ skill }) => `compaction of \`${skill}\``);
+      const byAnswer = new Map(invocation.answers.map((answer, i) => [answer, verdicts[i]]));
+      return {
+        answers: approved.map(({ item }) => item),
+        stale: stale.map(({ item }) => item),
+        compactions: compact.map(({ item }) => item.answer),
+        result: resolution,
+        resolve(eligible, latest) {
+          const answers = scheduleAnswers(approved.filter(({ item }) => eligible.has(item)), byAnswer, latest, context, failures);
+          carryOut(answers, stale, compact, latest, context, resolution);
+        },
+      };
+    },
+  };
+}
+
+type Approved = { change: ApprovedChange; evidence: ApprovalEvidence };
+interface Checked<T> { item: T; approval?: Approved }
+
+function scheduleAnswers(
+  approved: readonly Checked<ValidatedAnswer>[], verdicts: ReadonlyMap<ValidatedAnswer, Verdict | undefined>,
+  latest: AmendmentLedger, { dirs, referencesDir }: AmendmentContext, failures: string[],
+): ScheduledAnswer[] {
+  const prepared = approved.flatMap(({ item, approval }): ScheduledAnswer[] => {
+    const { answer, fingerprint, fix, directEdit, withdrawal: change } = item;
+    const scheduled = { answer, fingerprint, fix, directEdit, approval, verdict: verdicts.get(item) };
+    if (!change) return [scheduled];
+    try {
+      return [{ ...scheduled, withdrawn: preparedWithdrawal(answer, change, latest, dirs, referencesDir) }];
     } catch (error) {
       failures.push(`${label(answer)}: ${(error as Error).message}`);
       return [];
@@ -144,7 +199,7 @@ export function onReadAmendmentTransitions(invocation: AmendmentInvocation, cont
     if (previous && !isDeepStrictEqual(previous, draft)) conflictingWithdrawals.add(path);
     else withdrawalDrafts.set(path, draft);
   }
-  const answers = prepared.filter(({ answer, withdrawn }) => {
+  return prepared.filter(({ answer, withdrawn }) => {
     if (withdrawn?.rule && conflictingWithdrawals.has(withdrawn.rule.path)) {
       failures.push(`${label(answer)}: withdrawals of the same amendment need identical final body and references`);
       return false;
@@ -158,19 +213,6 @@ export function onReadAmendmentTransitions(invocation: AmendmentInvocation, cont
     );
     return false;
   });
-  const compactions = invocation.compactions.flatMap((answer): Compaction[] => {
-    try {
-      return [compaction(answer, context.branch, dirs.amendmentsDir, provenance)];
-    } catch (error) {
-      targetChanged ||= error instanceof TargetChangedError;
-      failures.push(`compaction of \`${answer.skill}\`: ${(error as Error).message}`);
-      return [];
-    }
-  });
-  return {
-    replays: answers.map(({ fix }) => fix?.replay),
-    resolve: (verdicts, branch) => carryOut({ answers, stale: invocation.stale, compactions, failures, targetChanged }, verdicts, branch, context),
-  };
 }
 
 /** A scheduled skill answer: an applied fix's rule, the withdrawal it carries out as checked against the ledger and the fix's rule file, or an applied direct edit the main agent made. */
@@ -179,57 +221,25 @@ interface ScheduledAnswer {
   fingerprint: string;
   fix?: FixRule;
   withdrawn?: Withdrawal;
-  directEdit?: true;
+  directEdit?: string;
+  approval?: Approved;
+  verdict?: Verdict;
 }
 
-interface Schedule {
-  answers: readonly ScheduledAnswer[];
-  stale: readonly StaleAnswer[];
-  compactions: readonly Compaction[];
-  /** Answers refused before anything was written. */
-  failures: readonly string[];
-  targetChanged: boolean;
-}
-
-/**
- * Carries out `schedule` in its phases, after checking every approval it
- * holds against `branch` as it is now: an approval that no longer holds
- * writes and records nothing.
- */
-function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[], branch: readonly SessionEntry[], context: AmendmentContext): AmendmentResolution {
-  const { dirs, referencesDir, latest, provenance, timestamp, sessionId } = context;
-  const { answers, stale, compactions } = schedule;
-  const resolution: AmendmentResolution = { records: [], publications: [], failures: [...schedule.failures], targetChanged: schedule.targetChanged, cleanup: [], deferred: [], approvals: [] };
+function carryOut(
+  answers: readonly ScheduledAnswer[], stale: readonly Checked<StaleAnswer>[], compactions: readonly Checked<Compaction>[],
+  latest: AmendmentLedger, context: AmendmentContext, resolution: AmendmentResolution,
+): void {
+  const { dirs, referencesDir, provenance, timestamp, sessionId } = context;
   const { records, publications, failures, cleanup, deferred, approvals } = resolution;
-  // Every Error returned here becomes a failure below.
-  const approvedNow = (answer: ProposalAnswer | StaleAnswer | CompactionAnswer) => {
-    try {
-      return approvedChange(answer, branch);
-    } catch (error) {
-      resolution.targetChanged ||= error instanceof TargetChangedError;
-      return error as Error;
-    }
-  };
-  const approvedEdit = (answer: ProposalAnswer) => {
-    try {
-      approvedDirectEdit(answer.approval, branch);
-      return undefined;
-    } catch (error) {
-      return error as Error;
-    }
-  };
-  const approved = answers.map(({ answer, directEdit }) => (directEdit ? approvedEdit(answer) : answer.approval ? approvedNow(answer) : undefined));
-  const staleApproved = stale.map((answer) => (answer.action === "keep" ? undefined : approvedNow(answer)));
-  const compactionApproved = compactions.map(({ answer }) => (answer.outcome === "applied" ? approvedNow(answer) : undefined));
 
   // Skills whose on-read amendment a stale update or delete changed in this call: a body the pass drafted from the file before that answer would undo it.
   const staleChanged = new Set<string>();
   const withdrawalChanged = new Set<string>();
   // Stale answers go first, so this call's additions land on the body they leave, and an addition after a stale delete creates the amendment again.
-  for (const [i, answer] of stale.entries()) {
+  for (const { item: answer, approval } of stale) {
+    const fixes = answer.action === "delete" ? fixesInForce(latest, answer.rule) : [];
     try {
-      const approval = staleApproved[i];
-      if (approval instanceof Error) throw approval;
       const { rule, kind, cleanupFailure } = settleStale(answer, approval?.change, dirs, referencesDir, provenance);
       if (cleanupFailure) cleanup.push(`stale \`${answer.rule}\` (delete): ${cleanupFailure}`);
       if (approval) approvals.push(approval.evidence);
@@ -248,7 +258,7 @@ function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[]
       staleChanged.add(rule.amends);
       if (answer.action !== "delete") continue;
       // The fixes inside go with the file, so an amendment created again under the same name doesn't bring them back.
-      for (const fix of fixesInForce(latest, rule.name)) {
+      for (const fix of fixes) {
         if (fix.fingerprint === rule.fingerprint) continue;
         const { fingerprint, skill, kind: fixKind, gist } = fix;
         records.push({ fingerprint, skill, kind: fixKind, gist, outcome: "deleted", rule: rule.path, timestamp, sessionId });
@@ -261,18 +271,10 @@ function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[]
   // On-read fixes this call applied, which a compaction of their skill has to include.
   const additions: SkillLedgerRecord[] = [];
   // Withdrawals go before additions: a new body the pass drafted from the amendment on disk must not drop a section this call adds.
-  const order = [...answers.keys()].sort((a, b) => Number(!answers[a]?.withdrawn) - Number(!answers[b]?.withdrawn));
-  for (const i of order) {
-    const { answer, fingerprint, fix, withdrawn } = answers[i]!;
-    const verdict = verdicts[i];
+  const order = [...answers].sort((a, b) => Number(!a.withdrawn) - Number(!b.withdrawn));
+  for (const { answer, fingerprint, fix, directEdit, withdrawn, verdict, approval } of order) {
     let outcome = answer.outcome;
     let rule: string | undefined;
-    const approval = approved[i];
-    // An approval that no longer holds writes and records nothing, not even the Later a failed replay records: the user may have retracted the answer.
-    if (approval instanceof Error) {
-      failures.push(`${label(answer)}: ${approval.message}`);
-      continue;
-    }
     if (verdict && verdict.verdict !== "passed") {
       // Nothing unchecked reaches disk: the answer comes back as a Later entry at a pass where the check passes.
       deferred.push(`${label(answer)}: ${describeVerdict(verdict)}`);
@@ -337,17 +339,12 @@ function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[]
       sessionId,
     };
     records.push(record);
+    if (directEdit !== undefined) resolution.directEdits.set(record, directEdit);
     if (fix?.section && outcome === "applied") additions.push(record);
   }
 
   // Compactions go after this call's additions, which their prepared `includes` name by fingerprint. One that includes an addition not applied here would carry a fix the user rejected, and one that leaves out an addition applied here would drop it, so either writes nothing.
-  for (const [i, { answer, skill, kind, fingerprint, gist }] of compactions.entries()) {
-    const approval = compactionApproved[i];
-    // As for any other answer, an approval that no longer holds writes and records nothing.
-    if (approval instanceof Error) {
-      failures.push(`compaction of \`${skill}\`: ${approval.message}`);
-      continue;
-    }
+  for (const { item: { skill, kind, fingerprint, gist, answer }, approval } of compactions) {
     const change = approval?.change.operation === "compaction" ? approval.change : undefined;
     let outcome = answer.outcome;
     let rule: string | undefined;
@@ -379,7 +376,6 @@ function carryOut(schedule: Schedule, verdicts: readonly (Verdict | undefined)[]
     }
     records.push({ fingerprint, skill, kind, gist, outcome, ...(rule && { rule }), compaction: true, timestamp, sessionId });
   }
-  return resolution;
 }
 
 const label = (answer: ProposalAnswer) => `\`${answer.skill}\` (${answer.gist})`;
@@ -387,7 +383,7 @@ const label = (answer: ProposalAnswer) => `\`${answer.skill}\` (${answer.gist})`
 /** The approved withdrawal `change` as a {@link Withdrawal}, checked against the ledger and the fix's rule file as they are now. */
 function preparedWithdrawal(
   answer: ProposalAnswer, change: WithdrawalChange,
-  latest: ReadonlyMap<string, LedgerRecord>, dirs: RuleDirs, referencesDir: string,
+  latest: Pick<AmendmentLedger, "get">, dirs: RuleDirs, referencesDir: string,
 ): Withdrawal {
   const draft = change.effect === "rewrite" ? { body: change.body, ...(change.references && { references: change.references.write }) }
     : change.effect === "delete" ? { body: "" } : undefined;
@@ -429,7 +425,7 @@ interface WithdrawalDraft {
  */
 export function withdrawal(
   answer: Pick<ProposalAnswer, "skill" | "fingerprint">, draft: WithdrawalDraft | undefined,
-  latest: Pick<ReadonlyMap<string, LedgerRecord>, "get">, dirs: RuleDirs, referencesDir: string,
+  latest: Pick<AmendmentLedger, "get">, dirs: RuleDirs, referencesDir: string,
 ): Withdrawal {
   if (!answer.fingerprint) throw new Error("a `withdrawn` answer needs the `fingerprint` of the applied fix it takes back");
   const record = latest.get(answer.fingerprint);
@@ -470,8 +466,8 @@ export function withdrawal(
  * A record names its rule by the file's basename, whichever directory the file
  * lived in then.
  */
-function fixesInForce(latest: ReadonlyMap<string, LedgerRecord>, rule: string): SkillLedgerRecord[] {
-  return [...latest.values()].filter(
+function fixesInForce(latest: AmendmentLedger, rule: string): SkillLedgerRecord[] {
+  return latest.forRule(rule).filter(
     (record): record is SkillLedgerRecord =>
       record.kind !== "project" && record.target === undefined && IN_FORCE_OUTCOMES.has(record.outcome) &&
       !record.compaction &&
@@ -533,13 +529,7 @@ function settleStale(
   referencesDir: string,
   provenance: ProvenanceResolver,
 ): { rule: ObserverRule; kind: PinKind; cleanupFailure?: string } {
-  if ("body" in answer || "references" in answer || (answer.action === "keep" && answer.approval !== undefined)) {
-    throw new Error("a stale answer carries no `body` or `references`: Keep only re-pins the amendment, leaving its body and reference files byte for byte, with no `approval`; an Update or Delete carries out the alternative its `approval` cites");
-  }
-  const rule = readObserverRule(dirs, answer.rule);
-  if (!isPinned(rule)) {
-    throw new Error(`\`${rule.name}\` is a barrier rule for a local or managed skill, so it never goes stale`);
-  }
+  const rule = staleRule(answer, dirs);
   const { kind: current } = provenance.byName(rule.amends);
   // shortcut: a skill that left the upstream and plugin kinds is recorded as upstream; read the ledger's kind if that ever matters.
   const kind: PinKind = isPinKind(current) ? current : "upstream";
@@ -553,6 +543,17 @@ function settleStale(
   if (references) replaceReferenceFiles(referencesDir, rule.amends, references.write, writeBody);
   else writeBody();
   return { rule, kind };
+}
+
+function staleRule(answer: StaleAnswer, dirs: RuleDirs): ObserverRule {
+  if ("body" in answer || "references" in answer || (answer.action === "keep" && answer.approval !== undefined)) {
+    throw new Error("a stale answer carries no `body` or `references`: Keep only re-pins the amendment, leaving its body and reference files byte for byte, with no `approval`; an Update or Delete carries out the alternative its `approval` cites");
+  }
+  const rule = readObserverRule(dirs, answer.rule);
+  if (!isPinned(rule)) {
+    throw new Error(`\`${rule.name}\` is a barrier rule for a local or managed skill, so it never goes stale`);
+  }
+  return rule;
 }
 
 /**
