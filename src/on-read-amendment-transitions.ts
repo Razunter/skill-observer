@@ -429,7 +429,7 @@ interface WithdrawalDraft {
  */
 export function withdrawal(
   answer: Pick<ProposalAnswer, "skill" | "fingerprint">, draft: WithdrawalDraft | undefined,
-  latest: ReadonlyMap<string, LedgerRecord>, dirs: RuleDirs, referencesDir: string,
+  latest: Pick<ReadonlyMap<string, LedgerRecord>, "get">, dirs: RuleDirs, referencesDir: string,
 ): Withdrawal {
   if (!answer.fingerprint) throw new Error("a `withdrawn` answer needs the `fingerprint` of the applied fix it takes back");
   const record = latest.get(answer.fingerprint);

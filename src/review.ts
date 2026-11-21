@@ -10,7 +10,7 @@
  * form that shows the proposals it selected.
  */
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, sep } from "node:path";
 import {
@@ -19,8 +19,8 @@ import {
 } from "./amendments.js";
 import {
   canonicalHarnessTarget, canonicalMissingPath, canonicalPathIn, canonicalProjectTarget, type Evidence, HARNESS_ROOT_NAMES, type HarnessFile, harnessFingerprint, harnessRootDirs, hookFileKey, hookPath,
-  ledgerForProject, type LedgerRecord, projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind, removalFingerprint,
-  proposalFingerprint, readLedger, targetLabel, type TargetScope,
+  ledgerDecisionInProject, type LedgerRecord, projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind, removalFingerprint,
+  proposalFingerprint, readLedgerDecision, targetLabel, type TargetScope,
 } from "./ledger.js";
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { type CatalogLookup, type CatalogSkill, lookupCatalog, parseSkillsBlock } from "./catalog.js";
@@ -35,6 +35,7 @@ import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type R
 import { type PatternDraft, type Sample, sampleSchemas } from "./replay.js";
 import type { ObserverFiles } from "./resolve.js";
 import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
+import { readObserverStore } from "./observer-store.js";
 
 export const REVIEW_TOOL_NAME = "observer_review";
 const PRIORITIES = ["stale", "note", "evidence", "compaction"] as const;
@@ -225,12 +226,16 @@ interface ReceiptContext extends GuidanceContext {
   currency: Map<string, string | undefined>;
 }
 
+interface ReviewDecisions {
+  get: (fingerprint: string) => LedgerRecord | undefined;
+  scoped: (fingerprint: string) => LedgerRecord | undefined;
+}
+
 interface PrepareContext extends ReceiptContext {
   cwd: string;
   /** The agent directory, which holds the global hooks directory and the companion extension. */
   agentDir: string;
-  /** The whole ledger: a withdrawal cites a fix wherever it was recorded. */
-  ledger: readonly LedgerRecord[];
+  decisions: ReviewDecisions;
   /** Filled by Prepare: the `## ` headings of each on-read append's target amendment at the bytes it read, by candidate ID, kept out of the proposal so its content hash ignores them. */
   amendmentSections: Map<string, string[]>;
 }
@@ -327,23 +332,23 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
       const details = emptyDetails();
       const amendmentSections = new Map<string, string[]>();
       try {
-        const ledger = readLedger(files.storeFile());
         const guidance = receiptContext(ctx, files);
         if (params?.action === "prepare") {
-          if (!Array.isArray(params.candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
+          const { candidates } = params;
+          if (!Array.isArray(candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
           if ("diagnosis" in params && params.diagnosis !== undefined) {
             throw new Error("Prepare ignores a `diagnosis` beside `candidates`: move `diagnosis` into each candidate it grounds, beside its `change`");
           }
-          const context: PrepareContext = { ...guidance, cwd: ctx.cwd, agentDir: ompAgentDir(), ledger, amendmentSections };
-          details.eligible = prepareProposals(params.candidates, context).map((proposal) => ({
+          details.eligible = withReviewDecisions(files.storeFile(), ctx.cwd, (decisions) =>
+            prepareProposals(candidates, { ...guidance, cwd: ctx.cwd, agentDir: ompAgentDir(), decisions, amendmentSections })).map((proposal) => ({
             reference: { reviewToolCallId: toolCallId, candidateId: proposal.candidateId, contentHash: contentHash(proposal) },
             proposal,
           }));
         } else if (params?.action === "select") {
           if (params.candidates !== undefined) throw new Error("Select takes `proposals`, the references a successful Prepare returned, not candidate drafts");
-          const declined = declinedFingerprints(ledgerForProject(ledger, ctx.cwd));
-          details.eligible = preparedEntries(params.proposals, guidance.evidence, guidance.branch)
-            .filter((entry) => !declined.has(entry.proposal.fingerprint));
+          details.eligible = withReviewDecisions(files.storeFile(), ctx.cwd, ({ scoped }) =>
+            preparedEntries(params.proposals, guidance.evidence, guidance.branch)
+              .filter(({ proposal }) => scoped(proposal.fingerprint)?.outcome !== "declined"));
           if (details.eligible.length > 1 && details.eligible.some(({ proposal }) => "change" in proposal && proposal.change.operation === "harness" && proposal.change.stage === "code")) {
             throw new Error("the code of a hook or companion change is asked in its own Select and Ask, apart from every other question");
           }
@@ -751,18 +756,31 @@ export async function rankingModelUnavailable(pi: ExtensionAPI, ctx: ExtensionCo
   }
 }
 
-const declinedFingerprints = (ledger: readonly LedgerRecord[]) =>
-  new Set(ledger.filter((record) => record.outcome === "declined").map((record) => record.fingerprint));
+function withReviewDecisions<T>(file: string, cwd: string, check: (decisions: ReviewDecisions) => T): T {
+  return readObserverStore(file, (db) => {
+    const root = realpathSync(cwd);
+    const decisions = new Map<string, LedgerRecord | undefined>();
+    const get = (fingerprint: string) => {
+      if (!decisions.has(fingerprint)) decisions.set(fingerprint, readLedgerDecision(db, fingerprint));
+      return decisions.get(fingerprint);
+    };
+    return check({
+      get,
+      scoped(fingerprint) {
+        const record = get(fingerprint);
+        return record && ledgerDecisionInProject(record, root) ? record : undefined;
+      },
+    });
+  }) ?? check({ get: () => undefined, scoped: () => undefined });
+}
 
 function prepareProposals(candidates: readonly ReviewCandidate[], context: PrepareContext): PreparedProposal[] {
-  const scoped = ledgerForProject(context.ledger, context.cwd);
-  const declined = declinedFingerprints(scoped);
   const grouped = new Map<string, PreparedProposal>();
   const checked = candidates.map((draft) => checkedCandidate(draft, context));
   // A compaction's `includes` resolve to this Prepare's on-read appends, so it is prepared after them.
   const ordered = checked.toSorted((a, b) => Number(a.change.operation === "compaction") - Number(b.change.operation === "compaction"));
   for (const candidate of ordered) {
-    const prepared = preparedProposal(candidate, scoped, declined, [...grouped.values()], context);
+    const prepared = preparedProposal(candidate, [...grouped.values()], context);
     if (!prepared) continue;
     const proposal = isSkillTextRepair(candidate) || isNewSkill(candidate)
       ? { ...prepared, diagnosis: candidateDiagnosis(candidate, context) } : prepared;
@@ -959,10 +977,12 @@ function checkedCandidate(candidate: ReviewCandidate, context: PrepareContext): 
  * writable. Throws with the reason it can't.
  */
 function preparedProposal(
-  candidate: ReviewCandidate & { evidence: ReviewEvidence[] }, scoped: readonly LedgerRecord[], declined: ReadonlySet<string>,
+  candidate: ReviewCandidate & { evidence: ReviewEvidence[] },
   prepared: readonly PreparedProposal[], context: PrepareContext,
 ): PreparedProposal | undefined {
   const { change: draft } = candidate;
+  const { decisions } = context;
+  const isDeclined = (fingerprint: string) => decisions.scoped(fingerprint)?.outcome === "declined";
   const isStale = draft.operation === "stale-update" || draft.operation === "stale-delete";
   if ((candidate.priority === "stale") !== isStale) throw new Error("stale priority is exactly a stale Update/Delete change");
   if ((candidate.priority === "compaction") !== (draft.operation === "compaction")) throw new Error("compaction priority is exactly a compaction change");
@@ -978,7 +998,7 @@ function preparedProposal(
     if (draft.stage === "removal") {
       const removal = hookRemoval(candidate.target, context);
       checkCurrentFingerprint(candidate, removal.fingerprint);
-      if (declined.has(removal.fingerprint)) return undefined;
+      if (isDeclined(removal.fingerprint)) return undefined;
       const { priority, gist, remedy, evidence } = candidate;
       return { candidateId: `removal:${removal.fingerprint}`, fingerprint: removal.fingerprint, priority, kind: "harness", target: removal.target, gist, remedy, evidence, ...removalStage(removal) };
     }
@@ -986,8 +1006,8 @@ function preparedProposal(
     if (!isCode && draft.stage !== "intent") throw new Error("a harness change is prepared at its `intent` stage, then at its `code` stage, or as a `removal`");
     const missing = isCode ? undefined : INTENT_LINES.find(([field]) => typeof draft[field] !== "string" || !draft[field].trim());
     if (missing) throw new Error(`a harness intent needs its ${missing[1].toLowerCase()}`);
-    const fingerprint = proposalIdentity(candidate, scoped);
-    if (declined.has(fingerprint)) return undefined;
+    const fingerprint = proposalIdentity(candidate, decisions);
+    if (isDeclined(fingerprint)) return undefined;
     if (isCode) return { candidateId: `code:${fingerprint}`, fingerprint, ...base, ...codeStage(candidate.target, fingerprint, draft, context) };
     return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, change: { operation: "harness", stage: "intent" }, preview: intentPreview(candidate.target, fingerprint, draft, context) };
   }
@@ -995,8 +1015,8 @@ function preparedProposal(
   if (draft.operation === "direct-edit") {
     if (isPinKind(candidate.kind)) throw new Error("an upstream or plugin skill takes amendment rules, not a direct edit");
     if (typeof draft.preview !== "string" || !draft.preview.trim()) throw new Error("a direct edit needs its exact preview");
-    const fingerprint = proposalIdentity(candidate, scoped);
-    if (declined.has(fingerprint)) return undefined;
+    const fingerprint = proposalIdentity(candidate, decisions);
+    if (isDeclined(fingerprint)) return undefined;
     return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, change: { operation: "direct-edit" }, preview: draft.preview };
   }
   if (candidate.kind === "project") throw new Error("a project proposal is a direct edit");
@@ -1004,7 +1024,7 @@ function preparedProposal(
   const { dirs, referencesDir } = context;
   /** `prepare` validates and reads the change's target only once the identity is known not to be declined. */
   const proposal = (identityClass: string, fingerprint: string, prepare: () => ProtectedChange): PreparedProposal | undefined => {
-    if (declined.has(fingerprint)) return undefined;
+    if (isDeclined(fingerprint)) return undefined;
     const change = prepare();
     const preview = renderPreview(skill, kind, change);
     // The Ask form collapses whitespace, so a CRLF or a bare CR would be written without ever being shown.
@@ -1019,7 +1039,7 @@ function preparedProposal(
   };
   switch (draft.operation) {
     case "on-read-append": {
-      const fingerprint = proposalIdentity(candidate, scoped);
+      const fingerprint = proposalIdentity(candidate, decisions);
       return reconciled(proposal("proposal", fingerprint, () => {
         const { rule: created } = fixRule({ skill, kind, gist: candidate.gist, rule: { body: draft.section } }, fingerprint, dirs, context.provenance);
         const rule = skillAmendment(dirs.amendmentsDir, skill) ?? created;
@@ -1034,7 +1054,7 @@ function preparedProposal(
     }
     case "rule": {
       if (typeof draft.pattern !== "string" || !draft.pattern.trim()) throw new Error("a rule change needs its `pattern`; an on-read fix is an on-read append");
-      const fingerprint = proposalIdentity(candidate, scoped);
+      const fingerprint = proposalIdentity(candidate, decisions);
       return reconciled(proposal("proposal", fingerprint, () => {
         const { operation: _, ...rule } = draft;
         const fix = fixRule({ skill, kind, gist: candidate.gist, rule }, fingerprint, dirs, context.provenance);
@@ -1069,12 +1089,12 @@ function preparedProposal(
     }
     case "withdrawal": {
       if (candidate.fingerprint === undefined) throw new Error("a withdrawal names the applied fix it takes back by `fingerprint`");
-      const fingerprint = proposalIdentity(candidate, scoped);
+      const fingerprint = proposalIdentity(candidate, decisions);
       return proposal("withdrawal", fingerprint, () => {
         const hasDraft = draft.body !== undefined || draft.references !== undefined;
         const taken = withdrawal({ skill, fingerprint },
           hasDraft ? { body: draft.body ?? "", ...optional("references", draft.references) } : undefined,
-          new Map(context.ledger.map((record) => [record.fingerprint, record])), dirs, referencesDir);
+          decisions, dirs, referencesDir);
         const withdrawn = { fingerprint: taken.record.fingerprint, gist: taken.record.gist };
         if (!taken.rule) return { operation: "withdrawal", withdrawn, effect: "record" };
         const body = taken.body?.trim();
@@ -1130,12 +1150,12 @@ function includedAddition(skill: string, addition: string, prepared: readonly Pr
 }
 
 /** A proposal's ledger identity: the scoped gist, or a re-offered Later entry's or withdrawn fix's recorded fingerprint. */
-function proposalIdentity(candidate: ReviewCandidate, ledger: readonly LedgerRecord[]): string {
+function proposalIdentity(candidate: ReviewCandidate, decisions: ReviewDecisions): string {
   let fingerprint = candidate.kind === "project" ? projectFingerprint(candidate.target)
     : candidate.kind === "harness" ? harnessFingerprint(candidate.target)
     : proposalFingerprint(candidate.skill, candidate.gist);
   if (candidate.kind !== "project" && candidate.kind !== "harness" && candidate.fingerprint !== undefined) {
-    const existing = ledger.find((record) => record.fingerprint === candidate.fingerprint);
+    const existing = decisions.scoped(candidate.fingerprint);
     if (existing) {
       if (existing.target !== undefined || existing.skill !== candidate.skill) throw new Error("candidate fingerprint belongs to another target");
       fingerprint = existing.fingerprint;

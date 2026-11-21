@@ -1,8 +1,11 @@
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { projectFingerprint } from "../src/ledger.js";
+import { compactionFingerprint } from "../src/amendments.js";
+import { harnessFingerprint, type LedgerRecord, projectFingerprint, type ProjectTarget, proposalFingerprint, putLedgerRecords } from "../src/ledger.js";
+import type { PreparedProposalRef } from "../src/review.js";
+import { writeObserverStore } from "../src/observer-store.js";
 import type { ExtensionAPI, ExtensionContext, Schema, SessionEntry, ToolArguments, ToolDefinition, ToolResultDetails } from "../src/omp.js";
 import { registerReviewTool } from "../src/review.js";
 
@@ -50,21 +53,23 @@ function host(options: { assignment?: string; settings?: boolean; models?: boole
   } as unknown as ExtensionContext;
   let eligible: Array<{ reference: { candidateId: string }; gist: string }> = [];
   const rankings = rankingsIn(root);
+  async function call(params: ToolArguments) {
+    if (!tool) throw new Error("review tool not registered");
+    const id = `review-${branch.length}`;
+    const result = await tool.execute(id, params, undefined, undefined, ctx);
+    branch.push(
+      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name: "observer_review", arguments: params }] } },
+      { type: "message", message: { role: "toolResult", toolCallId: id, toolName: "observer_review", isError: result.isError ?? false, details: result.details as ToolResultDetails } },
+    );
+    return { result, output: JSON.parse(result.content[0]!.text) };
+  }
   return {
-    rankings,
+    root, call, rankings,
     disable() { assignment = undefined; },
-    /** Runs Prepare with the fixture candidates, or Select with the references the last Prepare returned, naming Select's references by the gists Prepare gave them, and saves the completed call on the branch. */
     async run(action: "prepare" | "select") {
-      if (!tool) throw new Error("review tool not registered");
-      const id = `review-${branch.length}`;
-      const params = action === "prepare" ? { action, candidates: candidatesIn(root) } : { action, proposals: eligible.map(({ reference }) => reference), rankings };
-      const result = await tool.execute(id, params, undefined, undefined, ctx);
-      branch.push(
-        { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name: "observer_review", arguments: params as ToolArguments }] } },
-        { type: "message", message: { role: "toolResult", toolCallId: id, toolName: "observer_review", isError: result.isError ?? false, details: result.details as ToolResultDetails } },
-      );
+      const { result, output } = await call(action === "prepare"
+        ? { action, candidates: candidatesIn(root) } : { action, proposals: eligible.map(({ reference }) => reference), rankings });
       expect(result.isError).toBeFalsy();
-      const output = JSON.parse(result.content[0]!.text);
       if (action === "prepare") {
         eligible = output.eligible;
         return output;
@@ -111,4 +116,64 @@ describe("observer_review explicit judge availability", () => {
     h.disable();
     expect((await h.run("select")).selected[0]).toBe("Strong");
   });
+});
+
+it("keeps scoped Prepare and Select eligibility when other projects have decisions for the same remedies", async () => {
+  const { root, call } = host();
+  const other = mkdtempSync(join(tmpdir(), "observer-review-other-")); roots.push(other);
+  const project = (root: string, mechanism: string) => ({ scope: "project" as const, root, path: "AGENTS.md", mechanism });
+  const globalHook = { scope: "harness" as const, root: "global-hooks" as const, mechanism: "Configure guard" };
+  const projectHook = { scope: "harness" as const, root: "project-hooks" as const, mechanism: globalHook.mechanism };
+  const record = { sessionId: "review-model", timestamp: "2026-11-01T00:00:00Z" };
+  const declineProject = (target: ProjectTarget): LedgerRecord => ({
+    ...record, kind: "project", target, fingerprint: projectFingerprint(target), gist: target.mechanism, outcome: "declined",
+  });
+  const skill = "fixture-workflow";
+  const applied = { ...record, kind: "upstream", outcome: "applied", skill, gist: "Recorded fix", fingerprint: proposalFingerprint(skill, "Recorded fix") } as const;
+  const stale = { ...applied, gist: "Check stale amendment", fingerprint: proposalFingerprint(skill, "Old amendment") };
+  const compaction = { ...applied, gist: "Compact amendment", fingerprint: compactionFingerprint(skill, ""), outcome: "declined", compaction: true } as const;
+  const seed = (records: LedgerRecord[]) => writeObserverStore(join(root, "observer.sqlite"), new Date(), (db) => putLedgerRecords(db, records));
+  seed([
+    applied, stale, compaction, declineProject(project(root, "Declined repair")),
+    { ...record, kind: "harness", target: globalHook, gist: "Global guard", fingerprint: harnessFingerprint(globalHook), outcome: "declined" },
+  ]);
+  writeFileSync(join(root, "fixture-stale.md"), `---\ngeneratedBy: skill-observer\namends: ${skill}\nskillHash: old\ncondition: wrong\nscope: text\nfingerprint: ${stale.fingerprint}\n---\n\nOld guidance.\n`);
+  writeFileSync(join(root, "AGENTS.md"), "Project guidance.\n");
+  symlinkSync("AGENTS.md", join(root, "alias.md"));
+  const intent = { operation: "harness", stage: "intent", event: "tool_call", predicate: "Wrong target", action: "Block", mistake: "Wrong", legitimate: "Right", scope: "Only this target", lowerRungs: "No skill applies" };
+  const remedy = "Fix guidance";
+  const candidates = [
+    { ...projectRepair("Declined repair", "Evidence", 1), target: { ...project(root, "Declined repair"), path: "alias.md" } },
+    { ...projectRepair("Keep repair", "Evidence", 1), target: project(root, "Keep repair") },
+    { kind: "harness", gist: "Global guard", target: globalHook, priority: "evidence", remedy, change: intent },
+    { kind: "harness", gist: "Project guard", target: projectHook, priority: "evidence", remedy, change: intent },
+    { kind: "upstream", skill, gist: "Take back the recorded fix", fingerprint: applied.fingerprint, priority: "note", remedy, change: { operation: "withdrawal" } },
+    { kind: "upstream", skill, gist: stale.gist, priority: "stale", remedy, change: { operation: "stale-delete", rule: "fixture-stale" } },
+    { kind: "upstream", skill, gist: compaction.gist, priority: "compaction", remedy, change: { operation: "compaction", includes: [], body: "Shorter.", references: [] } },
+  ];
+  const prepare = async () => {
+    const { result, output } = await call({ action: "prepare", candidates });
+    expect(result.isError, JSON.stringify(output.failures)).toBeFalsy();
+    return output.eligible as Array<{ gist: string; reference: PreparedProposalRef }>;
+  };
+  const baseline = await prepare();
+  expect(baseline.map(({ gist }) => gist)).toEqual(["Keep repair", "Project guard", "Take back the recorded fix", stale.gist]);
+  const foreignHook = { ...projectHook, project: other };
+  seed([
+    declineProject(project(other, "Keep repair")),
+    { ...record, kind: "harness", target: foreignHook, gist: "Project guard", fingerprint: harnessFingerprint(foreignHook), outcome: "declined" },
+    ...Array.from({ length: 12 }, (_, i) => declineProject(project(i % 2 === 0 ? root : other, `Unrelated ${i}`))),
+  ]);
+  const padded = await prepare();
+  expect(padded.map(({ reference: { candidateId } }) => candidateId)).toEqual(baseline.map(({ reference: { candidateId } }) => candidateId));
+  seed([declineProject(project(root, "Keep repair")), { ...stale, outcome: "declined" }]);
+  const selected = await call({ action: "select", proposals: padded.map(({ reference }) => reference) });
+  expect(selected.result.isError).toBeFalsy();
+  expect(selected.output.selected).toEqual([padded[2]!.reference, padded[1]!.reference]);
+  const forged = await call({ action: "select", proposals: [{ ...padded[2]!.reference, contentHash: "wrong" }] });
+  expect(forged.result.isError).toBe(true);
+  expect(forged.output.selected).toEqual([]);
+  const refused = await call({ action: "prepare", candidates: [{ ...candidates[4], skill: "other-workflow" }] });
+  expect(refused.result.isError).toBe(true);
+  expect(refused.output.failures).toEqual([expect.stringContaining("belongs to another target")]);
 });

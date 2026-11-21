@@ -264,18 +264,20 @@ export const removalFingerprint = (fileKey: string) => createHash("sha256").upda
 /** Shared storage does not make another project's decisions visible in this pass; global hook and companion decisions apply in every project. */
 export function ledgerForProject(records: readonly LedgerRecord[], cwd: string): LedgerRecord[] {
   const root = realpathSync(cwd);
-  return records.filter((record) => {
-    switch (record.kind) {
-      case "project":
-        try {
-          return projectFingerprint(canonicalProjectTarget(root, record.target)) === record.fingerprint;
-        } catch { return false; }
-      case "harness":
-        return record.target.root !== "project-hooks" || record.target.project === root;
-      default:
-        return record.target === undefined;
-    }
-  });
+  return records.filter((record) => ledgerDecisionInProject(record, root));
+}
+
+export function ledgerDecisionInProject(record: LedgerRecord, canonicalRoot: string): boolean {
+  switch (record.kind) {
+    case "project":
+      try {
+        return projectFingerprint(canonicalProjectTarget(canonicalRoot, record.target)) === record.fingerprint;
+      } catch { return false; }
+    case "harness":
+      return record.target.root !== "project-hooks" || record.target.project === canonicalRoot;
+    default:
+      return record.target === undefined;
+  }
 }
 
 /**
@@ -299,6 +301,11 @@ export function readLedger(file: string): LedgerRecord[] {
 export function readLedgerRows(db: Database): LedgerRecord[] {
   return db.query<{ record: string }, []>("SELECT record FROM proposals ORDER BY answer_order").all()
     .map(({ record }) => JSON.parse(record) as LedgerRecord);
+}
+
+export function readLedgerDecision(db: Database, fingerprint: string): LedgerRecord | undefined {
+  const row = db.query<{ record: string }, [string]>("SELECT record FROM proposals WHERE fingerprint = ?").get(fingerprint);
+  return row === null ? undefined : JSON.parse(row.record) as LedgerRecord;
 }
 
 /** Replace each decision and move it to the end of the answer order within the caller's transaction. */
