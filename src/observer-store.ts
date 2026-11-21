@@ -100,9 +100,7 @@ export function hasCompletedObserverImport(file: string): boolean {
   if (!lstatSync(file, { throwIfNoEntry: false })) return false;
   try {
     return withConnection(file, true, (db) => db.transaction(() => {
-      const id = db.query<{ application_id: number }, []>("PRAGMA application_id").get();
-      const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get();
-      if (id?.application_id !== APPLICATION_ID || version?.user_version !== SCHEMA_VERSION) throw new Error("unrecognized store identity");
+      checkStoreIdentity(file, db);
       const schema = db.query<{ sql: string }, []>("SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL").all();
       // SQLite stores statement text, so ignore formatting changes to our own DDL.
       const normalise = (sql: string) => sql.replace(/\s+/g, " ");
@@ -176,12 +174,16 @@ function withConnection<T>(file: string, readonly: boolean, use: (db: Database) 
   }
 }
 
-function checkStore(file: string, db: Database): void {
+function checkStoreIdentity(file: string, db: Database): void {
   const id = db.query<{ application_id: number }, []>("PRAGMA application_id").get();
   const version = db.query<{ user_version: number }, []>("PRAGMA user_version").get();
   if (id?.application_id !== APPLICATION_ID || version?.user_version !== SCHEMA_VERSION) {
     throw new Error(`Observer store has an unrecognized identity or schema version: ${file}`);
   }
+}
+
+function checkStore(file: string, db: Database): void {
+  checkStoreIdentity(file, db);
   const origin = db.query<{ origin: string }, []>("SELECT origin FROM observer_store WHERE id = 1").get()?.origin;
   if (origin === "import") return;
   if (origin !== "runtime") throw new Error(`Observer store is not initialized: ${file}`);
