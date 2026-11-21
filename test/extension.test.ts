@@ -6606,6 +6606,90 @@ describe("remedy outcomes in the observation payload", () => {
   });
 });
 
+describe("migrated observer state", () => {
+  it("retains scoped decisions, applied remedy evidence and exact observation recurrences", async () => {
+    const host = loadExtension();
+    const root = host.skillHome.roots.cwd;
+    const foreign = join(host.skillHome.home, "other-project");
+    mkdirSync(foreign);
+    splitAmendment(host, "tdd", "tdd-fixture-check", { evidence: [{ quote: "The fixture missed a check.", count: 2 }] });
+    const applied = ledgerRecords(host.ledgerFile)[0]!;
+    rmSync(host.ledgerFile);
+
+    const timestamp = new Date(Date.now() - 86_400_000).toISOString();
+    const recorded = { timestamp, sessionId: "legacy-session" };
+    const project = (path: string, cwd = root) => ({ scope: "project" as const, root: cwd, path, mechanism: "Wire the fixture check." });
+    const projectRecord = (path: string, gist: string, outcome: "later" | "declined", cwd = root): LedgerRecord => {
+      const target = project(path, cwd);
+      return { ...recorded, kind: "project", target, fingerprint: projectFingerprint(target), gist, outcome };
+    };
+    const global: LedgerRecord = { ...recorded, kind: "upstream", skill: "tdd", fingerprint: proposalFingerprint("tdd", "Keep the global check."),
+      gist: "Keep the global check.", outcome: "later", reoffer: "When the check recurs." };
+    const declined = projectRecord("checks.json", "Keep the declined check.", "declined");
+    const terminal = { ...recorded, kind: "upstream", skill: "tdd",
+      fingerprint: proposalFingerprint("tdd", "Retired fixture check."), gist: "Retired fixture check." };
+    const rows = [
+      { ...declined, outcome: "later" }, { ...global, reoffer: "Old condition." }, { ...applied, timestamp },
+      { ...terminal, outcome: "applied" }, projectRecord("waiting.json", "Keep the local check.", "later"),
+      projectRecord("waiting.json", "Foreign Later must stay hidden.", "later", foreign),
+      projectRecord("new.json", "Foreign decline must not suppress a local candidate.", "declined", foreign),
+      declined, global, { ...terminal, outcome: "withdrawn" },
+    ];
+    const observation = (text: string, keyText: string, revision: string) => ({
+      text, count: 2, project: root, recordedAt: timestamp, revision,
+      key: createHash("sha256").update(`${root}\n${keyText}`).digest("hex").slice(0, 12),
+    });
+    const seen = observation("Fixture check repeats.", "fixturecheckrepeats", "077ef155-f112-4028-bcc6-73de868d7961");
+    const pending = observation("Fixture check is pending.", "fixturecheckispending", "2ddcc08c-d718-44b7-b748-f384bffe96dd");
+    const directory = dirname(host.ledgerFile);
+    const ledger = join(directory, "ledger.jsonl");
+    const observations = join(directory, "observations.jsonl");
+    const source = (rows: unknown[]) => rows.map((row) => JSON.stringify(row)).join("\n");
+    const legacyLedger = source(rows);
+    const legacyObservations = source([seen, { ...seen, shownAt: timestamp }, pending]);
+    writeFileSync(ledger, legacyLedger);
+    writeFileSync(observations, legacyObservations);
+    const script = fileURLToPath(new URL("../scripts/migrate-observer-store.ts", import.meta.url));
+    const migration = spawnSync(process.execPath, ["--no-env-file", script, "--agent-dir", dirname(directory), "--apply"],
+      { encoding: "utf8", timeout: 5_000 });
+    expect(migration.status, migration.stderr).toBe(0);
+
+    host.setBranch(fx.plainUserMessage);
+    await readSkill(host, "skill://tdd");
+    const before = readFileSync(host.ledgerFile);
+    await host.runCommand("observe-report");
+    const report = host.notices.at(-1);
+    expect(report).toContain(`- ${applied.fingerprint}: delivered (tdd)`);
+    expect(report).not.toContain(terminal.fingerprint);
+    expect(report).toMatch(/Later proposals: 2\nPending observations: 1/);
+    expect(host.sent).toHaveLength(0);
+    expect(readFileSync(host.ledgerFile)).toEqual(before);
+
+    await host.runCommand("observe");
+    const payload = String(host.sent.at(-1)?.message.content);
+    expect(payload).toContain(applied.gist);
+    expect(payload).toMatch(/Keep the local check\.[\s\S]*Keep the global check\. Re-offer when: When the check recurs\./);
+    expect(payload).toContain(`- ${pending.text} (count 2, last recorded`);
+    for (const hidden of [seen.text, "Old condition.", declined.gist, "Foreign Later must stay hidden."]) expect(payload).not.toContain(hidden);
+
+    const draft = (path: string) => ({ kind: "project", target: project(path), gist: `Repair ${path}.`, priority: "evidence",
+      remedy: "Run the fixture check.", change: { operation: "direct-edit", preview: "Wire the fixture check." } });
+    const selection = await prepareAndSelect(host, [draft("checks.json"), draft("new.json")]);
+    expect(reviewEntries(selection, "selected").map(({ proposal }) => proposal.gist)).toEqual(["Repair new.json."]);
+    const withdrawn = await resolveApproved(host, { withdrawals: [{ fingerprint: applied.fingerprint, gist: applied.gist }] });
+    expect(withdrawn.details).toMatchObject({ failures: [], records: [{ outcome: "withdrawn", evidence: applied.evidence }] });
+    expect(existsSync(join(host.amendmentsDir, "tdd-fixture-check.md"))).toBe(false);
+
+    await host.callTool("observe", { text: seen.text });
+    await host.runCommand("observe");
+    const next = String(host.sent.at(-1)?.message.content);
+    expect(next).toContain(`recorded again after being shown on ${timestamp.slice(0, 10)}`);
+    expect(next).not.toContain(pending.text);
+    expect(readFileSync(ledger, "utf8")).toBe(legacyLedger);
+    expect(readFileSync(observations, "utf8")).toBe(legacyObservations);
+  });
+});
+
 describe("/observe-report", () => {
   const TEST_RUN = { type: "message", id: "call-run-tests", message: { role: "assistant", content: [{ type: "toolCall", id: "run-tests", name: "bash", arguments: { command: "bun test" } }] } } as const;
   const TEST_RESULT = { type: "message", id: "result-run-tests", message: { role: "toolResult", toolCallId: "run-tests", toolName: "bash", content: [{ type: "text", text: "12 passed" }] } } as const;
