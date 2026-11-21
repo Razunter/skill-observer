@@ -179,6 +179,8 @@ Each item gives the supplier or owner, what was requested and what resulted, the
 
 Report items are not asked about, not stored in the ledger and not offered again. You act on the summary. The rule against editing another extension's code is an instruction, not a check: Prepare cannot tell extension code from other project files by path.
 
+An extension that accepts lead references can investigate a specific note or a pending observation shown in the pass. It handles its own review and makes any resulting changes. Observer's form and proposal ledger do not record those decisions. If the extension is unavailable or the finding remains unresolved, the pass keeps it as a report item.
+
 ## Observer hooks and the companion extension
 
 An **observer hook** is a hook file a pass wrote after your approval. The **companion extension** is the one user-level extension a pass may edit. Both live in fixed directories, which the payload's directory line names:
