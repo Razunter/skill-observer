@@ -28,7 +28,7 @@ import {
 } from "./digest.js";
 import { type CatalogSummary, catalogSummary, registerCatalogCapture, renderCatalogSummary } from "./catalog.js";
 import { registerAmendmentDelivery } from "./delivery.js";
-import { harnessRootDirs, ledgerForProject, readLedger, renderLedger } from "./ledger.js";
+import { harnessRootDirs, type LedgerRecord, ledgerForProject, readLedger, renderLedger } from "./ledger.js";
 import type { AskDetails, ExtensionAPI, ExtensionContext } from "./omp.js";
 import {
   createProvenanceResolver,
@@ -47,14 +47,14 @@ import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
 import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
 import { evidenceReport, isEmptyEvidenceReport, renderEvidenceReport } from "./report.js";
 import { recordHookCall, recordHookResult } from "./session-tool-evidence.js";
-import { markObservationsShown, type Observation, pendingObservations, recordObservation, renderObservations } from "./observations.js";
+import { countPendingObservations, markObservationsShown, type Observation, pendingObservations, recordObservation, renderObservations } from "./observations.js";
+import { ObserverCommitUnknownError, observerStorePath } from "./observer-store.js";
 import { hasApprovalNote, hasCustomInput, observationPassStart } from "./proposal-approval.js";
 
 const STATUS_KEY = "skill-observer";
 /** Global, not per project: feedback about global skills gathers in one place. */
 const ledgerFile = () => join(ompAgentDir(), "skill-observer", "ledger.jsonl");
-/** Next to the ledger; each row names its project, so one file serves every project. */
-const observationsFile = () => join(ompAgentDir(), "skill-observer", "observations.jsonl");
+const storeFile = () => observerStorePath(ompAgentDir());
 /** Next to the ledger, outside the rules directory, so OMP never loads a reference file as a rule. */
 const referencesDir = () => join(ompAgentDir(), "skill-observer", "references");
 const ruleDirs = (): RuleDirs => ({ rulesDir: userRulesDir(), amendmentsDir: amendmentsDir() });
@@ -81,9 +81,9 @@ function refreshHint(_event: unknown, ctx: ExtensionContext): void {
   let observations = 0;
   if (corrections === 0 && workflows === 0) {
     try {
-      observations = pendingObservations(observationsFile(), ctx.cwd, new Date()).length;
-    } catch (error) {
-      console.error("skill-observer: reading observations for the status hint failed:", error);
+      observations = countPendingObservations(storeFile(), ctx.cwd, new Date());
+    } catch {
+      // Explicit operations report storage errors; routine status refreshes stay quiet.
     }
   }
   const hint = corrections > 0 ? plural(corrections, "skill correction")
@@ -100,6 +100,7 @@ interface PassEvidence {
   stale: readonly ObserverRule[];
   /** The project's pending observations. */
   observations: readonly Observation[];
+  ledger: readonly LedgerRecord[];
   roots: SkillRoots;
   provenance: ProvenanceResolver;
   catalog: CatalogSummary;
@@ -124,9 +125,8 @@ interface ObservationPayload {
 async function observationPayload(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
-  { note, digest, stale, observations, roots, provenance, catalog }: PassEvidence,
+  { note, digest, stale, observations, ledger, roots, provenance, catalog }: PassEvidence,
 ): Promise<ObservationPayload> {
-  const ledger = ledgerForProject(readLedger(ledgerFile()), ctx.cwd);
   const hookDirs = harnessRootDirs(ctx.cwd, ompAgentDir());
   const inForce = rulesInForce(ledger, readObserverRules(ruleDirs()), digest, referencesDir());
   const onReadAmendments = readOnReadAmendments(amendmentsDir());
@@ -267,9 +267,10 @@ export default function skillObserver(pi: ExtensionAPI): void {
       if (ctx.agent?.kind === "sub") return { content: [{ type: "text", text: "Nothing was recorded: only the main agent records observations." }], isError: true };
       let pending: number;
       try {
-        pending = recordObservation(observationsFile(), ctx.cwd, text, new Date());
+        pending = recordObservation(storeFile(), ctx.cwd, text, new Date());
       } catch (error) {
-        return { content: [{ type: "text", text: `Nothing was recorded: ${error instanceof Error ? error.message : String(error)}` }], isError: true };
+        const message = error instanceof Error ? error.message : String(error);
+        return { content: [{ type: "text", text: error instanceof ObserverCommitUnknownError ? message : `Nothing was recorded: ${message}` }], isError: true };
       }
       return {
         content: [{ type: "text", text: `Observation recorded. ${plural(pending, "observation")} ${pending === 1 ? "is" : "are"} pending for this project; the user's \`/observe\` reviews them.` }],
@@ -290,12 +291,13 @@ export default function skillObserver(pi: ExtensionAPI): void {
       let observations: Observation[];
       let payload: ObservationPayload;
       try {
-        observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
+        observations = pendingObservations(storeFile(), ctx.cwd, new Date());
         if (!note && isEmptyDigest(digest) && stale.length === 0 && observations.length === 0) {
           ctx.ui.notify("Nothing to observe: no skill signals, stale amendments or pending observations, and no note.", "info");
           return;
         }
-        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, roots, provenance, catalog: catalogSummary(branch, ctx.sessionManager.getEntries(), catalogGap(branch)) });
+        const ledger = ledgerForProject(readLedger(ledgerFile()), ctx.cwd);
+        payload = await observationPayload(pi, ctx, { note, digest, stale, observations, ledger, roots, provenance, catalog: catalogSummary(branch, ctx.sessionManager.getEntries(), catalogGap(branch)) });
       } catch (error) {
         ctx.ui.notify(`Observation pass not started: ${error instanceof Error ? error.message : String(error)}`, "error");
         return;
@@ -307,9 +309,9 @@ export default function skillObserver(pi: ExtensionAPI): void {
         { triggerTurn: true, deliverAs: "followUp" },
       );
       try {
-        markObservationsShown(observationsFile(), observations, new Date());
+        markObservationsShown(storeFile(), observations, new Date());
       } catch (error) {
-        ctx.ui.notify(`Observations not marked as shown: ${error instanceof Error ? error.message : String(error)}; the next /observe lists them again.`, "error");
+        ctx.ui.notify(`Observations not marked as shown: ${error instanceof Error ? error.message : String(error)}. They may appear in the next /observe.`, "warning");
       }
       refreshHint(undefined, ctx);
       ctx.ui.notify(
@@ -329,13 +331,14 @@ export default function skillObserver(pi: ExtensionAPI): void {
       const digest = buildDigest(branch, { provenance });
       const stale = findStaleAmendments(ruleDirs(), provenance);
       try {
-        const observations = pendingObservations(observationsFile(), ctx.cwd, new Date());
+        const observations = pendingObservations(storeFile(), ctx.cwd, new Date());
+        const ledger = ledgerForProject(readLedger(ledgerFile()), ctx.cwd);
         const catalog = catalogSummary(branch, ctx.sessionManager.getEntries(), catalogGap(branch));
         const report = evidenceReport({
-          digest, ledger: ledgerForProject(readLedger(ledgerFile()), ctx.cwd), stale, observations: observations.length, catalog,
+          digest, ledger, stale, observations: observations.length, catalog,
         });
         if (!isEmptyEvidenceReport(report)) {
-          report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, roots, provenance, catalog })).sections);
+          report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, ledger, roots, provenance, catalog })).sections);
         }
         ctx.ui.notify(renderEvidenceReport(report), "info");
       } catch (error) {

@@ -22,9 +22,9 @@
   },
   "scripts": {
     "generate": "bun scripts/generate-fragments.ts",
-    "test": "vitest run",
+    "test": "bun --no-env-file --bun x vitest run",
     "typecheck": "tsc --noEmit",
-    "check": "tsc --noEmit && vitest run"
+    "check": "tsc --noEmit && bun run test"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

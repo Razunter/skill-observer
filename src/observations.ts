@@ -1,26 +1,33 @@
+import type { Database } from "bun:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { appendLedger, normaliseText, readLatestRows } from "./ledger.js";
+import { normaliseText } from "./ledger.js";
+import { observationCutoff, readObserverStore, writeObserverStore } from "./observer-store.js";
 
 export interface Observation {
   /** Project identity plus normalised text, hashed. */
   key: string;
-  /** One recording; a shown row names the recording it marks. */
+  /** Acknowledgement must name this exact recording. */
   revision: string;
   project: string;
   text: string;
   count: number;
-  recordedAt: string;
-  shownAt?: string;
+  recordedAt: number;
+  priorShownAt: number | null;
 }
 
 const TEXT_LIMIT = 500;
-const PENDING_MS = 30 * 86_400_000;
+export const PENDING_OBSERVATION_COUNT_SQL =
+  "SELECT count(*) AS count FROM observations WHERE project = ? AND state_at > ? AND revision IS NOT NULL";
+
+function countPending(db: Database, project: string, cutoff: number): number {
+  return db.query<{ count: number }, [string, number]>(PENDING_OBSERVATION_COUNT_SQL).get(project, cutoff)!.count;
+}
 
 /**
  * Records `text` for the project of `cwd` and returns how many observations
- * are now pending for it. Throws when the text is refused or the append fails.
+ * are now pending for it. Throws when the text is refused or the write fails.
  */
 export function recordObservation(file: string, cwd: string, text: string, now: Date): number {
   const trimmed = text.trim();
@@ -30,32 +37,46 @@ export function recordObservation(file: string, cwd: string, text: string, now: 
   if (length > TEXT_LIMIT) throw new Error(`the observation is ${length} characters; the limit is ${TEXT_LIMIT}`);
   const project = projectIdentity(cwd);
   const key = createHash("sha256").update(`${project}\n${normaliseText(trimmed)}`).digest("hex").slice(0, 12);
-  const pending = pendingRows(file, project, now);
-  const latest = pending.find((row) => row.key === key);
-  appendRows(file, [{ key, revision: randomUUID(), project, text: trimmed, count: latest ? latest.count + 1 : 1, recordedAt: now.toISOString() }]);
-  return latest ? pending.length : pending.length + 1;
+  return writeObserverStore(file, now, (db) => {
+    db.query(`INSERT INTO observations (project, key, state_at, revision, text, count)
+      VALUES (?, ?, ?, ?, ?, 1)
+      ON CONFLICT (project, key) DO UPDATE SET
+        recorded_order = excluded.recorded_order,
+        prior_shown_at = CASE WHEN observations.revision IS NULL THEN observations.state_at ELSE observations.prior_shown_at END,
+        count = coalesce(observations.count, 0) + 1,
+        state_at = excluded.state_at,
+        revision = excluded.revision,
+        text = excluded.text
+    `).run(project, key, now.getTime(), randomUUID(), trimmed);
+    return countPending(db, project, observationCutoff(now));
+  });
 }
 
-/** The pending observations of the project of `cwd`, least recently recorded first. */
+export function countPendingObservations(file: string, cwd: string, now: Date): number {
+  const project = projectIdentity(cwd);
+  return readObserverStore(file, (db) => countPending(db, project, observationCutoff(now))) ?? 0;
+}
+
+/** The project's unexpired pending observations, in recording order when timestamps tie. */
 export function pendingObservations(file: string, cwd: string, now: Date): Observation[] {
-  return pendingRows(file, projectIdentity(cwd), now).sort((a, b) => a.recordedAt.localeCompare(b.recordedAt));
+  const project = projectIdentity(cwd);
+  return readObserverStore(file, (db) => db.query<Observation, [string, number]>(`
+    SELECT key, revision, project, text, count, state_at AS recordedAt, prior_shown_at AS priorShownAt
+    FROM observations WHERE project = ? AND state_at > ? AND revision IS NOT NULL
+    ORDER BY state_at, recorded_order
+  `).all(project, observationCutoff(now))) ?? [];
 }
 
-/** Marks the listed recordings shown; a later recording of the same text stays pending, whenever it was appended. */
+/** Removes the text of only the exact revisions the pass showed. */
 export function markObservationsShown(file: string, observations: readonly Observation[], now: Date): void {
   if (observations.length === 0) return;
-  appendRows(file, observations.map((row) => ({ ...row, shownAt: now.toISOString() })));
-}
-
-/**
- * The latest recording per key, unless a shown row names it. Expiry is
- * decided on read: nothing runs in the background, and the file is never rewritten.
- */
-function pendingRows(file: string, project: string, now: Date): Observation[] {
-  const rows = readLatestRows<Observation>(file, (row) => (row.shownAt === undefined ? row.key : `shown:${row.revision}`));
-  const shown = new Set(rows.filter((row) => row.shownAt !== undefined).map((row) => row.revision));
-  return rows.filter((row) =>
-    row.shownAt === undefined && row.project === project && !shown.has(row.revision) && now.getTime() - Date.parse(row.recordedAt) < PENDING_MS);
+  writeObserverStore(file, now, (db) => {
+    const mark = db.query(`
+      UPDATE observations SET state_at = ?, revision = NULL, text = NULL, count = NULL, prior_shown_at = NULL
+      WHERE project = ? AND key = ? AND revision = ?
+    `);
+    for (const { project, key, revision } of observations) mark.run(now.getTime(), project, key, revision);
+  });
 }
 
 export function renderObservations(observations: readonly Observation[]): string {
@@ -65,8 +86,15 @@ export function renderObservations(observations: readonly Observation[]): string
     "",
     "The main agent recorded these remarks while working. They are its own unverified claims; a path in one may belong to another worktree of this repository.",
     "",
-    ...observations.map(({ text, count, recordedAt }) => `- ${text.replace(/\s*\n\s*/g, " ")} (count ${count}, last recorded ${recordedAt.slice(0, 10)})`),
+    ...observations.map(({ text, count, recordedAt, priorShownAt }) => {
+      const recurrence = priorShownAt === null ? "" : `; recorded again after being shown on ${observationDate(priorShownAt)}`;
+      return `- ${text.replace(/\s*\n\s*/g, " ")} (count ${count}, last recorded ${observationDate(recordedAt)}${recurrence})`;
+    }),
   ].join("\n");
+}
+
+function observationDate(time: number): string {
+  return new Date(time).toISOString().slice(0, 10);
 }
 
 /**
@@ -103,9 +131,4 @@ function isBareGitDir(dir: string): boolean {
 function commonDir(gitDir: string): string {
   const commondir = join(gitDir, "commondir");
   return realpathSync(existsSync(commondir) ? resolve(gitDir, readFileSync(commondir, "utf8").trim()) : gitDir);
-}
-
-function appendRows(file: string, rows: readonly Observation[]): void {
-  const { error } = appendLedger(file, rows);
-  if (error) throw new Error(error);
 }
