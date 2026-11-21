@@ -6691,6 +6691,35 @@ describe("migrated observer state", () => {
 });
 
 describe("/observe-report", () => {
+  it.each(["committed", "locked"] as const)("reads a %s store safely from the standalone report", async (state) => {
+    const host = loadExtension();
+    await host.callTool("observe", { text: "Standalone report fixture evidence." });
+    const session = join(host.skillHome.home, "recorded-session.jsonl");
+    writeFileSync(session, JSON.stringify({ type: "session", cwd: host.skillHome.roots.cwd }));
+    const before = readFileSync(host.ledgerFile);
+    const files = readdirSync(dirname(host.ledgerFile));
+    const lock = state === "locked" ? new Database(host.ledgerFile) : undefined;
+    try {
+      lock?.run("BEGIN EXCLUSIVE");
+      const script = fileURLToPath(new URL("../scripts/observe-report.ts", import.meta.url));
+      const result = spawnSync(process.execPath, ["--no-env-file", script, session], { encoding: "utf8", timeout: 5_000 });
+      if (lock) {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toMatch(/Evidence report not shown: .*database is locked/i);
+      } else {
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toMatch(/^Evidence report \(no observation pass started\)/);
+        expect(result.stdout).toContain("Pending observations: 1");
+        expect(result.stdout).not.toContain("Standalone report fixture evidence.");
+      }
+      expect(readFileSync(host.ledgerFile)).toEqual(before);
+      expect(readdirSync(dirname(host.ledgerFile))).toEqual(files);
+    } finally {
+      if (lock?.inTransaction) lock.run("ROLLBACK");
+      lock?.close();
+    }
+  });
+
   const TEST_RUN = { type: "message", id: "call-run-tests", message: { role: "assistant", content: [{ type: "toolCall", id: "run-tests", name: "bash", arguments: { command: "bun test" } }] } } as const;
   const TEST_RESULT = { type: "message", id: "result-run-tests", message: { role: "toolResult", toolCallId: "run-tests", toolName: "bash", content: [{ type: "text", text: "12 passed" }] } } as const;
 

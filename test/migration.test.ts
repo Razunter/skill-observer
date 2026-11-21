@@ -5,10 +5,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpath
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { readLedger } from "../src/ledger.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readLedger, readLedgerDecision } from "../src/ledger.js";
 import { readPendingObservations, recordObservation } from "../src/observations.js";
 import { observerStorePath, readObserverStore, writeObserverStore } from "../src/observer-store.js";
+import type { ExtensionAPI, ExtensionContext, Schema, ToolDefinition } from "../src/omp.js";
+import skillObserver from "../src/skill-observer.js";
 
 const script = fileURLToPath(new URL("../scripts/migrate-observer-store.ts", import.meta.url));
 let root: string;
@@ -25,7 +27,10 @@ beforeEach(() => {
   observations = join(dirname(store), "observations.jsonl");
 });
 
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(root, { recursive: true, force: true });
+});
 
 function cli(args: string[] = ["--agent-dir", agent], { envAgent = join(root, "environment-agent"), preload }: { envAgent?: string | null; preload?: string } = {}) {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: root };
@@ -115,6 +120,63 @@ describe("observer store migration", () => {
     expect(readFileSync(ledger, "utf8")).toBe("no longer valid JSONL");
   });
 
+  it("previews and imports an explicit opaque skill fingerprint verbatim", () => {
+    const record = decision("fp-tdd", { outcome: "declined" });
+    const original = jsonl(record);
+    mkdirSync(dirname(store), { recursive: true });
+    writeFileSync(ledger, original);
+
+    const preview = cli();
+    expect(preview.status, preview.stderr).toBe(0);
+    expect(preview.stdout).toContain("Retain: 1 proposal decisions");
+    expect(existsSync(store)).toBe(false);
+
+    const apply = cli(["--agent-dir", agent, "--apply"]);
+    expect(apply.status, apply.stderr).toBe(0);
+    expect(readObserverStore(store, (db) => readLedgerDecision(db, "fp-tdd"))).toEqual(record);
+    expect(readFileSync(ledger, "utf8")).toBe(original);
+  });
+
+  it.each([
+    { firstDaysAgo: 31, duplicateDaysAgo: 1, expectRecurrence: false },
+    { firstDaysAgo: 2, duplicateDaysAgo: 1, expectRecurrence: true },
+    { firstDaysAgo: 1, duplicateDaysAgo: 2, expectRecurrence: true },
+  ])("uses the first exact legacy acknowledgement ($firstDaysAgo days ago, duplicate $duplicateDaysAgo days ago)", async ({
+    firstDaysAgo, duplicateDaysAgo, expectRecurrence,
+  }) => {
+    const now = Date.now();
+    const daysAgo = (days: number) => new Date(now - days * 86_400_000).toISOString();
+    const shown = observation("Private shown remark", daysAgo(32));
+    const first = daysAgo(firstDaysAgo);
+    const duplicate = daysAgo(duplicateDaysAgo);
+    mkdirSync(dirname(store), { recursive: true });
+    writeFileSync(observations, jsonl(shown,
+      { ...shown, project: join(root, "other-project"), shownAt: duplicate },
+      { ...shown, key: "123456789abc", shownAt: duplicate },
+      { ...shown, shownAt: first },
+      { ...shown, shownAt: duplicate },
+    ));
+    const apply = cli(["--agent-dir", agent, "--apply"]);
+    expect(apply.status, apply.stderr).toBe(0);
+    const read = () => readObserverStore(store, (db) => readPendingObservations(db, root, new Date()));
+    expect(read()).toEqual([]);
+
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("PI_CODING_AGENT_DIR", agent);
+    const schema: Schema = { optional: () => schema, describe: () => schema };
+    const zod = Object.fromEntries(["object", "array", "string", "number", "enum", "union", "record", "unknown"].map((name) => [name, () => schema]));
+    const tools = new Map<string, ToolDefinition<{ text: string }, undefined>>();
+    skillObserver({
+      zod,
+      on: () => {},
+      registerCommand: () => {},
+      registerTool: (tool: ToolDefinition<{ text: string }, undefined>) => tools.set(tool.name, tool),
+    } as unknown as ExtensionAPI);
+    const result = await tools.get("observe")!.execute("record-again", { text: shown.text }, undefined, undefined, { cwd: root } as ExtensionContext);
+    expect(result.content[0]?.text).toContain("Observation recorded. 1 observation is pending");
+    expect(read()).toMatchObject([{ key: shown.key, count: 1, priorShownAt: expectRecurrence ? Date.parse(first) : null }]);
+  });
+
   it.each(["environment", "default"] as const)("resolves the %s agent directory and handles empty or absent sources", (location) => {
     const envAgent = location === "environment" ? agent : null;
     const destination = observerStorePath(envAgent ?? join(root, ".omp", "agent"));
@@ -143,6 +205,11 @@ describe("observer store migration", () => {
     ["UTF-8 BOM", "\ufeff" + jsonl(decision("a00000000000"))],
     ["invalid decision hidden by later answer", jsonl(decision("a00000000000", { outcome: "unsupported" }), decision("a00000000000"))],
     ["invalid known field", jsonl(decision("a00000000000", { evidence: [{ quote: "private evidence", count: {} }] }))],
+    ["blank skill fingerprint", jsonl(decision(" "))],
+    ["opaque project fingerprint", jsonl(decision("fp-project", { kind: "project", skill: undefined,
+      target: { scope: "project", root: "/retired/project", path: "guide.md", mechanism: "remember checks" } }))],
+    ["opaque harness fingerprint", jsonl(decision("fp-harness", { kind: "harness", skill: undefined,
+      target: { scope: "harness", root: "global-hooks", path: "sample.ts", mechanism: "guard the check" } }))],
     ["unsupported row", "[]"],
   ])("refuses %s without publishing", (_label, input) => {
     mkdirSync(dirname(store), { recursive: true });

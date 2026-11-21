@@ -105,10 +105,11 @@ function readSource<T>(dir: string, name: string, parse: (value: unknown) => T |
 
 function reduceObservations(rows: readonly LegacyObservation[], cutoff: number) {
   const recordings = new Map<string, LegacyObservation>();
-  const shown = new Map<string, LegacyObservation & { shownAt: number }>();
+  const shown = new Map<string, number>();
   for (const row of rows) {
     if (row.shownAt !== undefined) {
-      shown.set(row.revision, { ...row, shownAt: row.shownAt });
+      const revisionIdentity = JSON.stringify([row.project, row.key, row.revision]);
+      if (!shown.has(revisionIdentity)) shown.set(revisionIdentity, row.shownAt);
       continue;
     }
     // The append order picks the winning recording and breaks ties in its recording time.
@@ -119,9 +120,9 @@ function reduceObservations(rows: readonly LegacyObservation[], cutoff: number) 
   const pending: LegacyObservation[] = [];
   const markers: { project: string; key: string; shownAt: number }[] = [];
   for (const row of recordings.values()) {
-    const acknowledgement = shown.get(row.revision);
-    if (acknowledgement?.project === row.project && acknowledgement.key === row.key) {
-      if (acknowledgement.shownAt > cutoff) markers.push({ project: row.project, key: row.key, shownAt: acknowledgement.shownAt });
+    const shownAt = shown.get(JSON.stringify([row.project, row.key, row.revision]));
+    if (shownAt !== undefined) {
+      if (shownAt > cutoff) markers.push({ project: row.project, key: row.key, shownAt });
     } else if (row.recordedAt > cutoff) {
       pending.push(row);
     }
@@ -142,7 +143,7 @@ function parseObservation(value: unknown): LegacyObservation | undefined {
 function isLedgerRecord(value: unknown): value is LedgerRecord {
   if (!object(value)) return false;
   const { type, fingerprint, kind, skill, gist, outcome, timestamp, sessionId, evidence, reoffer, rule, compaction, experimentResult, target, publication } = value;
-  if (type !== undefined || !nonempty(fingerprint) || !/^[0-9a-f]{11,12}$/.test(fingerprint) || !nonempty(gist) ||
+  if (type !== undefined || !nonempty(fingerprint) || !nonempty(gist) ||
       !nonempty(outcome) || !outcomes.has(outcome) || !isoDate(timestamp) || !nonempty(sessionId) ||
       (reoffer !== undefined && !nonempty(reoffer)) ||
       (evidence !== undefined && (!Array.isArray(evidence) || !evidence.every((item: unknown) =>
@@ -155,7 +156,8 @@ function isLedgerRecord(value: unknown): value is LedgerRecord {
     return nonempty(skill) && target === undefined && publication === undefined && (rule === undefined || nonempty(rule)) &&
       (compaction === undefined || compaction === true);
   }
-  if (skill !== undefined || rule !== undefined || compaction !== undefined || !object(target) || !nonempty(target.mechanism)) return false;
+  if (!/^[0-9a-f]{11,12}$/.test(fingerprint) || skill !== undefined || rule !== undefined || compaction !== undefined ||
+      !object(target) || !nonempty(target.mechanism)) return false;
   if (kind === "project") {
     return target.scope === "project" && nonempty(target.root) && isAbsolute(target.root) && relativeFile(target.path) &&
       (publication === undefined || (object(publication) && nonempty(publication.writeToolCallId) &&

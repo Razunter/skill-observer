@@ -8,10 +8,11 @@
  * managed skills and observer state are copied to a temp dir first, because
  * loading the extension migrates rule files. The fake host has no judge role.
  */
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { CommandHandler, ExtensionAPI, ExtensionContext, Schema, SessionEntry } from "../src/omp.js";
+import { observerStorePath, readObserverStore } from "../src/observer-store.js";
 import { ompAgentDir } from "../src/provenance.js";
 
 const [sessionFile, leafId] = process.argv.slice(2);
@@ -29,12 +30,28 @@ const cwd = rows.find((row) => row.type === "session")?.cwd ?? process.cwd();
 
 const liveAgentDir = ompAgentDir();
 const agentDir = mkdtempSync(join(tmpdir(), "observe-report-"));
-for (const name of ["skill-observer", "rules", "managed-skills"]) {
-  if (existsSync(join(liveAgentDir, name))) cpSync(join(liveAgentDir, name), join(agentDir, name), { recursive: true });
-}
-process.env.PI_CODING_AGENT_DIR = agentDir;
-
+const liveStore = observerStorePath(liveAgentDir);
+const copiedStore = observerStorePath(agentDir);
 try {
+  for (const name of ["skill-observer", "rules", "managed-skills"]) {
+    const path = join(liveAgentDir, name);
+    if (!existsSync(path)) continue;
+    const source = realpathSync(path);
+    const store = join(source, basename(liveStore));
+    const stagingPrefix = join(source, ".observer-store-");
+    cpSync(source, join(agentDir, name), {
+      recursive: true,
+      filter: (entry) => name !== "skill-observer" ||
+        (entry !== store && !entry.startsWith(`${store}-`) && !entry.startsWith(stagingPrefix)),
+    });
+  }
+  // The shared read lock keeps database pages stable while copying the image.
+  readObserverStore(liveStore, () => {
+    mkdirSync(dirname(copiedStore), { recursive: true });
+    copyFileSync(liveStore, copiedStore);
+  });
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+
   const schema: Schema = { optional: () => schema, describe: () => schema };
   const builder = () => schema;
   const commands: Record<string, CommandHandler> = {};
@@ -46,7 +63,7 @@ try {
   } as unknown as ExtensionAPI;
   const ctx = {
     hasUI: true, agent: { kind: "main" }, cwd,
-    sessionManager: { getBranch: () => branch, getSessionId: () => "observe-report" },
+    sessionManager: { getBranch: () => branch, getEntries: () => rows, getSessionId: () => "observe-report" },
     modelRegistry: { getAvailable: () => [] },
     ui: { setStatus: () => {}, notify: (message: string) => console.log(message) },
   } as unknown as ExtensionContext;
@@ -54,6 +71,9 @@ try {
   const { default: skillObserver } = await import("../src/skill-observer.js");
   skillObserver(pi);
   await commands["observe-report"]!("", ctx);
+} catch (error) {
+  console.error(`Evidence report not shown: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 1;
 } finally {
   rmSync(agentDir, { recursive: true, force: true });
 }
