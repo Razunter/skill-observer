@@ -77,7 +77,7 @@ describe("instructionText", () => {
 
 describe("toolResultGuidance", () => {
   it("maps each error-path condition to its own tool-result paragraph of observer.md", () => {
-    const guidance = (["changed-target", "ledger-append-failed", "cleanup-failed", "custom-input", "approval-note"] as const).map(toolResultGuidance);
+    const guidance = (["changed-target", "ledger-recording-failed", "cleanup-failed", "custom-input", "approval-note"] as const).map(toolResultGuidance);
     const toolResult = fragments.filter(({ gate }) => gate === "tool-result").map(({ text }) => text);
     expect(new Set(guidance)).toEqual(new Set(toolResult));
     expect(guidance[0]).toMatch(/^\*\*A changed target\.\*\*/);

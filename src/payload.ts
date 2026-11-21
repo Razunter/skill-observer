@@ -154,11 +154,11 @@ export function instructionText(gates: ReadonlySet<Gate>): string {
   return joinFragments(observerFragments().filter(({ gate }) => gate === undefined || (gate !== "tool-result" && gates.has(gate))));
 }
 
-export type ToolResultCondition = "changed-target" | "ledger-append-failed" | "cleanup-failed" | "custom-input" | "approval-note";
+export type ToolResultCondition = "changed-target" | "ledger-recording-failed" | "cleanup-failed" | "custom-input" | "approval-note";
 
 const TOOL_RESULT_TITLES: Record<ToolResultCondition, string> = {
   "changed-target": "A changed target.",
-  "ledger-append-failed": "A failed ledger append.",
+  "ledger-recording-failed": "A failed ledger recording.",
   "cleanup-failed": "A failed cleanup.",
   "custom-input": "Custom input.",
   "approval-note": "An approval note.",

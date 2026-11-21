@@ -1,12 +1,14 @@
 /**
  * The proposal ledger: the user's answers to observation-pass proposals, kept
- * across sessions and projects so declines stick and deferrals come back. It is
- * an append-only JSONL file; the latest record per fingerprint wins.
+ * across sessions and projects so declines stick and deferrals come back. It
+ * keeps the latest answer per fingerprint in answer order.
  */
 
+import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
+import { readObserverStore } from "./observer-store.js";
 import { ompAgentDir } from "./provenance.js";
 
 export const PROPOSAL_KINDS = ["local", "managed", "upstream", "plugin", "new"] as const;
@@ -289,90 +291,28 @@ export function proposalFingerprint(skill: string, gist: string): string {
   return createHash("sha256").update(`${skill.trim()}\n${normaliseText(gist)}`).digest("hex").slice(0, 12);
 }
 
-/** Whether a record reached the ledger, as the file's bytes show; `unknown` when a failed append left bytes that can't settle it. */
-export type Recording = "recorded" | "unrecorded" | "unknown";
-
-export interface LedgerAppend {
-  /** One per record, in order. */
-  rows: Recording[];
-  /** Why the append failed. */
-  error?: string;
-}
-
-/**
- * Appends `records`. When the append fails, one read of the file shows which
- * of them it wrote whole: an exception does not prove that nothing was
- * written. Nothing is retried.
- */
-export function appendLedger(file: string, records: readonly object[]): LedgerAppend {
-  const lines = records.map((record) => Buffer.from(`${JSON.stringify(record)}\n`));
-  let existing: Buffer;
-  try {
-    mkdirSync(dirname(file), { recursive: true });
-    existing = existsSync(file) ? readFileSync(file) : Buffer.alloc(0);
-  } catch (error) {
-    // Nothing reached `appendFileSync`, so no row was written.
-    return { rows: lines.map(() => "unrecorded"), error: (error as Error).message };
-  }
-  // After an interrupted append, start on a fresh line so the torn one doesn't swallow the first new record.
-  const separator = Buffer.from(existing.length === 0 || existing.at(-1) === 0x0a ? "" : "\n");
-  const appended = Buffer.concat([separator, ...lines]);
-  try {
-    appendFileSync(file, appended);
-    return { rows: lines.map(() => "recorded") };
-  } catch (error) {
-    return { rows: writtenRows(file, existing, separator, lines), error: (error as Error).message };
-  }
-}
-
-/**
- * Which of `lines` the file holds whole after a failed append of them after
- * `separator` to `existing`: it must still start with `existing` and go on
- * with a prefix of what was appended. A line whose JSON is complete reads as
- * a record even without its newline.
- */
-function writtenRows(file: string, existing: Buffer, separator: Buffer, lines: readonly Buffer[]): Recording[] {
-  let now: Buffer;
-  try {
-    now = readFileSync(file);
-  } catch (error) {
-    // A file that isn't there holds no record; one that can't be read settles nothing.
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return lines.map(() => "unknown");
-    now = Buffer.alloc(0);
-  }
-  const tail = now.subarray(existing.length);
-  const appended = Buffer.concat([separator, ...lines]);
-  if (!now.subarray(0, existing.length).equals(existing) || !appended.subarray(0, tail.length).equals(tail)) return lines.map(() => "unknown");
-  let end = separator.length;
-  return lines.map((line) => {
-    end += line.length;
-    return tail.length >= end - 1 ? "recorded" : "unrecorded";
-  });
-}
-
 /** The latest record per fingerprint, oldest answer first. */
 export function readLedger(file: string): LedgerRecord[] {
-  return readLatestRows<LedgerRecord>(file, (record) => record.fingerprint);
+  return readObserverStore(file, readLedgerRows) ?? [];
 }
 
-/** The latest row per key of an append-only JSONL file, in file order of those rows. */
-export function readLatestRows<T extends object>(file: string, keyOf: (row: T) => string): T[] {
-  if (!existsSync(file)) return [];
-  const latest = new Map<string, T>();
-  for (const line of readFileSync(file, "utf8").split("\n")) {
-    if (!line.trim()) continue;
-    let row: T;
-    try {
-      row = JSON.parse(line);
-    } catch {
-      // A line cut short by an interrupted append carries no row; the rest of the file still holds.
-      continue;
-    }
-    if (!row || typeof row !== "object") continue;
-    latest.delete(keyOf(row));
-    latest.set(keyOf(row), row);
+export function readLedgerRows(db: Database): LedgerRecord[] {
+  return db.query<{ record: string }, []>("SELECT record FROM proposals ORDER BY answer_order").all()
+    .map(({ record }) => JSON.parse(record) as LedgerRecord);
+}
+
+/** Replace each decision and move it to the end of the answer order within the caller's transaction. */
+export function putLedgerRecords(db: Database, records: readonly LedgerRecord[]): void {
+  const put = db.query(`
+    INSERT INTO proposals (fingerprint, rule_name, hook_file_key, record) VALUES (?, ?, ?, ?)
+    ON CONFLICT (fingerprint) DO UPDATE SET
+      answer_order = excluded.answer_order, rule_name = excluded.rule_name,
+      hook_file_key = excluded.hook_file_key, record = excluded.record
+  `);
+  for (const record of records) {
+    put.run(record.fingerprint, record.rule === undefined ? null : basename(record.rule, ".md"),
+      record.kind === "harness" ? hookFileKey(record.target, record.fingerprint) ?? null : null, JSON.stringify(record));
   }
-  return [...latest.values()];
 }
 
 /** Outcomes that leave a fix applied: applied, or its amendment kept or re-pinned at a stale check. */

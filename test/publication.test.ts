@@ -1,4 +1,6 @@
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { PathLike } from "node:fs";
 import type * as NodeFS from "node:fs";
 import { basename, join } from "node:path";
@@ -8,6 +10,8 @@ import { registerReviewTool } from "../src/review.js";
 import { OBSERVATION_MESSAGE_TYPE } from "../src/digest.js";
 import type { AskDetails, ExtensionAPI, ExtensionContext, Schema, SessionEntry, ToolDefinition, ToolResultDetails } from "../src/omp.js";
 import { type Evidence, readLedger, type LedgerRecord } from "../src/ledger.js";
+import { readObserverStore, writeObserverStore } from "../src/observer-store.js";
+import { markObservationsShown, readPendingObservations, recordObservation } from "../src/observations.js";
 import * as amendments from "../src/amendments.js";
 import { replaceReferenceFiles } from "../src/references.js";
 import { buildDigest } from "../src/digest.js";
@@ -20,7 +24,6 @@ import { makeSkillHome } from "./skill-home.js";
 
 const renameFault = vi.hoisted(() => ({ check: undefined as ((from: PathLike, to: PathLike) => void) | undefined }));
 const writeFault = vi.hoisted(() => ({ check: undefined as ((file: unknown, data: unknown) => void) | undefined }));
-const appendFault = vi.hoisted(() => ({ check: undefined as ((file: unknown, data: unknown) => void) | undefined }));
 const readFault = vi.hoisted(() => ({ check: undefined as ((file: unknown) => void) | undefined }));
 vi.mock("node:fs", async importOriginal => {
   const actual = await importOriginal<typeof NodeFS>();
@@ -34,10 +37,6 @@ vi.mock("node:fs", async importOriginal => {
       writeFault.check?.(args[0], args[1]);
       actual.writeFileSync(...args);
     },
-    appendFileSync(...args: Parameters<typeof actual.appendFileSync>) {
-      appendFault.check?.(args[0], args[1]);
-      actual.appendFileSync(...args);
-    },
     readFileSync: ((...args: Parameters<typeof actual.readFileSync>) => {
       readFault.check?.(args[0]);
       return actual.readFileSync(...args);
@@ -47,7 +46,7 @@ vi.mock("node:fs", async importOriginal => {
 
 const homes: string[] = [];
 afterEach(() => {
-  renameFault.check = undefined; writeFault.check = undefined; appendFault.check = undefined; readFault.check = undefined;
+  renameFault.check = undefined; writeFault.check = undefined; readFault.check = undefined;
   vi.restoreAllMocks(); vi.unstubAllEnvs(); for (const home of homes.splice(0)) rmSync(home, { recursive: true, force: true });
 });
 function fixture() {
@@ -59,7 +58,7 @@ function fixture() {
   type Selected = { reference: unknown; proposal: { candidateId: string; gist: string; preview: string; alternatives?: Array<{ change: { operation: string }; preview: string }> } };
   type Details = { failures: string[]; deferred: string[]; cleanup: string[]; records: LedgerRecord[]; publications: unknown[]; selected: Selected[]; recording: { rows: string[]; error?: string } };
   const tools: Record<string, ToolDefinition<unknown, Details>> = {};
-  const files = { ledgerFile: () => join(home, "ledger.jsonl"), rulesDir: () => join(home, "rules"), amendmentsDir: () => join(home, "amendments"), referencesDir: () => join(home, "refs") };
+  const files = { storeFile: () => join(home, "observer.sqlite"), rulesDir: () => join(home, "rules"), amendmentsDir: () => join(home, "amendments"), referencesDir: () => join(home, "refs") };
   const pi = { zod, registerTool: (value: ToolDefinition<unknown, Details>) => { tools[value.name] = value; }, appendEntry: () => {} } as unknown as ExtensionAPI;
   registerResolveTool(pi, files);
   registerReviewTool(pi, files, () => undefined);
@@ -107,19 +106,31 @@ function fixture() {
   /** A compaction candidate of `tdd`'s on-read amendment, covering no addition of its Prepare. */
   const compaction = (body: string, references: Array<{ name: string; body: string }> = []) =>
     ({ kind: "upstream", skill: "tdd", gist: "Compact tdd", priority: "compaction", remedy: "Keep it short", change: { operation: "compaction", includes: [], body, references } });
-  return { files, roots, run, add, approve, withdraw, compaction, branch: () => branch };
+  const saveTool = (id: string, name: string, args: Record<string, unknown>, details?: ToolResultDetails) => {
+    branch = [...branch, toolCall(id, name, args),
+      { type: "message", message: { role: "toolResult", toolCallId: id, toolName: name, content: "ok", isError: false, ...(details && { details }) } }];
+  };
+  return { files, roots, run, add, approve, withdraw, compaction, saveTool, branch: () => branch };
 }
 const toolCall = (id: string, name: string, args: Record<string, unknown>): SessionEntry =>
   ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } });
+it("refuses Resolve on an unmigrated profile even when its legacy proposal ledger is empty", async () => {
+  const f = fixture();
+  writeFileSync(join(f.roots.cwd, "..", "ledger.jsonl"), "");
+  const result = await f.run({ outcomes: [{ skill: "tdd", kind: "upstream", gist: "Skip it", outcome: "declined" }] });
+  expect(result.isError).toBe(true);
+  expect(result.content[0]?.text).toContain("scripts/migrate-observer-store.ts");
+  expect(existsSync(f.files.storeFile())).toBe(false);
+});
 it.each(["later", "declined"])("binds an existing fingerprint to its skill for %s while accepting a reworded gist", async outcome => {
   const f = fixture(); await f.add("first");
-  const original = readLedger(f.files.ledgerFile())[0]!;
+  const original = readLedger(f.files.storeFile())[0]!;
   const bad = await f.run({ outcomes: [{ skill: "domain-modeling", kind: "upstream", gist: "reworded", fingerprint: original.fingerprint, outcome }] });
   expect(bad.details.failures).toHaveLength(1);
-  expect(readLedger(f.files.ledgerFile())).toHaveLength(1);
+  expect(readLedger(f.files.storeFile())).toHaveLength(1);
   const good = await f.run({ outcomes: [{ skill: "tdd", kind: "upstream", gist: "reworded", fingerprint: original.fingerprint, outcome: "later" }] });
   expect(good.details.failures).toEqual([]);
-  expect(readLedger(f.files.ledgerFile()).at(-1)?.gist).toBe("reworded");
+  expect(readLedger(f.files.storeFile()).at(-1)?.gist).toBe("reworded");
 });
 it("binds a new fingerprint to the first skill claiming it in one batch", async () => {
   const f = fixture();
@@ -128,7 +139,7 @@ it("binds a new fingerprint to the first skill claiming it in one batch", async 
     { skill: "domain-modeling", kind: "upstream", gist: "second", fingerprint: "shared", outcome: "later" },
   ] });
   expect(result.details.failures).toHaveLength(1);
-  expect(readLedger(f.files.ledgerFile())).toMatchObject([{ fingerprint: "shared", skill: "tdd", outcome: "declined" }]);
+  expect(readLedger(f.files.storeFile())).toMatchObject([{ fingerprint: "shared", skill: "tdd", outcome: "declined" }]);
 });
 it("lets a later skill claim a fingerprint whose first claimant failed validation", async () => {
   const f = fixture();
@@ -137,7 +148,7 @@ it("lets a later skill claim a fingerprint whose first claimant failed validatio
     { skill: "domain-modeling", kind: "upstream", gist: "second", fingerprint: "shared", outcome: "later" },
   ] });
   expect(result.details.failures).toHaveLength(1);
-  expect(readLedger(f.files.ledgerFile())).toMatchObject([{ fingerprint: "shared", skill: "domain-modeling", outcome: "later" }]);
+  expect(readLedger(f.files.storeFile())).toMatchObject([{ fingerprint: "shared", skill: "domain-modeling", outcome: "later" }]);
 });
 /** Writes half the data to a rule file, as a full disk would, then fails. */
 function failRuleWriteMidway(rulesDir: string) {
@@ -175,7 +186,7 @@ it("does not count an addition whose append failed toward the coverage of a comp
   expect(result.details.deferred).toEqual([expect.stringContaining("includes additions this call didn't apply")]);
   expect(result.details.publications).toEqual([]);
   expect(readFileSync(path, "utf8")).toBe(before);
-  expect(readLedger(f.files.ledgerFile()).slice(1)).toMatchObject([{ compaction: true, outcome: "later" }]);
+  expect(readLedger(f.files.storeFile()).slice(1)).toMatchObject([{ compaction: true, outcome: "later" }]);
 });
 it("keeps a rule intact when rewriting it fails midway", () => {
   const f = fixture();
@@ -203,7 +214,7 @@ it("classifies a resolver-published remedy by the rule name its delivery carries
   const f = fixture();
   const evidence = [{ quote: 'Tool error in `bash` "check": "failed"', count: 1 }];
   await f.add("check", "tdd", evidence);
-  const record = readLedger(f.files.ledgerFile())[0]!;
+  const record = readLedger(f.files.storeFile())[0]!;
   const name = basename(record.rule!, ".md");
   const env = { provenance: { byName: (skill: string) => ({ kind: "unknown" as const, name: skill }), byPath: (path: string) => ({ kind: "unknown" as const, name: path }) } };
   const digest = buildDigest([
@@ -215,7 +226,7 @@ it("classifies a resolver-published remedy by the rule name its delivery carries
 });
 it.each(["body", "references"])("rejects conflicting same-amendment withdrawal %s before either writes", async difference => {
   const f = fixture(); await f.add("first"); await f.add("second");
-  const records = readLedger(f.files.ledgerFile());
+  const records = readLedger(f.files.storeFile());
   const before = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!.body;
   const body = `Remaining; read ${join(f.files.referencesDir(), "tdd", "keep.md")}`;
   const outcomes = await f.withdraw(records, (i) => ({ body: difference === "body" && i ? `${body}\nDifferent` : body,
@@ -224,11 +235,11 @@ it.each(["body", "references"])("rejects conflicting same-amendment withdrawal %
   expect(result.details.failures.join(" ")).toContain("identical final body and references");
   expect(result.details.failures).toHaveLength(2);
   expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!.body).toBe(before);
-  expect(readLedger(f.files.ledgerFile())).toHaveLength(2);
+  expect(readLedger(f.files.storeFile())).toHaveLength(2);
 });
 it("accepts identical withdrawals and defers a compaction drafted before them", async () => {
   const f = fixture(); await f.add("first"); await f.add("second");
-  const records = readLedger(f.files.ledgerFile());
+  const records = readLedger(f.files.storeFile());
   const approvals = await f.approve([...records.map((record) => ({ kind: "upstream", skill: "tdd", gist: record.gist, fingerprint: record.fingerprint, priority: "note",
     remedy: "Take it back", change: { operation: "withdrawal", body: "Remaining.", references: [] } })), f.compaction("Resurrected fixes.")]);
   const outcomes = records.map((record, i) => ({ skill: "tdd", kind: "upstream", gist: record.gist, fingerprint: record.fingerprint, outcome: "withdrawn", approval: approvals[i] }));
@@ -251,13 +262,13 @@ it.each(["stale", "withdrawal", "compaction"])("restores previous references aft
     change: { operation, rule: amendment.name, ...(operation === "stale-update" && { body, references }) } })), "Update");
   const params = stale ? { outcomes: [], stale: [{ rule: amendment.name, action: "update", approval: stale[0] }] }
     : mode === "compaction" ? { outcomes: [], compactions: [{ skill: "tdd", outcome: "applied", approval: (await f.approve([f.compaction(body, references)]))[0] }] }
-    : { outcomes: await f.withdraw(readLedger(f.files.ledgerFile()), () => ({ body, references })) };
+    : { outcomes: await f.withdraw(readLedger(f.files.storeFile()), () => ({ body, references })) };
   vi.spyOn(amendments, mode === "stale" ? "repinAmendmentRule" : "rewriteRuleBody").mockImplementation(() => { throw new Error("injected body failure"); });
   const result = await f.run(params);
   expect(result.details.failures.join(" ")).toContain("injected body failure");
   expect(readFileSync(amendment.path, "utf8")).toBe(before);
   expect(readFileSync(oldPath, "utf8")).toBe("Original bytes\n");
-  expect(readLedger(f.files.ledgerFile())).toHaveLength(1);
+  expect(readLedger(f.files.storeFile())).toHaveLength(1);
 });
 
 /** Has the user approve on-read fixes `gists` of `tdd` in one Ask, then resolves them in one call. */
@@ -265,82 +276,146 @@ async function addAll(f: ReturnType<typeof fixture>, gists: string[]) {
   const approvals = await f.approve(gists.map((gist) => ({ kind: "upstream", skill: "tdd", gist, priority: "evidence", remedy: "Fix", change: { operation: "on-read-append", section: `## ${gist}\nFix ${gist}.` } })));
   return f.run({ outcomes: gists.map((gist, i) => ({ skill: "tdd", kind: "upstream", gist, outcome: "applied", approval: approvals[i] })) });
 }
-/** Makes the next ledger append write `bytes(data)`, as an interrupted append would, then fail; `after` runs once it has. Counts appends. */
-function failLedgerAppend(ledger: string, bytes: (data: string) => string, after = () => {}) {
-  const appends = { count: 0 };
-  appendFault.check = (file, data) => {
-    if (file !== ledger) return;
-    appends.count++;
-    appendFault.check = undefined;
-    const written = bytes(String(data));
-    if (written) appendFileSync(file, written);
-    after();
-    appendFault.check = () => { throw new Error("appended again"); };
-    throw new Error("ENOSPC: no space left on device");
-  };
-  return appends;
+
+/** A separate read transaction allows writes to begin but blocks their commit. */
+async function withReadLock<T>(file: string, action: () => Promise<T>): Promise<T> {
+  if (!existsSync(file)) writeObserverStore(file, new Date(), () => {});
+  const reader = new Database(file, { readonly: true });
+  try {
+    reader.run("BEGIN");
+    reader.query("SELECT count(*) FROM proposals").get();
+    return await action();
+  } finally {
+    reader.close();
+  }
 }
-it("reports an applied addition as an unrecorded publication, not later, when the ledger append writes nothing", async () => {
+
+it("rolls back a busy batch, preserving both publications and independent answers", async () => {
   const f = fixture();
-  const ledger = f.files.ledgerFile();
-  const appends = failLedgerAppend(ledger, () => "");
-  const result = await f.add("first");
-  const amendment = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!;
-  expect(amendment.body).toContain("## first");
-  expect(existsSync(ledger)).toBe(false);
-  expect(appends.count).toBe(1);
+  const file = f.files.storeFile();
+  const independent = (gist: string) => f.run({ outcomes: [{ skill: "domain-modeling", kind: "upstream", gist, outcome: "declined" }] });
+  await independent("before");
+  const result = await withReadLock(file, () => addAll(f, ["first", "second"]));
+  expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")?.body).toMatch(/## first[\s\S]*## second/);
   expect(result.isError).toBe(true);
-  expect(result.details.publications).toEqual([{ operation: "on-read-append", skill: "tdd", rule: amendment.path, fingerprint: expect.any(String) }]);
-  expect(result.details.records).toMatchObject([{ outcome: "applied", rule: amendment.path }]);
-  expect(result.details.deferred).toEqual([]);
-  expect(result.details.recording).toEqual({ rows: ["unrecorded"], error: expect.stringContaining("ENOSPC") });
-  const text = result.content.map((part) => part.text).join("\n");
+  expect(result.details.publications).toHaveLength(2);
+  expect(result.details.recording).toEqual({ rows: ["unrecorded", "unrecorded"], error: expect.stringMatching(/locked|busy/i) });
+  expect(readLedger(file).map((record) => record.gist)).toEqual(["before"]);
+  expect(existsSync(`${file}-journal`)).toBe(false);
+  expect((await independent("after")).details.recording.rows).toEqual(["recorded"]);
+  expect(readLedger(file).map((record) => record.gist)).toEqual(["before", "after"]);
+  const text = result.content[0]!.text;
   expect(text).toMatch(/Unrecorded publication[\s\S]*applied `tdd`/);
   expect(text).toContain("Don't call `observer_resolve` again for the outcomes below or redo their changes");
-  expect(text.split("## What to do now")).toHaveLength(2);
-  expect(text.endsWith(`\n## What to do now\n\n${toolResultGuidance("ledger-append-failed")}`)).toBe(true);
+  expect(text.endsWith(`\n## What to do now\n\n${toolResultGuidance("ledger-recording-failed")}`)).toBe(true);
 });
-it.each([
-  ["every row", Infinity, ["recorded", "recorded"], ["first", "second"]],
-  ["the first row and part of the second", 21, ["recorded", "unrecorded"], ["first"]],
-  ["the first row without its newline", 0, ["recorded", "unrecorded"], ["first"]],
-  ["the first row but its last byte", -1, ["unrecorded", "unrecorded"], []],
-])("tells the rows an interrupted append wrote whole from the ones it didn't: %s", async (_label, past, rows, gists) => {
+
+it("does not call an already-present on-read section an unrecorded publication", async () => {
   const f = fixture();
-  const ledger = f.files.ledgerFile();
-  failLedgerAppend(ledger, (data) => data.slice(0, data.indexOf("\n") + past));
-  const result = await addAll(f, ["first", "second"]);
-  expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!.body).toMatch(/## first[\s\S]*## second/);
-  expect(result.details.recording.rows).toEqual(rows);
-  expect(result.isError).toBe(rows.includes("unrecorded"));
-  expect(readLedger(ledger).map((record) => record.gist)).toEqual(gists);
+  await f.add("first");
+  const result = await withReadLock(f.files.storeFile(), () => f.add("first"));
+  expect(result.isError).toBe(true);
+  expect(result.details.publications).toEqual([]);
+  expect(result.details.recording.rows).toEqual(["unrecorded"]);
+  expect(result.content[0]?.text).toMatch(/Wrote nothing, not in the ledger[\s\S]*applied `tdd`/);
+  expect(result.content[0]?.text).not.toContain("Carried out, not in the ledger");
 });
-it.each([
-  ["can't be read back", (ledger: string) => { readFault.check = (file) => { if (file === ledger) throw new Error("EIO: i/o error"); }; }],
-  ["holds bytes the append didn't write", (ledger: string) => { writeFileSync(ledger, "{}\n"); }],
-])("leaves recording unknown when the ledger after an interrupted append %s", async (_label, after) => {
+
+it("reports unknown recording if SQLite commits before an exception reaches Resolve", async () => {
   const f = fixture();
-  const ledger = f.files.ledgerFile();
-  failLedgerAppend(ledger, (data) => data.slice(0, data.indexOf("\n") + 1 + 20), () => after(ledger));
+  writeObserverStore(f.files.storeFile(), new Date(), () => {});
+  const run = Database.prototype.run;
+  const calls = vi.spyOn(Database.prototype, "run").mockImplementation(function (this: Database, ...args) {
+    const result = run.apply(this, args);
+    if (args[0] === "COMMIT") throw new Error("injected exception after commit");
+    return result;
+  });
   const result = await addAll(f, ["first", "second"]);
-  readFault.check = undefined;
-  expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!.body).toMatch(/## first[\s\S]*## second/);
+  expect(calls.mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(1);
+  expect(result.isError).toBe(true);
   expect(result.details.recording.rows).toEqual(["unknown", "unknown"]);
-  expect(result.content.map((part) => part.text).join("\n")).toMatch(/Recording unknown[\s\S]*applied `tdd`/);
+  expect(result.content[0]?.text).toMatch(/Recorded 0 outcome[\s\S]*Recording unknown[\s\S]*applied `tdd`/);
+  expect(readLedger(f.files.storeFile()).map((record) => record.gist)).toEqual(["first", "second"]);
 });
-it("keeps a rolled-back compaction's failure and reference files when the ledger append fails", async () => {
+
+it("rolls back a deletion's record and all its generated records without restoring the file", async () => {
+  const f = fixture();
+  await addAll(f, ["first", "second"]);
+  const file = f.files.storeFile();
+  const amendment = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!;
+  const [approval] = await f.approve([{ kind: "upstream", skill: "tdd", gist: "Settle it", priority: "stale",
+    remedy: "Settle it", change: { operation: "stale-delete", rule: amendment.name } }], "Delete");
+  const result = await withReadLock(file, () => f.run({ outcomes: [], stale: [{ rule: amendment.name, action: "delete", approval }] }));
+  expect(existsSync(amendment.path)).toBe(false);
+  expect(result.details.recording.rows).toEqual(["unrecorded", "unrecorded", "unrecorded"]);
+  expect(result.content[0]?.text).toMatch(/Carried out, not in the ledger, 1 outcome[\s\S]*Wrote nothing, not in the ledger, 2 outcome/);
+  expect(readLedger(file).map((record) => [record.gist, record.outcome])).toEqual([["first", "applied"], ["second", "applied"]]);
+  expect(existsSync(`${file}-journal`)).toBe(false);
+});
+
+it.each(["corrupt", "locked"])("reports a verified external publication but makes no rule changes on a %s store at open", async (fault) => {
+  const f = fixture();
+  const file = f.files.storeFile();
+  const [approval] = await f.approve([{ kind: "upstream", skill: "tdd", gist: "first", priority: "evidence", remedy: "Fix", change: { operation: "on-read-append", section: "## first\nFix first." } }]);
+  const path = join(f.roots.cwd, "config.txt");
+  const bytes = "new config\n";
+  writeFileSync(path, bytes);
+  f.saveTool("write-config", "write", { path, content: bytes });
+  f.saveTool("check-config", "bash", { command: "cat config.txt", cwd: f.roots.cwd }, { exitCode: 0 });
+  let lock: Database | undefined;
+  if (fault === "corrupt") writeFileSync(file, "invalid database");
+  else {
+    writeObserverStore(file, new Date(), () => {});
+    lock = new Database(file, { create: false });
+    lock.run("BEGIN EXCLUSIVE");
+  }
+  try {
+    const result = await f.run({ outcomes: [
+      { kind: "project", target: { scope: "project", root: f.roots.cwd, path: "config.txt", mechanism: "configure build" },
+        gist: "Update config", outcome: "applied", publication: { writeToolCallId: "write-config", checkToolCallIds: ["check-config"], afterHash: createHash("sha256").update(bytes).digest("hex") } },
+      { skill: "tdd", kind: "upstream", gist: "first", outcome: "applied", approval },
+    ] });
+    expect(result.isError).toBe(true);
+    expect(result.details.publications).toEqual([]);
+    expect(result.details.recording.rows).toEqual(["unrecorded"]);
+    expect(result.content[0]?.text).toMatch(/Could not read the observer store[\s\S]*Unrecorded publication[\s\S]*config\.txt/);
+    expect(readFileSync(path, "utf8")).toBe(bytes);
+    expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")).toBeUndefined();
+  } finally {
+    lock?.close();
+  }
+});
+
+it("prunes expired pending observations and shown markers on a ledger-only write", async () => {
+  const f = fixture();
+  const file = f.files.storeFile(), cwd = f.roots.cwd;
+  const old = new Date("2020-01-01T00:00:00Z");
+  const pending = (now: Date) => readObserverStore(file, (db) => readPendingObservations(db, cwd, now));
+  recordObservation(file, cwd, "Fresh observation", new Date());
+  recordObservation(file, cwd, "Old shown observation", old);
+  markObservationsShown(file, pending(old)!.filter(({ text }) => text === "Old shown observation"), old);
+  recordObservation(file, cwd, "Old pending observation", old);
+  expect(pending(old)?.map(({ text }) => text)).toEqual(["Old pending observation", "Fresh observation"]);
+  expect(pending(new Date())?.map(({ text }) => text)).toEqual(["Fresh observation"]);
+  const result = await f.run({ outcomes: [{ skill: "tdd", kind: "upstream", gist: "No need", outcome: "declined" }] });
+  expect(result.details.recording.rows).toEqual(["recorded"]);
+  expect(pending(old)?.map(({ text }) => text)).toEqual(["Fresh observation"]);
+  recordObservation(file, cwd, "Old shown observation", old);
+  expect(pending(old)?.find(({ text }) => text === "Old shown observation")?.priorShownAt).toBeNull();
+});
+
+it("keeps a rolled-back compaction's failure and reference files when the ledger commit fails", async () => {
   const f = fixture(); await f.add("first");
   replaceReferenceFiles(f.files.referencesDir(), "tdd", [{ name: "old.md", body: "Original bytes" }]);
   const [approval] = await f.approve([f.compaction(`Read ${join(f.files.referencesDir(), "tdd", "new.md")}`, [{ name: "new.md", body: "Replacement" }])]);
   vi.spyOn(amendments, "rewriteRuleBody").mockImplementation(() => { throw new Error("injected body failure"); });
-  failLedgerAppend(f.files.ledgerFile(), () => "");
-  const result = await f.run({ outcomes: [{ skill: "domain-modeling", kind: "upstream", gist: "Unrelated", outcome: "declined" }], compactions: [{ skill: "tdd", outcome: "applied", approval }] });
+  const result = await withReadLock(f.files.storeFile(), () => f.run({ outcomes: [{ skill: "domain-modeling", kind: "upstream", gist: "Unrelated", outcome: "declined" }], compactions: [{ skill: "tdd", outcome: "applied", approval }] }));
   expect(result.details.failures.join(" ")).toContain("injected body failure");
   expect(readdirSync(join(f.files.referencesDir(), "tdd"))).toEqual(["old.md"]);
   expect(result.details.publications).toEqual([]);
   expect(result.details.recording.rows).toEqual(["unrecorded"]);
 });
-it("lists a Later replay deferral and a Decline apart from the unrecorded publication when the ledger append fails", async () => {
+it("lists a Later replay deferral and a Decline apart from the unrecorded publication when the ledger commit fails", async () => {
   const f = fixture();
   const [append, barrier] = await f.approve([
     { kind: "upstream", skill: "tdd", gist: "first", priority: "evidence", remedy: "Fix", change: { operation: "on-read-append", section: "## first\nFix first." } },
@@ -348,12 +423,11 @@ it("lists a Later replay deferral and a Decline apart from the unrecorded public
       pattern: "\\bgit commit\\b", scope: "tool:bash", matches: [{ command: "git commit -m x" }], spares: [{ command: "jj commit -m x" }] } },
   ]);
   vi.stubEnv("PATH", "");
-  failLedgerAppend(f.files.ledgerFile(), () => "");
-  const result = await f.run({ outcomes: [
+  const result = await withReadLock(f.files.storeFile(), () => f.run({ outcomes: [
     { skill: "tdd", kind: "upstream", gist: "first", outcome: "applied", approval: append },
     { skill: "ce-commit-jj", kind: "local", gist: "Commit with jj", outcome: "applied", approval: barrier },
     { skill: "domain-modeling", kind: "upstream", gist: "Unrelated", outcome: "declined" },
-  ] });
+  ] }));
   expect(result.details.records.map((record) => record.outcome)).toEqual(["applied", "later", "declined"]);
   expect(result.details.deferred).toEqual([expect.stringContaining("omp")]);
   const text = result.content.map((part) => part.text).join("\n");
@@ -367,7 +441,7 @@ it.each(["withdrawal", "stale Delete"])("reports a %s that deleted the amendment
   const amendment = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!;
   const folder = join(f.files.referencesDir(), "tdd");
   replaceReferenceFiles(f.files.referencesDir(), "tdd", [{ name: "old.md", body: "Original" }]);
-  const params = mode === "withdrawal" ? { outcomes: await f.withdraw(readLedger(f.files.ledgerFile()), () => ({ body: "" })) } : {
+  const params = mode === "withdrawal" ? { outcomes: await f.withdraw(readLedger(f.files.storeFile()), () => ({ body: "" })) } : {
     outcomes: [], stale: [{ rule: amendment.name, action: "delete", approval: (await f.approve([{ kind: "upstream", skill: "tdd", gist: "Settle it", priority: "stale",
       remedy: "Settle it", change: { operation: "stale-delete", rule: amendment.name } }], "Delete"))[0] }],
   };
@@ -381,7 +455,7 @@ it.each(["withdrawal", "stale Delete"])("reports a %s that deleted the amendment
   expect(result.details.publications).toEqual([{ operation: mode === "withdrawal" ? "withdrawal" : "stale-delete", skill: "tdd", rule: amendment.path, fingerprint: expect.any(String) }]);
   expect(result.details.cleanup).toEqual([expect.stringContaining("EACCES: injected cleanup failure")]);
   // The ledger reads back the latest record per fingerprint: the withdrawals, or the deletion and its tombstones, replace the applied records.
-  expect(readLedger(f.files.ledgerFile()).map((record) => record.outcome)).toEqual(mode === "withdrawal" ? ["withdrawn", "withdrawn"] : ["deleted", "deleted", "deleted"]);
+  expect(readLedger(f.files.storeFile()).map((record) => record.outcome)).toEqual(mode === "withdrawal" ? ["withdrawn", "withdrawn"] : ["deleted", "deleted", "deleted"]);
   const text = result.content.map((part) => part.text).join("\n");
   expect(text).toContain("inspect");
   expect(text).not.toContain("call again");
@@ -415,7 +489,7 @@ it("re-pins a stale Keep from the file's own bytes, leaving body and reference b
   expect(amendments.readObserverRule(dirs, "tdd-amendment").skillHash).toBe(skillHash(provenance.byName("tdd")));
   expect(readFileSync(reference)).toEqual(referenceBefore);
   expect(amendments.findStaleAmendments(dirs, createProvenanceResolver(f.roots))).toEqual([]);
-  expect(readLedger(f.files.ledgerFile())).toMatchObject([{ fingerprint: "fp-tdd", skill: "tdd", kind: "upstream", outcome: "kept", rule: path }]);
+  expect(readLedger(f.files.storeFile())).toMatchObject([{ fingerprint: "fp-tdd", skill: "tdd", kind: "upstream", outcome: "kept", rule: path }]);
 });
 it.each([
   ["a body", { body: "## Seams\n\nRewritten." }],
@@ -428,7 +502,7 @@ it.each([
   expect(result.details.failures).toHaveLength(1);
   expect([readFileSync(path), readFileSync(reference)]).toEqual(before);
   expect(amendments.findStaleAmendments(dirs, createProvenanceResolver(f.roots))).toHaveLength(1);
-  expect(readLedger(f.files.ledgerFile())).toEqual([]);
+  expect(readLedger(f.files.storeFile())).toEqual([]);
 });
 
 it("retains a failed reference rollback backup and refuses to overwrite it on retry", () => {
@@ -479,15 +553,13 @@ it("restores previous references without writing the body when reference install
 });
 it("keeps the result of a carried-out publication when its guidance can't be loaded", async () => {
   const f = fixture();
-  failLedgerAppend(f.files.ledgerFile(), () => "", () => {
-    readFault.check = (file) => { if (file === INSTRUCTIONS_PATH) throw new Error("EACCES: permission denied"); };
-  });
+  readFault.check = (file) => { if (file === INSTRUCTIONS_PATH) throw new Error("EACCES: permission denied"); };
   const logged = vi.spyOn(console, "error").mockImplementation(() => {});
-  const result = await f.add("first");
+  const result = await withReadLock(f.files.storeFile(), () => f.add("first"));
   const amendment = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!;
   expect(result.isError).toBe(true);
   expect(result.details.publications).toEqual([{ operation: "on-read-append", skill: "tdd", rule: amendment.path, fingerprint: expect.any(String) }]);
-  expect(result.details.recording).toEqual({ rows: ["unrecorded"], error: expect.stringContaining("ENOSPC") });
+  expect(result.details.recording).toEqual({ rows: ["unrecorded"], error: expect.stringMatching(/locked|busy/i) });
   const text = result.content.map((part) => part.text).join("\n");
   expect(text).toMatch(/Unrecorded publication[\s\S]*applied `tdd`/);
   expect(text.split("\n").at(-1)).toBe("The guidance for this result could not be loaded from observer.md: EACCES: permission denied");

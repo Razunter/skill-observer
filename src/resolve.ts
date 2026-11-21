@@ -15,14 +15,11 @@
  */
 
 import { existsSync } from "node:fs";
-import { relative } from "node:path";
+import { join, relative } from "node:path";
 import { isPinKind, type RuleDirs } from "./amendments.js";
 import {
   ANSWER_OUTCOMES,
   type AnswerOutcome,
-  appendLedger,
-  type LedgerAppend,
-  type Recording,
   type Evidence,
   type LedgerRecord,
   canonicalPathIn,
@@ -43,10 +40,12 @@ import {
   PROPOSAL_OUTCOMES,
   type ProposalOutcome,
   proposalFingerprint,
+  putLedgerRecords,
   readLedger,
   STALE_ACTIONS,
   type StaleAction,
 } from "./ledger.js";
+import { ObserverCommitUnknownError, writeObserverStore } from "./observer-store.js";
 import type { ExtensionAPI, SessionEntry } from "./omp.js";
 import { onReadAmendmentTransitions, type Publication, type ValidatedAnswer } from "./on-read-amendment-transitions.js";
 import { createProvenanceResolver, defaultSkillRoots, type ProvenanceResolver } from "./provenance.js";
@@ -66,7 +65,7 @@ const REOFFER_DESCRIPTION =
 
 /** Where the tool writes; the extension entry resolves them from OMP's agent dir. */
 export interface ObserverFiles {
-  ledgerFile(): string;
+  storeFile(): string;
   rulesDir(): string;
   amendmentsDir(): string;
   /** Holds one folder of reference files per skill, outside the rules directory. */
@@ -135,8 +134,8 @@ interface ResolveParams {
 interface ResolveDetails {
   ledger: string;
   records: LedgerRecord[];
-  /** Whether each of `records` reached the ledger, in order, and why the append failed, if it did. */
-  recording: LedgerAppend;
+  /** Whether the transaction recorded each of `records`, in order. */
+  recording: { rows: Recording[]; error?: string };
   /** Answers that wrote nothing, each with the reason. */
   failures: string[];
   /** Deletions carried out and recorded whose reference cleanup failed afterwards, each with what is left. */
@@ -148,6 +147,8 @@ interface ResolveDetails {
   /** The rule, amendment and reference file changes the call made, in the order made. */
   publications: Publication[];
 }
+
+type Recording = "recorded" | "unrecorded" | "unknown";
 
 /** What `fixRule` builds the rule from: an on-read append's section, or a rule's name, body, pattern, scope and samples. */
 function fixDraft(change: ApprovedChange): FixDraft {
@@ -175,7 +176,10 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
  * approved code is published; otherwise `later` or `declined`. A Later of the
  * code says a draft existed, since it comes back as an intent question.
  */
-function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly LedgerRecord[], branch: readonly SessionEntry[], timestamp: string, sessionId: string): HarnessLedgerRecord[] {
+function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly LedgerRecord[], branch: readonly SessionEntry[], timestamp: string, sessionId: string): {
+  records: HarnessLedgerRecord[];
+  publishedFiles?: string[];
+} {
   if (!PROPOSAL_OUTCOMES.includes(answer.outcome)) throw new Error("a harness answer is `applied`, `later` or `declined`");
   if (answer.outcome === "applied") {
     if (answer.approval === undefined || answer.proposal !== undefined) {
@@ -183,9 +187,12 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
     }
     const { proposal, change, answeredAt } = approvedHarness(answer.approval, ["code", "removal"], branch);
     const identity = harnessIdentity(proposal);
-    if (change.stage === "removal") return removalRecords(identity, change, ledger, timestamp, sessionId);
+    if (change.stage === "removal") return { records: removalRecords(identity, change, ledger, timestamp, sessionId) };
     checkHarnessPublication(change, answer.publication, cwd, branch, answeredAt);
-    return [{ ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId }];
+    return {
+      records: [{ ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId }],
+      publishedFiles: change.files.map(({ path }) => join(change.root, path)),
+    };
   }
   if (!isProposalRef(answer.proposal) || answer.approval !== undefined) {
     throw new Error("a Later or Decline of a hook or companion change cites its prepared proposal through `proposal`, its `reference` exactly as Prepare returned it");
@@ -196,11 +203,11 @@ function harnessRecords(answer: HarnessAnswer, cwd: string, ledger: readonly Led
   const note = answer.outcome === "later" && answer.reoffer === undefined ? laterNote(answer.proposal, evidence) : undefined;
   const reoffer = answer.reoffer ?? note;
   const drafted = "change" in proposal && proposal.change.operation === "harness" && proposal.change.stage === "code";
-  return [{
+  return { records: [{
     ...harnessIdentity(proposal), outcome: answer.outcome,
     ...laterReoffer({ outcome: answer.outcome, reoffer: drafted ? `A draft existed: its code was shown and answered Later; ask the intent again before drafting anew.${reoffer === undefined ? "" : ` ${reoffer}`}` : reoffer }),
     timestamp, sessionId,
-  }];
+  }] };
 }
 
 /**
@@ -348,39 +355,56 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
     loadMode: "essential",
     defaultInactive: true,
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const timestamp = new Date().toISOString();
+      const now = new Date();
+      const timestamp = now.toISOString();
       const sessionId = ctx.sessionManager.getSessionId();
       const provenance = createProvenanceResolver(defaultSkillRoots(ctx.cwd));
       const dirs: RuleDirs = { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() };
       const referencesDir = files.referencesDir();
-      const ledger = files.ledgerFile();
+      const ledger = files.storeFile();
       const records: LedgerRecord[] = [];
+      const external = new Map<LedgerRecord, readonly string[]>();
+      const directEdits = new Map<string, string>();
       const failures: string[] = [];
       const kept: string[] = [];
       let targetChanged = false;
       const label = (answer: CitingAnswer | ProjectAnswer | HarnessAnswer) => answer.kind === "project" ? `\`${answer.target?.path}\` (${answer.gist})`
         : answer.kind === "harness" || answer.gist === undefined ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
       // The latest record per fingerprint wins: it holds the fix a withdrawal takes back, and the evidence an answer citing nothing keeps.
-      const latest = new Map(readLedger(ledger).map((record) => [record.fingerprint, record]));
+      const latest = new Map<string, LedgerRecord>();
+      let openError: string | undefined;
+      try {
+        for (const record of readLedger(ledger)) latest.set(record.fingerprint, record);
+      } catch (error) {
+        openError = error instanceof Error ? error.message : String(error);
+      }
 
       // Fingerprint ownership binds across this call too: a later answer must not overwrite an earlier one's skill.
       const claimed = new Map<string, string>();
       const validated = params.outcomes.flatMap((sent): ValidatedAnswer[] => {
         if (sent.kind === "project") {
-          try { records.push(projectRecord(sent, ctx.cwd, ctx.sessionManager.getBranch(), timestamp, sessionId)); }
-          catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
-          return [];
-        }
-        if (sent.kind === "harness") {
+          if (openError !== undefined && sent.outcome !== "applied") return [];
           try {
-            const answered = harnessRecords(sent, ctx.cwd, [...latest.values()], ctx.sessionManager.getBranch(), timestamp, sessionId);
-            const repeated = answered.find((record) => records.some((other) => other.kind === "harness" && other.fingerprint === record.fingerprint));
-            if (repeated) throw new Error(`this call already answers \`${repeated.fingerprint}\`: send one answer per hook or companion identity`);
-            records.push(...answered);
+            const record = projectRecord(sent, ctx.cwd, ctx.sessionManager.getBranch(), timestamp, sessionId);
+            records.push(record);
+            if (record.publication) external.set(record, [join(record.target.root, record.target.path)]);
           }
           catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
           return [];
         }
+        if (sent.kind === "harness") {
+          if (openError !== undefined && (sent.outcome !== "applied" || sent.publication === undefined)) return [];
+          try {
+            const { records: answered, publishedFiles } = harnessRecords(sent, ctx.cwd, [...latest.values()], ctx.sessionManager.getBranch(), timestamp, sessionId);
+            const repeated = answered.find((record) => records.some((other) => other.kind === "harness" && other.fingerprint === record.fingerprint));
+            if (repeated) throw new Error(`this call already answers \`${repeated.fingerprint}\`: send one answer per hook or companion identity`);
+            records.push(...answered);
+            if (publishedFiles) external.set(answered[0]!, publishedFiles);
+          }
+          catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
+          return [];
+        }
+        if (openError !== undefined && (sent.outcome !== "applied" || sent.publication === undefined)) return [];
         let shown: CitingAnswer = sent;
         try {
           const answer = citedAnswer(sent, ctx.sessionManager.getBranch());
@@ -399,8 +423,9 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           }
           // An upstream or plugin fix is always a rule; a local, managed or new one is a barrier rule when it cites only the approval of its prepared rule, else an edit the model made.
           const isDirectEdit = answer.outcome === "applied" && !isPinKind(answer.kind) && (answer.approval === undefined || answer.publication !== undefined);
-          if (isDirectEdit) checkDirectEdit(answer, provenance, ctx.cwd, ctx.sessionManager.getBranch());
-          else if (answer.publication !== undefined) throw new Error("`publication` comes only with an applied local, managed or new skill direct edit");
+          if (openError !== undefined && !isDirectEdit) return [];
+          const published = isDirectEdit ? checkDirectEdit(answer, provenance, ctx.cwd, ctx.sessionManager.getBranch()) : undefined;
+          if (!isDirectEdit && answer.publication !== undefined) throw new Error("`publication` comes only with an applied local, managed or new skill direct edit");
           const writesRule = answer.outcome === "applied" && !isDirectEdit;
           if (answer.approval !== undefined && !writesRule && !withdraws && !isDirectEdit) {
             throw new Error("`approval` comes only with an applied on-read fix, pattern amendment, barrier rule or direct edit, or a withdrawal");
@@ -420,6 +445,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             : change?.operation === "withdrawal" ? { answer, fingerprint, withdrawal: change }
             : { answer, fingerprint, fix: change && fixRule({ ...answer, rule: fixDraft(change) }, fingerprint, dirs, provenance) };
           claimed.set(fingerprint, answer.skill);
+          if (published !== undefined) directEdits.set(fingerprint, published);
           return [checked];
         } catch (error) {
           targetChanged ||= error instanceof TargetChangedError;
@@ -430,7 +456,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         }
       });
       const transitions = onReadAmendmentTransitions(
-        { answers: validated, stale: params.stale ?? [], compactions: params.compactions ?? [] },
+        { answers: validated, stale: openError === undefined ? params.stale ?? [] : [], compactions: openError === undefined ? params.compactions ?? [] : [] },
         { dirs, referencesDir, latest, provenance, branch: ctx.sessionManager.getBranch(), timestamp, sessionId },
       );
       const verdicts = await Promise.all(transitions.replays.map((check) => (check ? replay(check, signal) : undefined)));
@@ -447,8 +473,20 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         const carried = record.evidence ? undefined : latest.get(record.fingerprint)?.evidence;
         if (carried) record.evidence = carried;
       }
-      // A failed append leaves every change above made: the result keeps them and says which records reached the ledger.
-      const recording: LedgerAppend = records.length > 0 ? appendLedger(ledger, records) : { rows: [] };
+      const recording: ResolveDetails["recording"] = { rows: [] };
+      let status: Recording = "recorded";
+      if (openError !== undefined) {
+        status = "unrecorded";
+        recording.error = `Could not read the observer store: ${openError}`;
+      } else if (records.length > 0) {
+        try {
+          writeObserverStore(ledger, now, (db) => putLedgerRecords(db, records));
+        } catch (error) {
+          status = error instanceof ObserverCommitUnknownError ? "unknown" : "unrecorded";
+          recording.error = error instanceof Error ? error.message : String(error);
+        }
+      }
+      recording.rows = records.map(() => status);
       const line = (record: LedgerRecord) => {
         const written = record.kind !== "project" && record.compaction && record.rule ? readReferenceFiles(referencesDir, record.skill) : [];
         return (
@@ -457,29 +495,39 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           referenceFilesSentence(written)
         );
       };
-      const withStatus = (status: Recording) => records.filter((_, i) => recording.rows[i] === status);
-      // A Later or Decline, answered or deferred by the replay or coverage check, wrote nothing, so it is no Unrecorded publication.
-      const wroteNothing = (record: LedgerRecord) => record.outcome === "later" || record.outcome === "declined";
-      const recorded = withStatus("recorded").map(line);
-      const unrecorded = withStatus("unrecorded").filter((record) => !wroteNothing(record)).map(line);
-      const unrecordedNoWrite = withStatus("unrecorded").filter(wroteNothing).map(line);
-      const unknown = withStatus("unknown").map(line);
-      // An append can fail after writing every record; the ledger's bytes, not the error, decide what is reported.
-      const unsettled = unrecorded.length + unrecordedNoWrite.length + unknown.length > 0;
+      const recorded = status === "recorded" ? records.map(line) : [];
       const text = [`Recorded ${recorded.length} outcome(s) in \`${ledger}\`:`, ...recorded];
+      const unsettled = recording.error !== undefined;
       if (unsettled) {
         text.push(
           "",
-          `Appending to the proposal ledger failed: ${recording.error}. Nothing this call wrote, deleted or re-pinned was undone. Don't call \`observer_resolve\` again for the outcomes below or redo their changes; the user repairs the ledger.`,
+          `Recording in the proposal ledger failed: ${recording.error}. No publication was undone. Don't call \`observer_resolve\` again for the outcomes below or redo their changes.`,
         );
-        if (unrecorded.length > 0) {
-          text.push(`Carried out, not in the ledger, ${unrecorded.length} outcome(s): what each wrote, deleted or re-pinned stays, and none is \`later\`; report each that changed a file as an Unrecorded publication, with its file and this error:`, ...unrecorded);
-        }
-        if (unrecordedNoWrite.length > 0) {
-          text.push(`Wrote nothing, not in the ledger, ${unrecordedNoWrite.length} outcome(s): each keeps the outcome listed, unrecorded; report it as that outcome with this error, not as a publication:`, ...unrecordedNoWrite);
-        }
-        if (unknown.length > 0) {
-          text.push(`Recording unknown, ${unknown.length} outcome(s): the ledger read back after the failure can't show whether these reached it; inspect it before anything else:`, ...unknown);
+        if (openError !== undefined) text.push("Resolve stopped before making any rule or amendment changes.");
+        if (status === "unknown") {
+          text.push(`Recording unknown, ${records.length} outcome(s). Inspect the ledger to determine whether the batch committed:`, ...records.map(line));
+        } else {
+          const internal = publications.slice();
+          const unrecorded: string[] = [];
+          const noPublication: string[] = [];
+          for (const record of records) {
+            const paths = external.get(record);
+            const direct = record.outcome === "applied" && record.rule === undefined ? directEdits.get(record.fingerprint) : undefined;
+            const publication = internal.findIndex((change) => matchesPublication(change, record));
+            if (publication >= 0) internal.splice(publication, 1);
+            if (direct !== undefined) directEdits.delete(record.fingerprint);
+            if (paths !== undefined || direct !== undefined || publication >= 0) {
+              unrecorded.push(line(record) + (paths ? ` Published files: ${paths.map((path) => `\`${path}\``).join(", ")}.` : direct ? ` Publication: \`${direct}\`.` : ""));
+            } else {
+              noPublication.push(line(record));
+            }
+          }
+          if (unrecorded.length > 0) {
+            text.push(`Carried out, not in the ledger, ${unrecorded.length} outcome(s). Report each as an Unrecorded publication with its target and this error:`, ...unrecorded);
+          }
+          if (noPublication.length > 0) {
+            text.push(`Wrote nothing, not in the ledger, ${noPublication.length} outcome(s). These are record-only answers, no-ops or records generated by another outcome:`, ...noPublication);
+          }
         }
       }
       if (approvals.length > 0) {
@@ -508,13 +556,13 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         text.push(...cleanup.map((failure) => `- ${failure}`));
       }
       if (failures.length > 0) {
-        text.push("", `Not recorded, ${failures.length} answer(s); fix each and call again with only these:`);
+        text.push("", openError !== undefined ? `Other refusals, ${failures.length} answer(s):` : `Not recorded, ${failures.length} answer(s); fix each and call again with only these:`);
         text.push(...failures.map((failure) => `- ${failure}`));
       }
       const guidance: ToolResultCondition[] = [];
-      if (unsettled) guidance.push("ledger-append-failed");
+      if (unsettled) guidance.push("ledger-recording-failed");
       if (cleanup.length > 0) guidance.push("cleanup-failed");
-      if (targetChanged) guidance.push("changed-target");
+      if (targetChanged && openError === undefined) guidance.push("changed-target");
       if (guidance.length > 0) text.push("", whatToDoNow(guidance));
       return {
         content: [{ type: "text", text: text.join("\n") }],
@@ -525,13 +573,24 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
   });
 }
 
+function matchesPublication(change: Publication, record: LedgerRecord): boolean {
+  if (record.skill !== change.skill || record.fingerprint !== change.fingerprint || record.rule !== change.rule) return false;
+  switch (change.operation) {
+    case "stale-keep": return record.outcome === "kept";
+    case "stale-update": return record.outcome === "updated";
+    case "stale-delete": return record.outcome === "deleted";
+    case "withdrawal": return record.outcome === "withdrawn";
+    default: return record.outcome === "applied" && Boolean(record.compaction) === (change.operation === "compaction");
+  }
+}
+
 /**
  * Throws unless the applied local, managed or new skill edit `answer` cites
  * the user's Apply of its prepared direct edit and the observed owner-tool
  * call that made the edit after that Apply: the main agent makes the edit, so
  * the ledger records it applied only once the branch shows it was made.
  */
-function checkDirectEdit(answer: ProposalAnswer, provenance: ProvenanceResolver, cwd: string, branch: readonly SessionEntry[]): void {
+function checkDirectEdit(answer: ProposalAnswer, provenance: ProvenanceResolver, cwd: string, branch: readonly SessionEntry[]): string {
   if (answer.approval === undefined) {
     throw new Error("an applied local, managed or new skill edit cites the user's Apply of its prepared proposal through `approval` and the call that made the edit through `publication`");
   }
@@ -542,6 +601,7 @@ function checkDirectEdit(answer: ProposalAnswer, provenance: ProvenanceResolver,
   const installed = provenance.byName(proposal.skill);
   const path = installed.kind === "local" ? installed.path : undefined;
   checkSkillEditPublication({ name: proposal.skill, kind: proposal.kind, ...(path !== undefined && { path }) }, answer.publication, cwd, branch, answeredAt);
+  return installed.kind === "unknown" ? `tool receipt ${answer.publication!.writeToolCallId}` : installed.path;
 }
 
 /** Operations whose proposal a skill answer cites through `proposal`. A withdrawal is answered through its approval, and only its Decline cites it through `proposal`; a stale amendment and a compaction are answered in their own lists. */

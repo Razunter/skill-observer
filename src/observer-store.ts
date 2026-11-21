@@ -97,6 +97,15 @@ export function publishObserverStore(file: string, origin: "runtime" | "import",
           ) STRICT;
           CREATE INDEX observations_pending ON observations (project, state_at) WHERE revision IS NOT NULL;
           CREATE INDEX observations_expiry ON observations (state_at);
+          CREATE TABLE proposals (
+            answer_order INTEGER PRIMARY KEY,
+            fingerprint TEXT NOT NULL UNIQUE,
+            rule_name TEXT,
+            hook_file_key TEXT,
+            record TEXT NOT NULL
+          ) STRICT;
+          CREATE INDEX proposals_rule ON proposals (rule_name);
+          CREATE INDEX proposals_hook ON proposals (hook_file_key);
         `);
         initialize?.(db);
         db.query("INSERT INTO observer_store (id, origin) VALUES (1, ?)").run(origin);
@@ -152,7 +161,7 @@ function checkStore(file: string, db: Database): void {
 
 function requireMigration(file: string): void {
   const dir = dirname(file);
-  if (lstatSync(join(dir, "observations.jsonl"), { throwIfNoEntry: false })) {
-    throw new Error(`Legacy observer state in ${dir} requires the standalone migration script before using the observer store.`);
+  if (["ledger.jsonl", "observations.jsonl"].some((name) => lstatSync(join(dir, name), { throwIfNoEntry: false }))) {
+    throw new Error(`Legacy observer state in ${dir} requires the migration script (scripts/migrate-observer-store.ts) before using the observer store.`);
   }
 }

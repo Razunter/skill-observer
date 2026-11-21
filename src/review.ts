@@ -327,7 +327,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
       const details = emptyDetails();
       const amendmentSections = new Map<string, string[]>();
       try {
-        const ledger = readLedger(files.ledgerFile());
+        const ledger = readLedger(files.storeFile());
         const guidance = receiptContext(ctx, files);
         if (params?.action === "prepare") {
           if (!Array.isArray(params.candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");

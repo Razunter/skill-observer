@@ -58,13 +58,12 @@ export function countPendingObservations(file: string, cwd: string, now: Date): 
 }
 
 /** The project's unexpired pending observations, in recording order when timestamps tie. */
-export function pendingObservations(file: string, cwd: string, now: Date): Observation[] {
-  const project = projectIdentity(cwd);
-  return readObserverStore(file, (db) => db.query<Observation, [string, number]>(`
+export function readPendingObservations(db: Database, cwd: string, now: Date): Observation[] {
+  return db.query<Observation, [string, number]>(`
     SELECT key, revision, project, text, count, state_at AS recordedAt, prior_shown_at AS priorShownAt
     FROM observations WHERE project = ? AND state_at > ? AND revision IS NOT NULL
     ORDER BY state_at, recorded_order
-  `).all(project, observationCutoff(now))) ?? [];
+  `).all(projectIdentity(cwd), observationCutoff(now));
 }
 
 /** Removes the text of only the exact revisions the pass showed. */

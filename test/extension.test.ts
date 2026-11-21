@@ -7,8 +7,9 @@ import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { appendLedger, canonicalProjectTarget, harnessFingerprint, type LedgerRecord, projectFingerprint, proposalFingerprint, readLedger } from "../src/ledger.js";
+import { canonicalProjectTarget, harnessFingerprint, type LedgerRecord, projectFingerprint, proposalFingerprint, putLedgerRecords, readLedger as ledgerRecords } from "../src/ledger.js";
 import { PENDING_OBSERVATION_COUNT_SQL } from "../src/observations.js";
+import { observerStorePath, writeObserverStore } from "../src/observer-store.js";
 import skillObserver from "../src/skill-observer.js";
 import { buildDigest } from "../src/digest.js";
 import { createProvenanceResolver, skillHash } from "../src/provenance.js";
@@ -261,8 +262,8 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
      * A Prepare's skill-text repair drafts are grounded first, as {@link groundRepairs} describes.
      */
     callTool,
-    ledgerFile: join(skillHome.home, ".omp/agent/skill-observer/ledger.jsonl"),
-    observationsFile: join(skillHome.home, ".omp/agent/skill-observer/observer.sqlite"),
+    ledgerFile: observerStorePath(join(skillHome.home, ".omp/agent")),
+    observationsFile: observerStorePath(join(skillHome.home, ".omp/agent")),
     rulesDir: join(skillHome.home, ".omp/agent/rules"),
     amendmentsDir: join(skillHome.home, ".omp/agent/skill-observer/amendments"),
     activeTools: () => activeTools,
@@ -809,7 +810,7 @@ const ownedFiles = (host: ReturnType<typeof loadExtension>) => Object.fromEntrie
   .map((path) => [path, readFileSync(path, "utf8")]));
 /** Every byte observer_resolve could change: the rule and reference files it owns, and the ledger. */
 const observerBytes = (host: ReturnType<typeof loadExtension>) =>
-  ({ ...ownedFiles(host), ledger: existsSync(host.ledgerFile) ? readFileSync(host.ledgerFile, "utf8") : null });
+  ({ ...ownedFiles(host), ledger: existsSync(host.ledgerFile) ? readFileSync(host.ledgerFile, "base64") : null });
 const resolve = (host: ReturnType<typeof loadExtension>, outcomes: unknown[]) => host.callTool("observer_resolve", { outcomes });
 const failures = (result: ToolResult<unknown>) => (result.details as { failures: string[] }).failures;
 
@@ -1232,8 +1233,8 @@ describe("observer_review prepared proposals", () => {
 
   it("suppresses a declined proposal whose target is no longer writable, and prepares the rest", async () => {
     const host = loadExtension();
-    appendLedger(host.ledgerFile, [{ fingerprint: proposalFingerprint("removed-skill", "Declined fix"), skill: "removed-skill", kind: "upstream",
-      gist: "Declined fix", outcome: "declined", timestamp: new Date().toISOString(), sessionId: "fixture-session" } as LedgerRecord]);
+    seedLedger(host.ledgerFile, [{ fingerprint: proposalFingerprint("removed-skill", "Declined fix"), skill: "removed-skill", kind: "upstream",
+      gist: "Declined fix", outcome: "declined", timestamp: new Date().toISOString(), sessionId: "fixture-session" }]);
     startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [
       { kind: "upstream", skill: "removed-skill", gist: "Declined fix", priority: "evidence", remedy, change: { operation: "on-read-append", section: "## Gone\n\nGone." } },
@@ -1272,7 +1273,7 @@ describe("observer_review prepared proposals", () => {
     const notes = writeReference(host, "domain-modeling", "notes.md", "Notes.\n");
     const gone = { fingerprint: proposalFingerprint("tdd", "Gone fix"), skill: "tdd", kind: "upstream", gist: "Gone fix", outcome: "applied",
       rule: join(host.rulesDir, "gone-fix.md"), timestamp: new Date().toISOString(), sessionId: "fixture-session" } as LedgerRecord;
-    appendLedger(host.ledgerFile, [gone]);
+    seedLedger(host.ledgerFile, [gone]);
     const reds = join(referencesDir(host), "tdd", "reds.md");
     const kept = join(referencesDir(host), "domain-modeling", "kept.md");
     const tddFix = { fingerprint: proposalFingerprint("tdd", "Gist of tdd-amendment."), gist: "Gist of tdd-amendment." };
@@ -1776,7 +1777,7 @@ describe("proposal approval of on-read appends", () => {
     expect((await resolve(host, [applied])).isError).toBeFalsy();
     expect((await resolve(host, [applied])).isError).toBeFalsy();
     expect(readRule(amendment(host)).body).toBe("## Seams\n\nName the seam first.");
-    expect(ledgerRecords(host.ledgerFile).map(({ outcome }) => outcome)).toEqual(["applied", "applied"]);
+    expect(ledgerRecords(host.ledgerFile).map(({ outcome }) => outcome)).toEqual(["applied"]);
   });
 
   it("checks the approval again right before writing, after the call's replay wait", async () => {
@@ -1819,10 +1820,10 @@ describe("proposal reconciliation of on-read appends", () => {
     return { ...fixture.applied, approval: { ...fixture.applied.approval, revision: revision.reference } };
   };
   const expectNoWrite = async (host: ReturnType<typeof loadExtension>, outcomes: unknown[], reason: string) => {
-    const before = { amendment: readFileSync(amendment(host), "utf8"), ledger: readFileSync(host.ledgerFile, "utf8") };
+    const before = { amendment: readFileSync(amendment(host), "utf8"), ledger: readFileSync(host.ledgerFile, "base64") };
     const result = await resolve(host, outcomes);
     expect(failures(result)).toEqual([expect.stringContaining(reason)]);
-    expect({ amendment: readFileSync(amendment(host), "utf8"), ledger: readFileSync(host.ledgerFile, "utf8") }).toEqual(before);
+    expect({ amendment: readFileSync(amendment(host), "utf8"), ledger: readFileSync(host.ledgerFile, "base64") }).toEqual(before);
   };
 
   it("writes nothing when the amendment changed after Prepare and no reconciliation cites the approval", async () => {
@@ -2000,15 +2001,12 @@ const outcome = (skill: string, kind: string, gist: string, answer: string): Out
 
 /** Records `skill`'s edit as applied in the ledger, as an earlier pass did once it observed the edit after the user's Apply. */
 function seedApplied(host: ReturnType<typeof loadExtension>, skill: string, kind: string, gist: string): void {
-  appendLedger(host.ledgerFile, [{ fingerprint: proposalFingerprint(skill, gist), skill, kind, gist, outcome: "applied",
+  seedLedger(host.ledgerFile, [{ fingerprint: proposalFingerprint(skill, gist), skill, kind, gist, outcome: "applied",
     timestamp: new Date().toISOString(), sessionId: "fixture-session" } as LedgerRecord]);
 }
 
-function ledgerRecords(file: string): Array<Record<string, string>> {
-  return readFileSync(file, "utf8")
-    .trim()
-    .split("\n")
-    .map((line) => JSON.parse(line));
+function seedLedger(file: string, records: readonly LedgerRecord[]): void {
+  writeObserverStore(file, new Date(), (db) => putLedgerRecords(db, records));
 }
 
 /** The file names in the rules and amendments directories; none before a rule is written. */
@@ -2041,9 +2039,8 @@ function splitAmendment(
     `---\ndescription: "${gist}"\namends: "${skill}"\nskillHash: "${currentSkillHash(host, skill)}"\nfingerprint: "${fingerprint}"\ngeneratedBy: "skill-observer"\n---\n\n${options.body ?? `Body of ${name}.`}\n`,
   );
   const rule = join(host.rulesDir, `${name}.md`);
-  const record = { fingerprint, skill, kind: "upstream", gist, outcome: "applied", rule, evidence: options.evidence, timestamp: new Date().toISOString(), sessionId: "fixture-session" };
-  mkdirSync(dirname(host.ledgerFile), { recursive: true });
-  appendFileSync(host.ledgerFile, `${JSON.stringify(record)}\n`);
+  seedLedger(host.ledgerFile, [{ fingerprint, skill, kind: "upstream", gist, outcome: "applied",
+    rule, evidence: options.evidence, timestamp: new Date().toISOString(), sessionId: "fixture-session" }]);
 }
 
 /**
@@ -2065,7 +2062,7 @@ async function readSkill(host: ReturnType<typeof loadExtension>, path: string, o
 }
 
 describe("observer_resolve", () => {
-  it("appends one ledger record per outcome and reports the ledger it wrote", async () => {
+  it("records an accepted batch and reports the ledger it wrote", async () => {
     const host = loadExtension();
     const result = await host.callTool("observer_resolve", {
       outcomes: [
@@ -2093,7 +2090,34 @@ describe("observer_resolve", () => {
     ]);
   });
 
-  it("gives the same fingerprint to gists that differ only in case, punctuation or spacing", async () => {
+  it("re-offers only the latest same-timestamp answers in answer order", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-21T12:00:00Z"));
+    const host = loadExtension();
+    await host.callTool("observer_resolve", {
+      outcomes: [
+        { ...outcome("tdd", "upstream", "Record the red first.", "later"), reoffer: "At the first gate." },
+        outcome("tdd", "upstream", "Keep the seam named.", "later"),
+      ],
+    });
+    await host.callTool("observer_resolve", {
+      outcomes: [
+        { ...outcome("tdd", "upstream", "Record the red first.", "later"), reoffer: "At the next gate." },
+      ],
+    });
+
+    const report = ledgerRecords(host.ledgerFile);
+    expect(report.map(({ gist, reoffer }) => [gist, reoffer])).toEqual([
+      ["Keep the seam named.", undefined],
+      ["Record the red first.", "At the next gate."],
+    ]);
+    await host.runCommand("observe", "Review the outstanding decisions");
+    const payload = String(host.sent[0]?.message.content);
+    expect(payload).toMatch(/Keep the seam named\.[\s\S]*Record the red first\. Re-offer when: At the next gate\./);
+    expect(payload).not.toContain("At the first gate.");
+  });
+
+  it("replaces answers whose gists differ only in case, punctuation or spacing", async () => {
     const host = loadExtension();
     await host.callTool("observer_resolve", {
       outcomes: [
@@ -2105,11 +2129,11 @@ describe("observer_resolve", () => {
       ],
     });
 
-    const [first, restyled, rePunctuated, otherSkill, otherGist] = ledgerRecords(host.ledgerFile).map((r) => r.fingerprint);
-    expect(restyled).toBe(first);
-    expect(rePunctuated).toBe(first);
-    expect(otherSkill).not.toBe(first);
-    expect(otherGist).not.toBe(first);
+    expect(ledgerRecords(host.ledgerFile).map(({ skill, gist }) => [skill, gist])).toEqual([
+      ["tdd", "Rerun the seams test first"],
+      ["grill-with-docs", "Re-run the seam's test first."],
+      ["tdd", "Re-run the seam's test last."],
+    ]);
   });
 
   it("keeps the evidence an answer cites on its ledger record, and records an answer without evidence", async () => {
@@ -2150,22 +2174,22 @@ describe("observer_resolve", () => {
       ],
     });
 
-    const [, , tddAgain, grillAgain] = ledgerRecords(host.ledgerFile);
+    const [tddAgain, grillAgain] = ledgerRecords(host.ledgerFile);
     expect(tddAgain).toMatchObject({ outcome: "declined", evidence: earlier });
     expect(grillAgain).toMatchObject({ outcome: "declined", evidence: fresh });
   });
 
-  it("keeps a new answer when the ledger ends in a line cut short by an interrupted write", async () => {
+  it("refuses passes and reports on an unmigrated profile even when the old ledger is empty", async () => {
     const host = loadExtension();
-    mkdirSync(dirname(host.ledgerFile), { recursive: true });
-    writeFileSync(host.ledgerFile, '{"fingerprint":"0123456789ab","skill":"tdd","outc');
-    await host.callTool("observer_resolve", {
-      outcomes: [outcome("deploy-notes", "new", "Draft release notes from the jj log.", "later")],
-    });
-
-    host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
-    await host.runCommand("observe");
-    expect(String(host.sent[0]?.message.content)).toContain("Draft release notes from the jj log.");
+    const legacy = join(dirname(host.ledgerFile), "ledger.jsonl");
+    mkdirSync(dirname(legacy), { recursive: true });
+    writeFileSync(legacy, "");
+    await host.runCommand("observe-report");
+    await host.runCommand("observe", "Review");
+    expect(host.notices.filter((notice) => /migration|migrate/i.test(notice))).toHaveLength(2);
+    expect(host.sent).toEqual([]);
+    expect(existsSync(host.ledgerFile)).toBe(false);
+    expect(readFileSync(legacy, "utf8")).toBe("");
   });
 });
 
@@ -2210,9 +2234,10 @@ describe("project proposal decisions", () => {
     host.setCwd(alias);
     const result = await host.callTool("observer_resolve", { outcomes: [projectAnswer(alias, "alias-checks/new.json")] });
     expect(result.isError).toBeFalsy();
-    const [first, second] = ledgerRecords(host.ledgerFile);
-    expect(second?.fingerprint).toBe(first?.fingerprint);
-    expect(second).toMatchObject({ target: { scope: "project", root, path: "checks/new.json" }, evidence });
+    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({
+      target: { scope: "project", root, path: "checks/new.json", mechanism: "Wire the existing typecheck." },
+      outcome: "declined", evidence,
+    })]);
     expect(existsSync(join(root, "checks/new.json"))).toBe(false);
     expect(rulesWritten(host)).toEqual([]);
   });
@@ -2325,7 +2350,7 @@ describe("project proposal decisions", () => {
       })) });
       const accepted = scenario === "safe sibling";
       expect(result.isError ?? false).toBe(!accepted);
-      expect(readLedger(host.ledgerFile).map((record) => record.kind === "project" ? record.target.path : undefined))
+      expect(ledgerRecords(host.ledgerFile).map((record) => record.kind === "project" ? record.target.path : undefined))
         .toEqual(accepted ? ["package.json", "other.json"] : scenario === "missing target" ? ["other.json"] : []);
     },
   );
@@ -2356,7 +2381,7 @@ describe("project proposal decisions", () => {
         publication: { writeToolCallId: "js-write-target", checkToolCallIds: ["js-bash-check"], afterHash: createHash("sha256").update(content).digest("hex") },
       }] });
       expect(result.isError ?? false).toBe(scenario !== "successful");
-      expect(readLedger(host.ledgerFile).map((record) => record.outcome)).toEqual(scenario === "successful" ? ["applied"] : []);
+      expect(ledgerRecords(host.ledgerFile).map((record) => record.outcome)).toEqual(scenario === "successful" ? ["applied"] : []);
     },
   );
 
@@ -2399,7 +2424,7 @@ describe("project proposal decisions", () => {
       }] });
       const accepted = scenario === "matching native and hook";
       expect(result.isError ?? false).toBe(!accepted);
-      expect(readLedger(host.ledgerFile).map((record) => record.outcome)).toEqual(accepted ? ["applied"] : []);
+      expect(ledgerRecords(host.ledgerFile).map((record) => record.outcome)).toEqual(accepted ? ["applied"] : []);
     },
   );
 
@@ -2433,12 +2458,11 @@ describe("project proposal decisions", () => {
   it("never interprets project records as skill edits or withdrawal ownership", async () => {
     const host = loadExtension();
     const fingerprint = "project-owned";
-    mkdirSync(dirname(host.ledgerFile), { recursive: true });
-    writeFileSync(host.ledgerFile, `${JSON.stringify({
-      fingerprint, kind: "project", skill: "tdd",
+    const record = { fingerprint, kind: "project", skill: "tdd",
       target: { scope: "project", root: host.skillHome.roots.cwd, path: "checks.json", mechanism: "Project-only check" },
       gist: "Project-only check", outcome: "applied", timestamp: new Date().toISOString(), sessionId: "fixture-session",
-    })}\n`);
+    } as unknown as LedgerRecord;
+    seedLedger(host.ledgerFile, [record]);
     host.setBranch([...fx.plainUserMessage, ...fx.skillUrlRead]);
     await host.runCommand("observe", "Review");
     expect(String(host.sent[0]?.message.content).split("### Rules in force")[1]).not.toContain("Project-only check");
@@ -3086,7 +3110,7 @@ describe("observer hook and companion intents", () => {
       const result = await resolve(host, [removed(approval)]);
       expect(failures(result)).toEqual([]);
       expect(resultText(result)).toContain(`- withdrawn \`${file}\` (project hook), fingerprint \`${proposal.fingerprint}\`: Block git commit here`);
-      expect(ledgerRecords(host.ledgerFile).map(({ fingerprint, outcome }) => [fingerprint, outcome])).toEqual([[proposal.fingerprint, "applied"], [proposal.fingerprint, "withdrawn"]]);
+      expect(ledgerRecords(host.ledgerFile).map(({ fingerprint, outcome }) => [fingerprint, outcome])).toEqual([[proposal.fingerprint, "withdrawn"]]);
       await host.runCommand("observe", "Is the hook gone?");
       expect(String(host.sent.at(-1)?.message.content)).not.toContain("### Remedy outcomes");
     });
@@ -3224,7 +3248,7 @@ describe("/observe with answers from earlier passes", () => {
     const host = loadExtension();
     splitAmendment(host, "tdd", "tdd-seams-and-reds");
     const merged = join(host.rulesDir, "tdd-seams-and-reds.md");
-    const record = (gist: string, outcome: string, rule: string) => ({
+    const record = (gist: string, outcome: LedgerRecord["outcome"], rule: string): LedgerRecord => ({
       fingerprint: proposalFingerprint("tdd", gist),
       skill: "tdd",
       kind: "upstream",
@@ -3239,7 +3263,7 @@ describe("/observe with answers from earlier passes", () => {
       ...Object.entries(sources).map(([name, gist]) => record(gist, "applied", join(host.rulesDir, `${name}.md`))),
       ...Object.values(sources).map((gist) => record(gist, "merged", merged)),
     ];
-    appendFileSync(host.ledgerFile, records.map((r) => `${JSON.stringify(r)}\n`).join(""));
+    seedLedger(host.ledgerFile, records);
 
     const content = await observe(host, fourSkillsLoaded);
     const tdd = skillEntry(content, "tdd");
@@ -3386,12 +3410,12 @@ describe("/observe with answers from earlier passes", () => {
     splitAmendment(host, "tdd", "tdd-afk-seams");
     splitAmendment(host, "tdd", "tdd-red-is-an-assertion-diff");
     rmSync(join(host.amendmentsDir, "tdd-afk-seams.md"));
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
 
     const inForce = ledgerList(await observe(host, fourSkillsLoaded), RULES_IN_FORCE);
     expect(inForce).toContain("Gist of tdd-red-is-an-assertion-diff.");
     expect(inForce).not.toContain("Gist of tdd-afk-seams.");
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
   });
 
   it("lists every hand-written rule by name and description, whether or not a loaded skill relates to it", async () => {
@@ -3565,14 +3589,14 @@ describe("observer_resolve with upstream fixes", () => {
     const fixes = await approveOnRead(host, [{ gist: "Test one behaviour per test.", section: ONE_BEHAVIOUR }]);
     splitAmendment(host, "tdd", "tdd-red-is-an-assertion-diff");
     const files = Object.fromEntries(readdirSync(host.amendmentsDir).map((name) => [name, readFileSync(join(host.amendmentsDir, name), "utf8")]));
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
 
     const result = await host.callTool("observer_resolve", { outcomes: fixes });
 
     expect(result.isError).toBe(true);
     expect(resultText(result)).toMatch(/Not recorded[\s\S]*join them into one by hand/);
     expect(Object.fromEntries(rulesWritten(host).map((name) => [name, readFileSync(join(host.amendmentsDir, name), "utf8")]))).toEqual(files);
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
   });
 
   it.skipIf(!ompAvailable)("writes a pattern amendment that watches the model's text", async () => {
@@ -3790,28 +3814,28 @@ describe("withdrawing applied fixes", () => {
     const host = loadExtension();
     const { red, file } = await twoSections(host);
     const rule = readFileSync(file, "utf8");
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
 
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [withdrawalCandidate({ fingerprint: red?.fingerprint, gist: "A red is an assertion diff." })] });
 
     expect(result.isError).toBe(true);
     expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining("the withdrawal needs its `body`")] });
     expect(readFileSync(file, "utf8")).toBe(rule);
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
   });
 
   it("records and changes nothing for a withdrawal that empties the skill's on-read amendment while another fix in force is in it", async () => {
     const host = loadExtension();
     const { seams, red, file } = await twoSections(host);
     const rule = readFileSync(file, "utf8");
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
 
     const result = await resolveApproved(host, { withdrawals: [{ fingerprint: red?.fingerprint, gist: "A red is an assertion diff.", body: "" }] });
 
     expect(result.isError).toBe(true);
     expect(resultText(result)).toMatch(new RegExp(`Not recorded[\\s\\S]*${seams?.fingerprint}`));
     expect(readFileSync(file, "utf8")).toBe(rule);
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
   });
 
   it("moves a fix to another skill: withdrawn for the old skill and applied for the new one in one call", async () => {
@@ -3827,7 +3851,7 @@ describe("withdrawing applied fixes", () => {
     expect(result.isError).toBeFalsy();
     expect(readRule(file).body).toBe(SEAMS);
     expect(readRule(movedFile)).toMatchObject({ frontmatter: { amends: "domain-modeling" }, body: RED });
-    expect(ledgerRecords(host.ledgerFile).slice(2)).toEqual([
+    expect(ledgerRecords(host.ledgerFile).slice(1)).toEqual([
       expect.objectContaining({ skill: "tdd", fingerprint: red?.fingerprint, outcome: "withdrawn" }),
       expect.objectContaining({ skill: "domain-modeling", outcome: "applied", rule: movedFile }),
     ]);
@@ -3861,7 +3885,7 @@ describe("withdrawing applied fixes", () => {
     }
     const [applied] = ledgerRecords(host.ledgerFile);
     const rule = readFileSync(file, "utf8");
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
 
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [
       withdrawalCandidate({ skill, gist: "Gist of tdd-afk-seams.", fingerprint: earlier === undefined ? "0123456789ab" : applied?.fingerprint }),
@@ -3870,7 +3894,7 @@ describe("withdrawing applied fixes", () => {
     expect(result.isError).toBe(true);
     expect(result.details).toMatchObject({ eligible: [], failures: [expect.any(String)] });
     expect(readFileSync(file, "utf8")).toBe(rule);
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
   });
 });
 
@@ -4097,13 +4121,13 @@ describe("compacting on-read amendments", () => {
     ])("writes and records nothing for %s", async (_label, reason, params) => {
       const approved = await approvedCompaction();
       const sent = params(approved);
-      const before = { files: ownedFiles(approved.host), ledger: readFileSync(approved.host.ledgerFile, "utf8") };
+      const before = { files: ownedFiles(approved.host), ledger: readFileSync(approved.host.ledgerFile, "base64") };
 
       const result = await approved.host.callTool("observer_resolve", { outcomes: [], ...sent });
 
       expect(failures(result)).toEqual([expect.stringContaining(reason)]);
       expect((result.details as { records: unknown[] }).records).toEqual([]);
-      expect({ files: ownedFiles(approved.host), ledger: readFileSync(approved.host.ledgerFile, "utf8") }).toEqual(before);
+      expect({ files: ownedFiles(approved.host), ledger: readFileSync(approved.host.ledgerFile, "base64") }).toEqual(before);
     });
 
     it("writes nothing for a compaction the user declined", async () => {
@@ -4119,13 +4143,13 @@ describe("compacting on-read amendments", () => {
 
     it("writes and records nothing for a compaction applied with a note", async () => {
       const { host, compaction } = await approvedCompaction((proposal) => proposal.priority === "compaction" ? { option: "Apply", note: "Keep Red first." } : "Apply");
-      const before = { files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "utf8") };
+      const before = { files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "base64") };
 
       const result = await host.callTool("observer_resolve", { outcomes: [], compactions: [compaction] });
 
       expect(failures(result)).toEqual([expect.stringContaining("with the note \"Keep Red first.\"")]);
       expect((result.details as { records: unknown[] }).records).toEqual([]);
-      expect({ files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "utf8") }).toEqual(before);
+      expect({ files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "base64") }).toEqual(before);
     });
   });
 
@@ -4141,7 +4165,7 @@ describe("compacting on-read amendments", () => {
     setLockHash(host, "tdd", "0000000000000000000000000000000000000001");
     const file = join(host.amendmentsDir, "tdd-amendment.md");
     const rule = readFileSync(file, "utf8");
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
     // Points at one file by its bare name and at the other by its path, as the live pass wrote it.
     const body = `## Seams\n\nRead references/tdd/seams.md. ${pointer(host, "tdd", "reds.md")}`;
     const references = [
@@ -4160,7 +4184,7 @@ describe("compacting on-read amendments", () => {
     expect(failures).toMatch(/pointer[\s\S]*seams\.md/);
     expect(failures).not.toMatch(/reds\.md/);
     expect(readFileSync(file, "utf8")).toBe(rule);
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
     expect(existsSync(referencesDir(host))).toBe(false);
   });
 
@@ -4176,7 +4200,7 @@ describe("compacting on-read amendments", () => {
     writeFileSync(referencesDir(host), "In the way.");
     const file = join(host.amendmentsDir, "tdd-amendment.md");
     const rule = readFileSync(file, "utf8");
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
     const body = `## Seams\n\n${pointer(host, "tdd", "seams.md")}`;
     const references = [{ name: "seams.md", body: "Seam recipes." }];
 
@@ -4188,7 +4212,7 @@ describe("compacting on-read amendments", () => {
     expect(resultText(result)).toContain("Not recorded");
     expect(resultText(result)).not.toMatch(/approval|changed since/);
     expect(readFileSync(file, "utf8")).toBe(rule);
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
   });
 
   it("keeps the old reference files and body when writing a compaction's reference files fails", async () => {
@@ -4274,13 +4298,13 @@ describe("compacting on-read amendments", () => {
     const host = loadExtension();
     await addOnReadFix(host, "tdd", "Name the seam first.", SEAMS);
     const rule = readFileSync(join(host.amendmentsDir, "tdd-amendment.md"), "utf8");
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
 
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [compactionCandidate({ includes: [], body: "## Short\n\nOne line.", references: [{ name, body: "Escaped." }] })] });
 
     expect(result.isError).toBe(true);
     expect(readFileSync(join(host.amendmentsDir, "tdd-amendment.md"), "utf8")).toBe(rule);
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
     expect(existsSync(referencesDir(host))).toBe(false);
   });
 
@@ -4448,7 +4472,7 @@ describe("observer_resolve with barrier rules for local and managed skills", () 
     const { frontmatter } = readRule(file);
     const records = ledgerRecords(host.ledgerFile);
     expect(frontmatter).toMatchObject({ condition: narrower.pattern, description: gist, fingerprint: records.at(-1)?.fingerprint });
-    expect(records.slice(1)).toEqual([
+    expect(records).toEqual([
       expect.objectContaining({ fingerprint: replaced, outcome: "withdrawn", gist: "Commit with jj, not git.", rule: file }),
       expect.objectContaining({ outcome: "applied", gist, rule: file }),
     ]);
@@ -4799,7 +4823,7 @@ describe("observer_resolve replays each pattern before writing it", () => {
       fixes: [{ gist: "Name the seam before the first test.", section: SEAMS }],
       stale: [{ rule: "tdd-name-the-seam", select: "Delete" }],
     });
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
     const rules = rulesWritten(host);
     const cancelled = new AbortController();
     cancelled.abort();
@@ -4811,7 +4835,7 @@ describe("observer_resolve replays each pattern before writing it", () => {
     );
 
     await expect(call).rejects.toThrow();
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
     expect(rulesWritten(host)).toEqual(rules);
   });
 });
@@ -4965,11 +4989,11 @@ describe("stale amendments", () => {
 
   it("records a stale answer under the fingerprint of the proposal that wrote the rule", async () => {
     const host = await withAmendment();
+    const [applied] = ledgerRecords(host.ledgerFile);
     changeSkillFile(host, "tdd");
     await host.callTool("observer_resolve", { outcomes: [], stale: [{ rule: "tdd-name-the-seam", action: "keep" }] });
 
-    const [applied, kept] = ledgerRecords(host.ledgerFile);
-    expect(kept?.fingerprint).toBe(applied?.fingerprint);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ outcome: "kept", fingerprint: applied?.fingerprint })]);
   });
 
   it("keeps the evidence of the proposal that wrote the rule on a stale answer", async () => {
@@ -5113,7 +5137,7 @@ describe("stale answers in a call with other answers", () => {
     ];
     expect((result.details as { publications: unknown[] }).publications).toEqual(
       published.map(([operation, skill, rule, fingerprint]) => ({ operation, skill, rule, fingerprint })));
-    expect(ledgerRecords(host.ledgerFile).slice(3).map(({ fingerprint, outcome }) => [fingerprint, outcome])).toEqual(
+    expect(ledgerRecords(host.ledgerFile).slice(2).map(({ fingerprint, outcome }) => [fingerprint, outcome])).toEqual(
       published.map(([operation, , , fingerprint]) => [fingerprint, operation === "stale-update" ? "updated" : operation === "withdrawal" ? "withdrawn" : "applied"]));
     expect(readRule(tdd).body).toBe(compacted);
     expect(readRule(domainModeling).body).toBe(`${terms}\n\n${AGGREGATES}`);
@@ -5136,14 +5160,14 @@ describe("proposal approval of stale answers and withdrawals", () => {
   }
   /** Runs observer_resolve with `params` and checks that it refused each answer for `reason` and left every owned file and the ledger as they were. */
   async function expectNoWrite(host: ReturnType<typeof loadExtension>, params: Record<string, unknown>, reason: string) {
-    const before = { files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "utf8") };
+    const before = { files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "base64") };
     const result = await host.callTool("observer_resolve", { outcomes: [], ...params });
     expect(failures(result).length).toBeGreaterThan(0);
     for (const failure of failures(result)) expect(failure).toContain(reason);
-    expect({ files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "utf8") }).toEqual(before);
+    expect({ files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "base64") }).toEqual(before);
   }
-  type Row = Record<string, string>;
-  const withdrawn = (record: Row) => ({ ...outcome("tdd", "upstream", String(record.gist), "withdrawn"), fingerprint: record.fingerprint });
+  type Row = Pick<LedgerRecord, "fingerprint" | "gist">;
+  const withdrawn = (record: Row) => ({ ...outcome("tdd", "upstream", record.gist, "withdrawn"), fingerprint: record.fingerprint });
 
   it.each<[string, string, (host: ReturnType<typeof loadExtension>, records: { seams: Row; red: Row }) => Promise<Record<string, unknown>>]>([
     ["a stale Update with a raw body", "needs `approval`", async () => ({ stale: [{ rule: "tdd-amendment", action: "update", body: SEAMS }] })],
@@ -5209,7 +5233,7 @@ describe("proposal approval of stale answers and withdrawals", () => {
     expect(failures(result)).toEqual([expect.stringContaining("needs `approval`")]);
     expect(readRule(amendmentFile(host))).toMatchObject({ frontmatter: { skillHash: currentSkillHash(host, "tdd") }, body: updated });
     expect(existsSync(join(host.amendmentsDir, "dm-define-terms.md"))).toBe(false);
-    expect(ledgerRecords(host.ledgerFile).slice(3).map(({ fingerprint, outcome }) => [fingerprint, outcome])).toEqual([
+    expect(ledgerRecords(host.ledgerFile).slice(2).map(({ fingerprint, outcome }) => [fingerprint, outcome])).toEqual([
       [amendments.skillAmendmentFingerprint("tdd"), "updated"], [term.fingerprint, "withdrawn"],
     ]);
     expect((result.details as { approvals: Array<{ fingerprint: string; selected: string }> }).approvals.map(({ fingerprint, selected }) => [fingerprint, selected])).toEqual([
@@ -5228,8 +5252,8 @@ describe("proposal approval of stale answers and withdrawals", () => {
 
     expect(result.isError).toBeFalsy();
     expect(existsSync(amendmentFile(host))).toBe(false);
-    expect(ledgerRecords(host.ledgerFile).slice(2).map(({ outcome }) => outcome)).toEqual(["deleted", "deleted", "deleted"]);
-    expect(ledgerRecords(host.ledgerFile)[2]).toMatchObject({ fingerprint: amendments.skillAmendmentFingerprint("tdd"), outcome: "deleted" });
+    expect(ledgerRecords(host.ledgerFile).map(({ outcome }) => outcome)).toEqual(["deleted", "deleted", "deleted"]);
+    expect(ledgerRecords(host.ledgerFile)[0]).toMatchObject({ fingerprint: amendments.skillAmendmentFingerprint("tdd"), outcome: "deleted" });
   });
 
   it("takes back a fix the user asked for in prose only once an Ask approves its shown withdrawal", async () => {
@@ -5412,7 +5436,7 @@ describe("answers citing their prepared proposal", () => {
     expect(failures(result)).toEqual([]);
     expect(existsSync(join(host.amendmentsDir, "dm-define-terms.md"))).toBe(false);
     expect(readRule(join(host.amendmentsDir, "tdd-amendment.md")).body).toBe(SEAMS);
-    expect(ledgerRecords(host.ledgerFile).slice(1)).toEqual([
+    expect(ledgerRecords(host.ledgerFile)).toEqual([
       recorded({ fingerprint: fix.fingerprint, skill: "domain-modeling", kind: "upstream", gist: fix.gist, outcome: "withdrawn", rule: fix.rule }),
       recorded({ fingerprint: proposalFingerprint("tdd", "Name the seam"), skill: "tdd", kind: "upstream", gist: "Name the seam", outcome: "applied",
         rule: join(host.amendmentsDir, "tdd-amendment.md"), evidence: [{ quote: "which seam?", count: 2 }] }),
@@ -5496,7 +5520,7 @@ describe("answers citing their prepared proposal", () => {
 
     await resolve(host, [{ outcome: "declined", proposal: withEvidence }, { outcome: "declined", proposal: without }]);
 
-    expect(ledgerRecords(host.ledgerFile).slice(2)).toEqual([
+    expect(ledgerRecords(host.ledgerFile)).toEqual([
       expect.objectContaining({ fingerprint: cited?.fingerprint, outcome: "declined", evidence: [{ quote: "the whole suite again", count: 2 }] }),
       expect.objectContaining({ fingerprint: uncited?.fingerprint, outcome: "declined", evidence: earlier }),
     ]);
@@ -5647,14 +5671,14 @@ describe("observer_resolve takes no raw protected change", () => {
     mkdirSync(join(referencesDir(host), "tdd"), { recursive: true });
     writeFileSync(join(referencesDir(host), "tdd", "old.md"), "Old recipes.\n");
     changeSkillFile(host, "tdd");
-    const before = { files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "utf8") };
+    const before = { files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "base64") };
 
     const result = await host.callTool("observer_resolve", { outcomes: [], ...params });
 
     expect(result.isError).toBe(true);
     expect((result.details as { failures: string[] }).failures).toEqual([expect.stringContaining(reason)]);
     expect((result.details as { records: unknown[] }).records).toEqual([]);
-    expect({ files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "utf8") }).toEqual(before);
+    expect({ files: ownedFiles(host), ledger: readFileSync(host.ledgerFile, "base64") }).toEqual(before);
   });
 });
 
@@ -6414,7 +6438,7 @@ describe("evidence-gated instructions", () => {
 });
 
 describe("error-path guidance in tool results", () => {
-  const CONDITIONS: readonly ToolResultCondition[] = ["changed-target", "ledger-append-failed", "cleanup-failed", "custom-input", "approval-note"];
+  const CONDITIONS: readonly ToolResultCondition[] = ["changed-target", "ledger-recording-failed", "cleanup-failed", "custom-input", "approval-note"];
   /** Each `## What to do now` section of `text`, as the conditions whose guidance paragraphs it holds, in order; any other paragraph stays text. */
   const whatToDoNow = (text: string) => text.split("\n## What to do now\n\n").slice(1)
     .map((section) => section.split("\n\n").map((paragraph) => CONDITIONS.find((condition) => toolResultGuidance(condition) === paragraph) ?? paragraph));
@@ -6537,7 +6561,7 @@ describe("remedy outcomes in the observation payload", () => {
     if (project) {
       const target = canonicalProjectTarget(host.skillHome.roots.cwd, { scope: "project", root: host.skillHome.roots.cwd, path: "package.json", mechanism: "Wire the typecheck." });
       const fingerprint = projectFingerprint(target);
-      appendFileSync(host.ledgerFile, `${JSON.stringify({ fingerprint, kind: "project", target, gist: "Wire the typecheck.", outcome: "applied", timestamp: new Date().toISOString(), sessionId: "fixture-session" })}\n`);
+      seedLedger(host.ledgerFile, [{ fingerprint, kind: "project", target, gist: "Wire the typecheck.", outcome: "applied", timestamp: new Date().toISOString(), sessionId: "fixture-session" }]);
       fingerprints.push(fingerprint);
     }
     host.setBranch(fx.plainUserMessage);
@@ -6597,7 +6621,7 @@ describe("/observe-report", () => {
     splitAmendment(host, "tdd", "tdd-red");
     splitAmendment(host, "domain-modeling", "dm-terms");
     changeSkillFile(host, "domain-modeling");
-    appendFileSync(host.ledgerFile, `${JSON.stringify({ fingerprint: "later-fix", skill: "tdd", kind: "upstream", gist: "Later gist.", outcome: "later", timestamp: new Date().toISOString(), sessionId: "fixture-session" })}\n`);
+    seedLedger(host.ledgerFile, [{ fingerprint: "later-fix", skill: "tdd", kind: "upstream", gist: "Later gist.", outcome: "later", timestamp: new Date().toISOString(), sessionId: "fixture-session" }]);
     host.setBranch(fx.plainUserMessage);
     await readSkill(host, "skill://tdd");
     await readSkill(host, "skill://missing-skill", { isError: true });
@@ -6613,14 +6637,14 @@ describe("/observe-report", () => {
     const host = await richHost();
     const branch = structuredClone(host.getBranch());
     const tools = [...host.activeTools()];
-    const ledger = readFileSync(host.ledgerFile, "utf8");
+    const ledger = readFileSync(host.ledgerFile, "base64");
 
     await host.runCommand("observe-report");
 
     expect(host.sent).toEqual([]);
     expect(host.getBranch()).toEqual(branch);
     expect(host.activeTools()).toEqual(tools);
-    expect(readFileSync(host.ledgerFile, "utf8")).toBe(ledger);
+    expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
     expect(host.noticeEvents).toEqual([{ message: expect.any(String), type: "info" }]);
     const report = host.notices[0]!;
     const fingerprint = (skill: string, rule: string) => proposalFingerprint(skill, `Gist of ${rule}.`);
@@ -7431,7 +7455,7 @@ describe("observer_review inspect and grounded repairs", () => {
     const resolved = await resolve(host, [{ skill, kind, gist, fingerprint, outcome: "applied", approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } }]);
     expect(failures(resolved)).toEqual([]);
     expect(readFileSync(amendment, "utf8")).toContain("Build one fixture per seam.");
-    expect(readLedger(host.ledgerFile).at(-1)).toMatchObject({ fingerprint, outcome: "applied" });
+    expect(ledgerRecords(host.ledgerFile).at(-1)).toMatchObject({ fingerprint, outcome: "applied" });
   });
 
   it("refuses a skill-text repair whose candidate diagnosis lacks its receipt, explanation or behavior delta, naming what is missing", async () => {
@@ -7754,7 +7778,7 @@ describe("observer_review inspect and grounded repairs", () => {
       const recorded = await resolve(host, [{ skill, kind, gist: "Name the request in the description.", outcome: "applied" }]);
       expect(recorded.isError, label).toBe(true);
     }
-    expect(readLedger(host.ledgerFile)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([]);
     expect(observerBytes(host)).toEqual(before);
     expect(readFileSync(guidePath(host), "utf8")).toBe(GUIDE_TEXT);
   });
@@ -7770,10 +7794,10 @@ describe("observer_review inspect and grounded repairs", () => {
         expect(failures(recorded).join("\n"), label).toMatch(/installed as an? (upstream|plugin) skill/);
       }
     }
-    expect(readLedger(host.ledgerFile)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([]);
     const declined = await resolve(host, [{ skill: GUIDE, kind: "upstream", gist: "Name the request in the description.", outcome: "declined" }]);
     expect(failures(declined)).toEqual([]);
-    expect(readLedger(host.ledgerFile)).toEqual([expect.objectContaining({ skill: GUIDE, kind: "upstream", outcome: "declined" })]);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ skill: GUIDE, kind: "upstream", outcome: "declined" })]);
   });
 
   /** Records a successful `name` call on the branch, as OMP saves it, and returns its ID. */
@@ -7821,17 +7845,17 @@ describe("observer_review inspect and grounded repairs", () => {
       ] as const) {
         expect(failures(await resolve(host, [answer])).join("\n"), `${kind} ${JSON.stringify(answer)}`).toContain(reason);
       }
-      expect(readLedger(host.ledgerFile), kind).toEqual([]);
+      expect(ledgerRecords(host.ledgerFile), kind).toEqual([]);
 
       const recorded = await resolve(host, [{ approval, outcome: "applied", publication: { writeToolCallId: publish() } }]);
       expect(failures(recorded), kind).toEqual([]);
-      expect(readLedger(host.ledgerFile), kind).toEqual([expect.objectContaining({ skill, kind, outcome: "applied", fingerprint: entry!.proposal.fingerprint })]);
+      expect(ledgerRecords(host.ledgerFile), kind).toEqual([expect.objectContaining({ skill, kind, outcome: "applied", fingerprint: entry!.proposal.fingerprint })]);
 
       // The user speaks while the call waits after validating the answer: the approval is checked again before recording.
       const retracted = resolve(host, [{ approval, outcome: "applied", publication: { writeToolCallId: publish() } }]);
       host.getBranch().push({ type: "message", id: `steer-${kind}`, message: { role: "user", steering: true, content: "Stop, not that one." } });
       expect(failures(await retracted).join("\n"), kind).toContain("sent a message after answering");
-      expect(readLedger(host.ledgerFile), kind).toHaveLength(1);
+      expect(ledgerRecords(host.ledgerFile), kind).toHaveLength(1);
     }
   });
 });
@@ -7922,7 +7946,7 @@ describe("observer_review new-skill search", () => {
     expect(failures(misnamed).join("\n")).toContain(`create\` of \`${NEW}\``);
     const created = await resolve(host, [{ approval, outcome: "applied", publication: { writeToolCallId: createInSession(host, NEW) } }]);
     expect(failures(created)).toEqual([]);
-    expect(readLedger(host.ledgerFile)).toEqual([expect.objectContaining({ skill: NEW, kind: "new", outcome: "applied" })]);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ skill: NEW, kind: "new", outcome: "applied" })]);
   });
 
   it("fails the search when a required source exists but can't be read, or a skill already holds the name", async () => {
