@@ -93,7 +93,9 @@ This is trusted-host enforcement of the recorded correspondence, not a filesyste
 
 ## Ledger
 
-`observer_resolve` appends one record per proposal to `<agent dir>/skill-observer/ledger.jsonl` (global, not per project). Each record holds the fingerprint, target skill, kind (`local`, `managed`, `upstream`, `plugin` or `new`), gist, outcome, timestamp and session id. It also holds `rule`, the rule file, for every answer that wrote one, and `evidence`, the quotes the question cited, each as `{ quote, count }` with the quoted signal's repeat count.
+`observer_resolve` records accepted decisions in `<agent dir>/skill-observer/observer.sqlite`. The proposal ledger holds the latest answer per fingerprint in answer order. Each record includes its target and kind, gist, outcome, timestamp and session ID. It retains rule paths, publication receipts and evidence when supplied. The same database holds pending observations and short-lived recurrence markers, not catalog or session history.
+
+Prepare and Select read by fingerprint. Resolve also reads decisions bound to an affected rule or hook and checks ledger dependencies again after replay, within the transaction that records the answers. `/observe-report` uses one read-only snapshot for the evidence and estimate, and releases it before waiting. Writes prune expired observations and markers. SQLite reclaims free pages at commit.
 
 A skill answer may cite its prepared proposal of the current pass instead of carrying skill, kind, gist, fingerprint and evidence: an approved one through `approval`, any other answer to a prepared on-read fix, rule or direct edit (Later, Decline or deferred by Select) through `proposal`, the proposal's `reference`. The resolver fills the answer from that proposal before any other check, and records the proposal's evidence without its source label. Values the answer supplies must still match the proposal. An answer citing no prepared proposal carries its skill, kind and gist. An answer with no evidence of its own or from its proposal keeps the evidence last recorded under its fingerprint, so re-offering a proposal or settling its stale amendment preserves its evidence.
 
@@ -121,7 +123,7 @@ Prepare refuses a withdrawal of a hand-written rule, a rule holding another fix,
 
 A fix whose rule is already gone, or that wrote none (an edit to a local or managed skill, which the pass reverts itself), is only recorded. The `withdrawn` record keeps the skill, kind, gist and `rule` of the fix it takes back. Moving a fix to another skill is one call with a `withdrawn` answer for the old skill and an `applied` answer for the new one. The pass asks about a fix you retract or redirect this way, whether in an answer's text or a later message, and records it once you approve the withdrawal.
 
-A record's `rule` is the path the file had when the record was written; ledger rows are never rewritten. A fix's rule is the one named by that path's file name, looked up in the amendments directory, then the rules directory, so the fixes of an on-read amendment that moved out of the rules directory stay attached to it.
+A record's `rule` is the path the file had when the answer was recorded. Moving the file does not update that path. A fix's rule is the one named by the path's file name, looked up in the amendments directory, then the rules directory. Fixes stay attached to an on-read amendment that moved out of the rules directory.
 
 ### Publication phases and recording failures
 
@@ -129,15 +131,15 @@ One call's changes run in fixed phases across every skill it names: stale answer
 
 The exception is a deletion that removed its rule file and then failed to delete the skill's reference folder. The deletion is listed as made, with its records, tombstones included. The result's `cleanup` names what remains, for the pass to inspect and report without calling again.
 
-The result's `publications` lists each change the call carried out, in order: its `operation` (`stale-keep`, `stale-update`, `stale-delete`, `withdrawal`, `on-read-append`, `rule` or `compaction`), skill, rule file and the fingerprint its record carries. An on-read addition whose section the amendment already held verbatim changed no file and is not listed. Neither is a deferred, refused or record-only answer. [`src/on-read-amendment-transitions.ts`](../src/on-read-amendment-transitions.ts) owns these phases; `observer_resolve` validates each answer, runs the replays, appends the records and reports.
+The result's `publications` lists each rule or reference change the call carried out, in order: its `operation` (`stale-keep`, `stale-update`, `stale-delete`, `withdrawal`, `on-read-append`, `rule` or `compaction`), skill, rule file and the fingerprint its record carries. An on-read addition whose section the amendment already held verbatim changed no file and is not listed. Neither is a deferred, refused or record-only answer. [`src/on-read-amendment-transitions.ts`](../src/on-read-amendment-transitions.ts) owns these phases.
 
-Rule, amendment and reference file changes and the ledger append are separate writes; no call is a transaction. When the append fails, the call still returns what it carried out. For each record in order, `recording` says whether it reached the ledger: `recorded`, `unrecorded` or `unknown`, with the error. The append reads the ledger once beforehand. A failure before writing starts leaves every record `unrecorded`.
+The transaction commits all accepted records from one Resolve call together, including generated withdrawal and deletion records. Replay finishes before the transaction starts. SQLite rollback cannot undo rule, amendment, reference or other file changes. For each record in order, `recording` reports `recorded`, `unrecorded` or `unknown`, with the error if recording failed.
 
-After a failed write, one read of the file settles each record. A record written whole (its JSON complete, with or without its newline) is `recorded`; one cut short or not reached is `unrecorded`. If the file can't be read or no longer starts with its earlier bytes followed by a prefix of the append, every record is `unknown`. The exception alone settles nothing.
+A known rollback leaves every record in the batch unrecorded. If the extension cannot determine whether the commit succeeded, it reports the batch as unknown.
 
-An applied change whose record didn't reach the ledger is an Unrecorded publication. The result lists it as made, never as `later`, and tells the pass to report it and leave the ledger to the user, without calling again or redoing it. A `later` or `declined` record that didn't reach the ledger, answered so or deferred by the replay or coverage check, is listed separately. It wrote nothing and keeps its outcome, unrecorded. Nothing is retried, repaired or replayed at startup.
+A file change whose record did not reach the ledger is an Unrecorded publication. The result lists it separately from answers that changed no file. Preserve the changes and report the error. Do not retry Resolve or redo the publication.
 
-The result text ends with `## What to do now` holding the `tool-result` paragraph of `observer.md` for each of three reported conditions: a failed ledger append, a failed cleanup, and an answer refused because its target changed since Prepare or the reconciliation. The last is decided by type. `checkTarget` in [`src/proposal-approval.ts`](../src/proposal-approval.ts) throws `TargetChangedError`, and the resolution's `targetChanged` flag records that one reached the failures. The failure text is never matched.
+The result text ends with `## What to do now` holding the `tool-result` paragraph of `observer.md` for each of three reported conditions: a ledger recording failure, a failed cleanup, and an answer refused because its target changed since Prepare or reconciliation. The last is decided by type. `checkTarget` in [`src/proposal-approval.ts`](../src/proposal-approval.ts) throws `TargetChangedError`, and the resolution's `targetChanged` flag records that one reached the failures. The failure text is never matched.
 
 During a pass, the `ask` result hook in [`src/skill-observer.ts`](../src/skill-observer.ts) adds the `custom-input` paragraph under the same heading when an answer starts with `Other: `, and the `approval-note` paragraph when `details.notes` holds a note that is not blank. `toolResultGuidance` reads the paragraphs from `observer.md` on each call, keeping a single source. `whatToDoNow` never throws: these results may report changes already made, so a paragraph it cannot load becomes a logged error and a one-line note.
 
@@ -212,7 +214,9 @@ bun run test
 bun run typecheck
 ```
 
-This runs ordinary tests without launching the native OMP checks. See [Testing](#testing) for explicit native checks. To print what `/observe-report` shows for a saved session without OMP, for example to compare the observation payload estimate before and after a change, run `bun --no-env-file scripts/observe-report.ts <session.jsonl>`; it works on a temp copy of the agent dir's observer state.
+This runs ordinary tests without launching the native OMP checks. See [Testing](#testing) for explicit native checks.
+
+To print the report for a saved session without starting OMP, run `bun --no-env-file scripts/observe-report.ts <session.jsonl>`. It takes a read-locked snapshot of the database in a temp directory. It reports a locked or unreadable store without changing the original.
 
 ### Instruction fragments
 
@@ -250,13 +254,15 @@ Run this from the source checkout's extension root. It creates `skill-observer-0
 | [`src/payload.ts`](../src/payload.ts) | Observation payload: the `observer.md` fragment parser, gates from pass evidence, gated instruction text, `tool-result` guidance and the chars/4 payload estimate |
 | [`scripts/generate-fragments.ts`](../scripts/generate-fragments.ts) | `bun run generate`: writes `observer/` from `observer.md` |
 | [`scripts/check-hook.ts`](../scripts/check-hook.ts) | The hook check: runs an observer hook against sample events on a stand-in host |
+| [`scripts/migrate-observer-store.ts`](../scripts/migrate-observer-store.ts) | Standalone preview and one-time import of legacy JSONL files |
+| [`src/observer-store.ts`](../src/observer-store.ts) | Profile database initialization, read snapshots, and write transactions with observation pruning |
 | [`src/delivery.ts`](../src/delivery.ts) | On-read amendment delivery on both routes (`/skill:` reminder, `read` of the entry file) and the once-per-context-window rule |
 | [`src/reminder.ts`](../src/reminder.ts) | Delivery records: reminder markup, reminder message type, delivery entry type and their parsers |
 | [`src/amendments.ts`](../src/amendments.ts) | Observer rule files in both directories: reading, writing, pins, staleness and the load-time migration |
 | [`src/provenance.ts`](../src/provenance.ts) | Where a skill comes from (local, upstream, managed, plugin, or a byte-identical copy of one) and the skill-folder `skillHash` |
 | [`src/digest.ts`](../src/digest.ts) | Session digest: skill signals, loaded skills and deliveries rebuilt from the branch |
-| [`src/ledger.ts`](../src/ledger.ts) | Proposal ledger: append-only JSONL, latest answer per fingerprint, project and harness target identities, and the three harness directories |
-| [`src/observations.ts`](../src/observations.ts) | Observation store: append-only JSONL, latest row per project and text, pending and expiry on read, the project identity from the shared git directory, and the payload section |
+| [`src/ledger.ts`](../src/ledger.ts) | Current proposal decisions, project and harness target identities, and the three harness directories |
+| [`src/observations.ts`](../src/observations.ts) | Pending observations and recurrence markers; repository identity and payload rendering |
 | [`src/resolve.ts`](../src/resolve.ts) | `observer_resolve`: validates and records answers, and replays pattern rules before the call's changes |
 | [`src/on-read-amendment-transitions.ts`](../src/on-read-amendment-transitions.ts) | On-read amendment transitions: one call's stale settlements, withdrawals, additions and rules, and compactions in their phases, with withdrawal checks, compaction coverage and reference release |
 | [`src/publication.ts`](../src/publication.ts) | Builds and validates the rule of an applied fix from its approved section or rule |

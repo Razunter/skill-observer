@@ -19,6 +19,8 @@ omp
 
 OMP installs and enables the extension for your user; no manual clone or configuration entry is needed. The extension is not published on npm and needs no runtime npm packages or build step. See [setup](docs/setup.md) for checkout loading, OMP's `/extensions` controls, and state locations.
 
+Upgrading a profile with existing observer state? [Migrate its JSONL files](docs/setup.md#migrate-existing-observer-state) before you start the upgraded extension.
+
 ## Use it
 
 After working with a skill and correcting the agent, enter:
@@ -45,7 +47,7 @@ To see what the extension knows about the current branch without starting a revi
 
 It lists signal counts, loaded skills, remedy outcomes of applied fixes, stale amendments, pending observations, skill catalog observations, the next `/observe` pass's estimated size, and the Later count. It calls no model and writes nothing.
 
-While it works, the agent can also record an **observation** with its `observe` tool when a skill, a rule or the project setup gets something wrong. Observations are kept per repository, shared by its worktrees, and survive across sessions. The next `/observe` in that repository lists them, then drops them; an observation that no pass shows expires 30 days after it was last recorded. See [observations](docs/observation.md#observations).
+While it works, the agent can record an **observation** with its `observe` tool when a skill, a rule or the project setup gets something wrong. Observations survive across sessions and are shared by all worktrees of their repository. The next `/observe` lists and clears the pending recording. A repeat within 30 days of being shown names the date it was last shown. An observation no pass shows expires 30 days after it was last recorded. See [observations](docs/observation.md#observations).
 
 ### Optional remote skills
 
@@ -59,7 +61,7 @@ Install these skills separately. Ordinary observation works without them. See [o
 - **Interactive review:** `/observe` requires a main session with UI. Amendment delivery also runs in subagents and headless sessions, but requires the extension to stay loaded.
 - **Different targets:** upstream and plugin skill files stay untouched. Approved local or managed skill changes can edit those skills directly, and approved project fixes use normal editing tools.
 - **Instruction delivery, not guaranteed compliance:** amendments add guidance to the model's context. Pattern rules are checked against their supplied samples, not proven correct for every possible output.
-- **Existing state:** loading can migrate legacy observer-owned files. New proposals follow the review workflow; this is not a filesystem sandbox. See [storage and migration](docs/amendments.md).
+- **Existing state:** the extension does not import old proposal or observation files on load. Use the [one-time migration](docs/setup.md#migrate-existing-observer-state). Loading may still [migrate legacy amendment files](docs/amendments.md).
 
 ## Documentation
 

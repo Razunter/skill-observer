@@ -9,6 +9,7 @@
 - Previews show paths under the home directory as `~/…`, and cut each rule `Matches:`/`Spares:` sample line to 200 characters. Written content is unchanged.
 - The status line reads `skill-observer: N skill correction(s) → /observe` (and likewise for workflows without a skill and pending observations).
 - The pass summary reports dismissed signals as one line, counted and grouped by reason, instead of listing them.
+- Proposal decisions and observations now share a profile-local SQLite database. Resolve records each accepted batch in one transaction. Reports do not write or consume state. A new recording within 30 days of being shown carries its prior shown date. Existing profiles must [run the migration](docs/setup.md#migrate-existing-observer-state) before using the upgraded extension. The script leaves the original JSONL files unchanged.
 
 ## 0.3.0 - 2026-11-17
 

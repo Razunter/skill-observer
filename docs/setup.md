@@ -99,8 +99,24 @@ Use each source project's installation instructions. OMP must be able to discove
 
 ## State and upgrades
 
-The extension stores its ledger, observations, on-read amendments, and reference files under the active OMP agent directory's `skill-observer/` directory. Pattern amendments and barrier rules live in the agent directory's `rules/`. Skill decisions are shared across projects in that profile; project decisions are scoped to the canonical OMP working directory, and observations to the repository.
+The proposal ledger and observations share `<agent dir>/skill-observer/observer.sqlite`. Skill decisions are shared across projects in that profile. Project decisions use the canonical OMP working directory. Observations use the repository. On-read amendments and reference files still live under `skill-observer/`. Pattern amendments and barrier rules live under `rules/`.
 
-Loading can migrate marked legacy observer rules to the current layout, separately from proposal approval. Upstream updates preserve separately stored amendments; the next `/observe` checks for staleness. On-read delivery requires the extension to stay loaded in later sessions.
+Loading can still migrate legacy observer rules separately from proposal approval. Upstream updates preserve separately stored amendments. The next `/observe` checks them for staleness. On-read delivery requires the extension to stay loaded in later sessions.
 
 See [amendment storage, delivery, and migration](amendments.md) and [ledger and approval details](development.md#ledger).
+
+### Migrate existing observer state
+
+For a profile with `ledger.jsonl` or `observations.jsonl` under `<agent dir>/skill-observer/`, run the migration once from the upgraded skill-observer checkout. Fresh profiles need no setup.
+
+1. Stop all OMP sessions that share the agent directory you are upgrading. Old and new versions must not write to the same profile.
+2. Preview the migration. It reports input sizes and the counts it would keep, without changing files or printing observations or proposal evidence.
+
+   ```sh
+   bun --no-env-file scripts/migrate-observer-store.ts --agent-dir /path/to/agent
+   ```
+
+3. Add `--apply` to the same command to import. It leaves both JSONL files unchanged as recovery copies. A completed import is a no-op on rerun. The script refuses to overwrite any other database.
+4. Start the upgraded extension. Use `/observe-report` to inspect the profile without consuming pending observations.
+
+Omit `--agent-dir` to use `PI_CODING_AGENT_DIR` or the default `~/.omp/agent`. Pass the resolved agent directory explicitly for a named profile outside its OMP process. A downgrade does not carry decisions made after the cutover back into the originals.
