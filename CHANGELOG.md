@@ -14,6 +14,7 @@
 ### Fixed
 
 - The session digest shows only the inner tools when the records show that `bash` did no other work. It still shows mixed shell work. Approval receipts are unchanged.
+- `/observe` summaries use terminal-safe Markdown, with required occurrence IDs visible in lists instead of raw disclosure tags.
 
 ## 0.3.0 - 2026-11-17
 
