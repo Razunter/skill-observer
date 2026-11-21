@@ -3,6 +3,7 @@
  * Adapted from task-observer by Eoghan Henn / rebelytics.com (CC BY 4.0),
  * https://github.com/rebelytics/one-skill-to-rule-them-all
  */
+import { randomUUID } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -29,7 +30,7 @@ import {
 import { type CatalogSummary, catalogSummary, registerCatalogCapture, renderCatalogSummary } from "./catalog.js";
 import { registerAmendmentDelivery } from "./delivery.js";
 import { harnessRootDirs, type LedgerRecord, ledgerForProject, readLedgerRows, renderLedger } from "./ledger.js";
-import type { AskDetails, ExtensionAPI, ExtensionContext } from "./omp.js";
+import type { AskDetails, ExtensionAPI, ExtensionContext, ObservationLead } from "./omp.js";
 import {
   createProvenanceResolver,
   defaultSkillRoots,
@@ -117,6 +118,7 @@ interface PassEvidence {
 interface ObservationPayload {
   sections: PayloadSection[];
   content: string;
+  leads: ObservationLead[];
   /** The project gate is on and no installed `retro` could be read. */
   retroUnavailable: boolean;
 }
@@ -148,6 +150,12 @@ async function observationPayload(
     catalog,
   });
   const retro = gates.has("project") ? retroReference(provenance) : undefined;
+  const leads: ObservationLead[] = [];
+  const leadLabel = (kind: ObservationLead["kind"], text: string) => {
+    const ref = randomUUID();
+    leads.push({ ref, kind, text });
+    return `lead: \`${ref}\``;
+  };
   const sections: PayloadSection[] = [
     {
       name: "instructions",
@@ -159,9 +167,9 @@ async function observationPayload(
           `Project hooks directory: \`${hookDirs["project-hooks"]}\`. Global hooks directory: \`${hookDirs["global-hooks"]}\`. Companion extension directory: \`${hookDirs.companion}\`.`,
       ].join("\n"),
     },
-    { name: "note", text: note && `## User note\n\n${note}` },
+    { name: "note", text: note && `## User note (${leadLabel("note", note)})\n\n${note}` },
     { name: "digest", text: `## Session digest\n\n${renderDigest(digest)}` },
-    { name: "observations", text: renderObservations(observations) },
+    { name: "observations", text: renderObservations(observations, (text) => leadLabel("observation", text)) },
     { name: "catalog", text: renderCatalogSummary(catalog) },
     { name: "ledger", text: renderLedger(ledger) },
     { name: "outcomes", text: renderRemedyOutcomes(remedyOutcomes(ledger, digest), ledger, digest) },
@@ -171,7 +179,7 @@ async function observationPayload(
     { name: "stale", text: stale.length > 0 ? renderStaleAmendments(stale, provenance) : "" },
   ];
   const present = sections.filter(({ text }) => text !== "");
-  return { sections: present, content: present.map(({ text }) => text).join("\n\n"), retroUnavailable: retro?.available === false };
+  return { sections: present, content: present.map(({ text }) => text).join("\n\n"), leads, retroUnavailable: retro?.available === false };
 }
 
 /** Project scope and the `correct` offer, which only a project-environment pass needs. */
@@ -290,7 +298,9 @@ export default function skillObserver(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       if (!isObservable(ctx)) return;
       const note = args.trim();
-      const roots = defaultSkillRoots(ctx.cwd);
+      const cwd = ctx.cwd;
+      const sessionId = ctx.sessionManager.getSessionId();
+      const roots = defaultSkillRoots(cwd);
       const provenance = createProvenanceResolver(roots);
       const branch = ctx.sessionManager.getBranch();
       const digest = buildDigest(branch, { provenance });
@@ -298,7 +308,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
       let observations: readonly Observation[];
       let payload: ObservationPayload;
       try {
-        const state = readPassState(ctx.cwd, new Date());
+        const state = readPassState(cwd, new Date());
         observations = state.observations;
         if (!note && isEmptyDigest(digest) && stale.length === 0 && observations.length === 0) {
           ctx.ui.notify("Nothing to observe: no skill signals, stale amendments or pending observations, and no note.", "info");
@@ -312,7 +322,10 @@ export default function skillObserver(pi: ExtensionAPI): void {
       if (payload.retroUnavailable) ctx.ui.notify("Retro reference unavailable; ordinary skill observation remains usable.", "warning");
       await activatePassTools();
       pi.sendMessage(
-        { customType: OBSERVATION_MESSAGE_TYPE, content: payload.content, display: false, attribution: "user" },
+        {
+          customType: OBSERVATION_MESSAGE_TYPE, content: payload.content, display: false, attribution: "user",
+          details: { observationLeads: { cwd, sessionId, leads: payload.leads } },
+        },
         { triggerTurn: true, deliverAs: "followUp" },
       );
       try {

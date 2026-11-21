@@ -77,7 +77,7 @@ export interface SessionEntry {
    * extension adds; `name` and `path` on `skill-prompt` messages; `kind` on
    * `compaction` entries (`experimental-context-rollover`).
    */
-  details?: { rules?: string[]; name?: string; path?: string; kind?: string };
+  details?: CustomMessageDetails & { name?: string; path?: string; kind?: string };
   /** `ttsr_injection` entries. */
   injectedRules?: string[];
   /** `compaction` entries: the first entry the compaction kept in context; empty when a provider payload holds the kept turns. */
@@ -263,6 +263,17 @@ export interface ToolResultEventResult {
 /** Command handlers get a richer context in OMP; this extension needs only the base. */
 export type CommandHandler = (args: string, ctx: ExtensionContext) => Promise<void>;
 
+export interface ObservationLead {
+  ref: string;
+  kind: "note" | "observation";
+  text: string;
+}
+
+interface CustomMessageDetails {
+  rules?: string[];
+  observationLeads?: { cwd: string; sessionId: string; leads: ObservationLead[] };
+}
+
 /** A `pi.sendMessage` payload; it persists as a `custom_message` entry. */
 export interface CustomMessage {
   customType: string;
@@ -270,7 +281,7 @@ export interface CustomMessage {
   /** Whether the TUI shows the message; the model receives it either way. */
   display: boolean;
   attribution?: "user" | "agent";
-  details?: { rules?: string[] };
+  details?: CustomMessageDetails;
 }
 
 export interface SendMessageOptions {

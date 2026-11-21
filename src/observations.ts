@@ -78,7 +78,7 @@ export function markObservationsShown(file: string, observations: readonly Obser
   });
 }
 
-export function renderObservations(observations: readonly Observation[]): string {
+export function renderObservations(observations: readonly Observation[], leadLabel: (shownText: string) => string): string {
   if (observations.length === 0) return "";
   return [
     "## Observations",
@@ -87,7 +87,8 @@ export function renderObservations(observations: readonly Observation[]): string
     "",
     ...observations.map(({ text, count, recordedAt, priorShownAt }) => {
       const recurrence = priorShownAt === null ? "" : `; recorded again after being shown on ${observationDate(priorShownAt)}`;
-      return `- ${text.replace(/\s*\n\s*/g, " ")} (count ${count}, last recorded ${observationDate(recordedAt)}${recurrence})`;
+      const shownText = text.replace(/\s*\n\s*/g, " ");
+      return `- ${shownText} (count ${count}, last recorded ${observationDate(recordedAt)}${recurrence}) [${leadLabel(shownText)}]`;
     }),
   ].join("\n");
 }

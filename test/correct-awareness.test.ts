@@ -26,7 +26,7 @@ it.each([true, false])("discovers the existing user-only correct reference in a 
     zod: Object.fromEntries(["object", "array", "string", "number", "enum", "union", "record", "unknown"].map(key => [key, () => schema])),
   } as unknown as ExtensionAPI;
   skillObserver(pi);
-  const ctx = { hasUI: true, cwd: roots.cwd, agent: { kind: "main" }, sessionManager: { getBranch: () => entries.skillLessTurn, getEntries: () => entries.skillLessTurn }, ui: { notify() {}, setStatus() {} } } as unknown as ExtensionContext;
+  const ctx = { hasUI: true, cwd: roots.cwd, agent: { kind: "main" }, sessionManager: { getSessionId: () => "fixture-session", getBranch: () => entries.skillLessTurn, getEntries: () => entries.skillLessTurn }, ui: { notify() {}, setStatus() {} } } as unknown as ExtensionContext;
   await observe!("inspect recurring errors", ctx);
   expect(sent).toHaveLength(1);
   expect(String(sent[0]!.content).includes(path)).toBe(available);

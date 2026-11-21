@@ -75,7 +75,7 @@ let customEntryIds = 0;
  * available judge role unless `judge` is false. Given another host's
  * `skillHome`, it is a second session of the same agent dir and project.
  */
-function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; allTools?: ExtensionAPI["getAllTools"]; systemPrompt?: string[]; onSend?: () => void } = {}) {
+function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; sessionId?: string; allTools?: ExtensionAPI["getAllTools"]; systemPrompt?: string[]; onSend?: () => void } = {}) {
   const skillHome = options.skillHome ?? makeSkillHome();
   mkdirSync(skillHome.roots.cwd, { recursive: true });
   vi.stubEnv("HOME", skillHome.home);
@@ -140,7 +140,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     hasUI: options.hasUI ?? true,
     agent: options.agentKind === "unknown" ? undefined : { kind: options.agentKind ?? "main" },
     cwd: skillHome.roots.cwd,
-    sessionManager: { getBranch: () => branch, getEntries: sessionEntries, getSessionId: () => "fixture-session" },
+    sessionManager: { getBranch: () => branch, getEntries: sessionEntries, getSessionId: () => options.sessionId ?? "fixture-session" },
     ...(options.systemPrompt && { getSystemPrompt: () => options.systemPrompt! }),
     modelRegistry: { getAvailable: () => [{ provider: "fixture", id: "explicit-judge" }] },
     ui: {
@@ -400,6 +400,7 @@ describe("/observe", () => {
     expect(options).toMatchObject({ triggerTurn: true });
     const content = String(message.content);
     expect(content).toContain(textOf(fx.steeringUserMessage));
+    expect(message.details?.observationLeads?.leads).toEqual([]);
     expect(content).toMatch(/`tdd`: upstream/);
     expect(content).toMatch(/`implement-spec`: managed/);
   });
@@ -519,9 +520,51 @@ describe("/observe", () => {
     host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
     await host.runCommand("observe", "  tdd should say to run the one failing test first\nnot the whole suite  ");
     const content = String(host.sent[0]?.message.content);
-    const note = content.indexOf("## User note\n\ntdd should say to run the one failing test first\nnot the whole suite\n");
+    const note = content.search(/## User note \(lead: `[^`]+`\)\n\ntdd should say to run the one failing test first\nnot the whole suite\n/);
     expect(note).toBeGreaterThan(-1);
     expect(note).toBeLessThan(content.indexOf("## Session digest"));
+  });
+
+  it("binds fresh lead references to the note and observations actually shown in each pass", async () => {
+    const sessionId = "lead-test-session";
+    const host = loadExtension({ sessionId });
+    const cwd = join(host.skillHome.home, "lead-project");
+    mkdirSync(cwd);
+    host.setCwd(cwd);
+    const note = "A retained fact is obsolete.\nThe switch is now off.";
+    const repeated = "The same retained fact\n  keeps appearing twice.";
+    const shownOnce = "The formatter flag is still missing.";
+    await host.callTool("observe", { text: repeated });
+    await host.callTool("observe", { text: shownOnce });
+    await host.runCommand("observe", `  ${note}  `);
+    await host.callTool("observe", { text: repeated });
+    await host.runCommand("observe", note);
+
+    expect(host.sent).toHaveLength(2);
+    const refs: string[] = [];
+    for (const [index, { message }] of host.sent.entries()) {
+      const details = message.details?.observationLeads;
+      const leadTexts = [
+        { kind: "note", text: note },
+        { kind: "observation", text: "The same retained fact keeps appearing twice." },
+        ...(index === 0 ? [{ kind: "observation", text: shownOnce }] : []),
+      ];
+      expect(details).toEqual({
+        cwd, sessionId, leads: leadTexts.map((lead) => ({ ...lead, ref: expect.any(String) })),
+      });
+      const leads = details!.leads;
+      expect(message.content).toContain(`## User note (lead: \`${leads[0]!.ref}\`)\n\n${note}\n`);
+      expect([...message.content.matchAll(/\blead: `([^`]+)`/g)].map((match) => match[1])).toEqual(leads.map(({ ref }) => ref));
+      for (const { ref, kind, text } of leads) {
+        refs.push(ref);
+        if (kind === "observation") {
+          expect(message.content.split("\n").find((line) => line.startsWith(`- ${text} (count `))).toContain(`[lead: \`${ref}\`]`);
+        }
+      }
+      expect(message.content).toContain("## Session digest");
+      expect(message.content).toContain("**Report items.**");
+    }
+    expect(new Set(refs).size).toBe(refs.length);
   });
 
   it("runs a pass for a note alone, in a session with no signals", async () => {
@@ -6876,7 +6919,8 @@ describe("observations", () => {
     expect(host.sent).toHaveLength(payloads);
     const content = String(host.sent.at(-1)?.message.content ?? "");
     const section = /\n## Observations\n\n([\s\S]*?)(?=\n## |$)/.exec(content)?.[1] ?? "";
-    return section.split("\n").filter((line) => line.startsWith("- "));
+    return section.split("\n").filter((line) => line.startsWith("- "))
+      .map((line) => line.replace(/ \[lead: `[^`]+`\]$/, ""));
   };
 
   /** Records `text` from `cwd` in one session, then runs `/observe` from `observeCwd` in a second session of the same agent dir. */
