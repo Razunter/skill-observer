@@ -2,7 +2,7 @@ import { existsSync, lstatSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { checkPublishedExecutableInputs, type ExecutableCheck, prepareExecutableCheck } from "./executable-check.js";
 import { canonicalMissingPath, canonicalPathIn, type HarnessFile, harnessDestinationRoot, harnessRootDirs, type HarnessTarget } from "./ledger.js";
-import { checkScalarFileState, prepareScalarFile, type ScalarFileEdit } from "./project-publication.js";
+import { checkScalarFileState, fileId, prepareScalarFile, type ScalarFileEdit } from "./project-publication.js";
 import type { SessionToolEvidence } from "./session-tool-evidence.js";
 
 export interface ExecutableEdit {
@@ -55,7 +55,7 @@ export function prepareExecutableEdit(target: HarnessTarget, hookPath: string | 
     }
   }
   const check = prepareExecutableCheck(hookPath === undefined ? "extension" : "hook", files, root, draft.checkToolCallId, evidence, passStart);
-  const change: ExecutableEdit = { operation: "harness", stage: "checked", root, rootId: existsSync(root) ? identity(root) : null, files: changes, check };
+  const change: ExecutableEdit = { operation: "harness", stage: "checked", root, rootId: existsSync(root) ? fileId(lstatSync(root)) : null, files: changes, check };
   const blast = target.root === "project-hooks" || target.root === "extension" && target.checkout !== undefined
     ? `Affects sessions loading this code from ${target.root === "project-hooks" ? cwd : target.checkout}.` : `Affects sessions loading this code from the active profile at ${agentDir}.`;
   return { change, preview: [
@@ -67,16 +67,11 @@ export function prepareExecutableEdit(target: HarnessTarget, hookPath: string | 
 }
 
 export function checkExecutableState(change: ExecutableEdit, pending: readonly string[] = []): void {
-  if (canonicalMissingPath(change.root) !== change.root || change.rootId !== null && identity(change.root) !== change.rootId) {
+  if (canonicalMissingPath(change.root) !== change.root || change.rootId !== null && fileId(lstatSync(change.root)) !== change.rootId) {
     throw new Error("the reviewed executable root changed; prepare and ask again");
   }
   for (const file of change.files) checkScalarFileState(file, pending.includes(file.path));
   checkPublishedExecutableInputs(change.check, change.root, pending);
-}
-
-function identity(path: string): string {
-  const { dev, ino } = lstatSync(path);
-  return `${dev}:${ino}`;
 }
 
 function inside(root: string, file: string): boolean {

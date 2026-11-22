@@ -67,7 +67,6 @@ export function evidenceReport({ digest, ledger, stale, observations, catalog }:
   };
 }
 
-/** Nothing to estimate for an initial pass and no remedy outcomes to report. */
 export function isEmptyEvidenceReport(report: EvidenceReport): boolean {
   return report.payload === undefined && Object.values(report.signals).every((count) => count === 0) &&
     report.skills.length === 0 && report.stale.length === 0 && report.outcomes.length === 0 && report.observations === 0;

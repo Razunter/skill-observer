@@ -312,7 +312,6 @@ function renderSessionSource({ id, file, leaf, compaction }: PassEvidence["sessi
   ].filter(Boolean).join(" ");
 }
 
-/** Project scope and the `correct` offer, which only a project-environment pass needs. */
 function projectSections(cwd: string, provenance: ProvenanceResolver): string {
   const correct = provenance.byName("correct");
   return [
@@ -321,7 +320,6 @@ function projectSections(cwd: string, provenance: ProvenanceResolver): string {
   ].join("\n\n");
 }
 
-/** A pointer to optional category guidance, not the standalone retro workflow. */
 function retroReference(provenance: ProvenanceResolver): { text: string; available: boolean } {
   const retro = provenance.byName("retro");
   if (retro.kind !== "unknown") {

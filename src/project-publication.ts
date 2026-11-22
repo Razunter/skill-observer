@@ -29,7 +29,7 @@ export interface ProjectEdit extends ScalarFileEdit {
   check: string;
 }
 
-const fileId = ({ dev, ino }: { dev: number; ino: number }) => `${dev}:${ino}`;
+export const fileId = ({ dev, ino }: { dev: number; ino: number }) => `${dev}:${ino}`;
 
 function maybeStat(file: string) {
   try { return lstatSync(file); } catch (error) {
@@ -143,8 +143,8 @@ export function projectToolAuthorization(event: ToolCallEvent, cwd: string, bran
         if (file) throw new Error("the executable destination has no current native Apply");
         continue;
       }
-      const pending = change.files.filter((edit) => !successfulOwnerWrite(evidence, edit, reference.contentHash, approval.answeredAt))
-        .map(({ path }) => path);
+      const ownerWrite = ownerWriteLookup(evidence, reference.contentHash, approval.answeredAt);
+      const pending = change.files.filter((edit) => !ownerWrite(edit)).map(({ path }) => path);
       if (file) {
         if (!pending.includes(file.path)) throw new Error("this executable file already has its approved owner write");
         if (paths.length !== 1 || !exactOwnerCall(file, event.toolName, event.input)) {
@@ -188,8 +188,9 @@ export function projectToolAuthorization(event: ToolCallEvent, cwd: string, bran
         throw new Error("use the ordinary owner tool for the exact reviewed destination and content");
       }
       if (change.operation === "project-edits") {
+        const ownerWrite = ownerWriteLookup(evidence, reference.contentHash, approval.answeredAt);
         for (const { change: member } of edits) {
-          const done = successfulOwnerWrite(evidence, member, reference.contentHash, approval.answeredAt);
+          const done = ownerWrite(member);
           if (done && member === edit) throw new Error(`\`${edit.file}\` already has a successful owner write; do not repeat it`);
           if (done) continue;
           try {
@@ -202,7 +203,8 @@ export function projectToolAuthorization(event: ToolCallEvent, cwd: string, bran
         checkProjectState(edit, true);
       }
     } else {
-      const checked = matches.filter(({ change }) => successfulOwnerWrite(evidence, change, reference.contentHash, approval.answeredAt));
+      const ownerWrite = ownerWriteLookup(evidence, reference.contentHash, approval.answeredAt);
+      const checked = matches.filter(({ change }) => ownerWrite(change));
       if (!checked.length) continue;
       if (checked.length === 1) checkProjectState(checked[0]!.change, false);
     }
@@ -211,8 +213,7 @@ export function projectToolAuthorization(event: ToolCallEvent, cwd: string, bran
   for (const { proposal: { change, target } } of entries) {
     if (change.operation === "harness") {
       for (const file of paths) {
-        const rel = relative(change.root, canonicalMissingPath(file));
-        if (rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel) ||
+        if (inRoot(change.root, canonicalMissingPath(file)) ||
             change.files.some((edit) => edit.text !== undefined && edit.text === event.input.content)) {
           throw new Error("this executable destination was not reviewed; use the exact approved target");
         }
@@ -225,13 +226,11 @@ export function projectToolAuthorization(event: ToolCallEvent, cwd: string, bran
     }
     const roots = change.operation === "project-edits" ? edits.map(edit => edit.target.root) : [target.root];
     if (paths.some(file => roots.some(root => {
-      const rel = relative(root, file);
-      if (target.scope === "profile") {
-        const canonicalRel = relative(root, canonicalMissingPath(file));
-        if (canonicalRel && canonicalRel !== ".." && !canonicalRel.startsWith(`..${sep}`) && !isAbsolute(canonicalRel)) return true;
-      }
-      return !!rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
-    }))) throw new Error(`this ${target.scope} destination was not reviewed; keep scratch work outside the destination root`);
+      const lexicalMatch = inRoot(root, file);
+      return (target.scope === "profile" && inRoot(root, canonicalMissingPath(file))) || lexicalMatch;
+    }))) {
+      throw new Error(`this ${target.scope} destination was not reviewed; keep scratch work outside the destination root`);
+    }
   }
   if (paths.length && unapprovedGroupDestination(evidence, passStart, paths)) {
     throw new Error("that project destination has no exact scope review and native Apply");
@@ -271,20 +270,33 @@ function exactCheck(target: { root: string }, command: string, args: ToolArgumen
   return args.command === command && args.cwd === target.root && args.async !== true && args.name == null;
 }
 
-function successfulOwnerWrite(evidence: SessionToolEvidence, change: ScalarFileEdit, authorization: string, after: number): CompletedToolCall | undefined {
-  const name = change.text === undefined ? "edit" : "write";
-  return evidence.completedCalls(name).find(({ observed }) =>
+function ownerWriteTool(change: ScalarFileEdit): "edit" | "write" {
+  return change.text === undefined ? "edit" : "write";
+}
+
+function ownerWriteLookup(evidence: SessionToolEvidence, authorization: string, after: number) {
+  let edits: CompletedToolCall[] | undefined;
+  let writes: CompletedToolCall[] | undefined;
+  return (change: ScalarFileEdit) => {
+    const calls = ownerWriteTool(change) === "edit"
+      ? (edits ??= evidence.completedCalls("edit"))
+      : (writes ??= evidence.completedCalls("write"));
+    return findSuccessfulOwnerWrite(calls, change, authorization, after);
+  };
+}
+
+function findSuccessfulOwnerWrite(calls: readonly CompletedToolCall[], change: ScalarFileEdit, authorization: string, after: number): CompletedToolCall | undefined {
+  return calls.find(({ observed }) =>
     observed?.call.authorization === authorization && observed.call.position > after && observed.result.isError === false &&
     observed.result.supplier?.source === "builtin" && exactOwnerCall(change, observed.call.name, observed.call.args))?.observed;
 }
 
-/** Resolve all reviewed destinations, not a caller-selected subset. Each leaf still uses the scalar receipt check. */
 export function observedProjectPublication(target: ProjectTarget, change: ProjectEdit, approval: ProposalAnswerRef,
     answeredAt: number, evidence: SessionToolEvidence): ProjectPublication {
   const authorization = approval.proposal.contentHash;
-  const write = successfulOwnerWrite(evidence, change, authorization, answeredAt);
+  const write = findSuccessfulOwnerWrite(evidence.completedCalls(ownerWriteTool(change)), change, authorization, answeredAt);
   if (!write) {
-    const tool = change.text === undefined ? "edit" : "write";
+    const tool = ownerWriteTool(change);
     const failed = evidence.completedCalls(tool).some(({ observed }) => observed?.call.authorization === authorization &&
       observed.call.position > answeredAt && exactOwnerCall(change, observed.call.name, observed.call.args));
     if (failed) {
@@ -413,7 +425,7 @@ export function checkHarnessPublication(change: ExecutableEdit, publication: Har
     branch: readonly SessionEntry[], approvedAt: number): HarnessPublicationResult {
   const evidence = sessionToolEvidence(branch);
   const id = approval.proposal.contentHash;
-  const writes = change.files.map((file) => successfulOwnerWrite(evidence, file, id, approvedAt));
+  const writes = change.files.map(ownerWriteLookup(evidence, id, approvedAt));
   const failures = (reason: string): HarnessPublicationResult => ({
     files: change.files.map((edit, i) => {
       const { file } = edit;

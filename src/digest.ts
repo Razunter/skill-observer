@@ -234,7 +234,7 @@ function submittedValues(resultText: string, name: string): string[] {
     .filter(Boolean);
 }
 
-function textOf(content: AgentMessage["content"]): string {
+export function textOf(content: AgentMessage["content"]): string {
   if (typeof content === "string") return content;
   return (content ?? [])
     .filter((block) => block.type === "text")

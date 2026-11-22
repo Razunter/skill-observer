@@ -33,7 +33,7 @@ import { isDeepStrictEqual } from "node:util";
 import { frontmatterField } from "./amendments.js";
 import { OBSERVATION_MESSAGE_TYPE } from "./digest.js";
 import type { AgentMessage, AskDetails, AskOptionNote, Schema, SchemaBuilder, SessionEntry } from "./omp.js";
-import { isProposalRef, type PreparedChange, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, preparedEntry, preparedProjectEntries, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, reviewSelectionForForm, snapshot } from "./review.js";
+import { isProposalRef, type PreparedChange, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, type PreparedReceiptIndex, preparedEntry, preparedProjectEntries, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, reviewSelectionForForm, snapshot } from "./review.js";
 import { hasUnlistedReferenceEntries, readReferenceFiles } from "./references.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 
@@ -444,12 +444,12 @@ export function latestPrepared(candidateId: string, evidence: SessionToolEvidenc
  * of this pass, and an answer to it, cite only a proposal of this pass.
  * Throws with the precise reason otherwise.
  */
-export function preparedInPass(ref: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): PreparedEntry {
+export function preparedInPass(ref: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[], receipts?: PreparedReceiptIndex): PreparedEntry {
   const passStart = observationPassStart(branch);
   if (passStart === undefined) {
     throw new Error("no observation pass is current on this branch: a later prompt, `/skill:` start or `/clear` ended it, so its answers approve nothing");
   }
-  const entry = preparedEntry(evidence, ref);
+  const entry = preparedEntry(evidence, ref, receipts);
   if (evidence.completedCall(ref.reviewToolCallId).call.position < passStart) throw new Error("the proposal was prepared in an earlier observation pass; prepare, select and ask again");
   return entry;
 }

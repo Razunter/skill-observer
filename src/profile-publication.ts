@@ -3,7 +3,7 @@ import { existsSync, lstatSync } from "node:fs";
 import { basename, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { canonicalMissingPath, canonicalProfileTarget, type ProfileTarget } from "./ledger.js";
-import { checkScalarFileState, prepareScalarFile, type ScalarFileEdit } from "./project-publication.js";
+import { checkScalarFileState, fileId, prepareScalarFile, type ScalarFileEdit } from "./project-publication.js";
 import { CHECK_TOOL_NAME, replayCase, type PatternDraft } from "./replay.js";
 import type { SessionToolEvidence } from "./session-tool-evidence.js";
 
@@ -75,16 +75,16 @@ export function prepareProfileEdit(target: ProfileTarget, text: string, check: P
     default:
       throw new Error("supply a meaningful target-bound content, skill-control or pattern check");
   }
-  const { dev, ino } = lstatSync(target.root);
-  const change: ProfileEdit = { ...edit, operation: "profile-edit", profileRootId: `${dev}:${ino}`, text, afterHash: edit.afterHash!, verification,
+  const root = lstatSync(target.root);
+  const change: ProfileEdit = { ...edit, operation: "profile-edit", profileRootId: fileId(root), text, afterHash: edit.afterHash!, verification,
     ...(installed && { installedSkill: installed.skill }) };
   return { change, preview: `${preview}\nProfile-wide in ${target.root}. ${activation}\nVerification: ${verification}.` };
 }
 
 export function checkProfileState(target: ProfileTarget, change: ProfileEdit, before: boolean): void {
   const current = canonicalProfileTarget(target);
-  const { dev, ino } = lstatSync(current.root);
-  if (current.path !== target.path || join(current.root, current.path) !== change.file || `${dev}:${ino}` !== change.profileRootId) {
+  const root = lstatSync(current.root);
+  if (current.path !== target.path || join(current.root, current.path) !== change.file || fileId(root) !== change.profileRootId) {
     throw new Error("the approved profile or destination changed; prepare and ask again");
   }
   if (target.path === "config.yaml" && existsSync(join(current.root, "config.yml"))) throw new Error("config.yml now takes precedence; inspect the active settings and ask again");

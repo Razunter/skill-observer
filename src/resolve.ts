@@ -185,7 +185,7 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
   const { outcome } = answer;
   if (!PROPOSAL_OUTCOMES.includes(answer.outcome) || typeof answer.gist !== "string" || !answer.gist.trim() ||
       answer.rule !== undefined || "skill" in answer) throw new Error("project answers need a gist and Apply/Later/Decline; they are not skill amendments");
-  const choice = outcome === "applied" ? "Apply" : outcome === "later" ? "Later" : "Decline";
+  const choice = choiceForOutcome(outcome);
   let approved = outcome === "applied" || answer.approval !== undefined ? approvedProject(answer.approval, branch, undefined, choice) : undefined;
   if (approved?.change.operation === "project-edits") throw new Error("resolve a reviewed group with one project-group outcome");
   const root = projectRootScope(cwd, approved && { roots: [approved.proposal.target.root], worktrees: [] })(answer.target?.root);
@@ -232,7 +232,7 @@ function projectGroupRecords(answer: ProjectGroupAnswer, branch: SessionEntry[],
     throw new Error("a project group resolves the exact reviewed destinations, not a replacement list or supplied publication");
   }
   const answered = deferred === undefined
-    ? approvedProject(approval, branch, evidence, outcome === "applied" ? "Apply" : outcome === "later" ? "Later" : "Decline")
+    ? approvedProject(approval, branch, evidence, choiceForOutcome(outcome))
     : undefined;
   let reoffer = answered?.note;
   if (deferred !== undefined) {
@@ -278,8 +278,7 @@ function profileRecord(answer: ProfileAnswer, branch: readonly SessionEntry[], t
     if (!matches(proposal)) throw new Error("the cited proposal is not this exact profile target");
     return { ...record, evidence: proposal.evidence, reoffer: answer.reoffer ? `${deferral} ${answer.reoffer}` : deferral };
   }
-  const option = answer.outcome === "applied" ? "Apply" : answer.outcome === "later" ? "Later" : "Decline";
-  const { proposal, change, approval, answeredAt, note } = approvedProfile(answer.approval, branch, option);
+  const { proposal, change, approval, answeredAt, note } = approvedProfile(answer.approval, branch, choiceForOutcome(answer.outcome));
   if (!matches(proposal)) throw new Error("the answer does not name the exact profile edit reviewed in that Ask");
   return {
     ...record, evidence: proposal.evidence,
@@ -307,8 +306,7 @@ function harnessRecord(answer: HarnessAnswer, branch: readonly SessionEntry[], t
   }
   const { outcome } = answer;
   if (answer.approval !== undefined) {
-    const { proposal, change, answeredAt, note, approval } = approvedHarness(answer.approval, branch,
-      outcome === "applied" ? "Apply" : outcome === "later" ? "Later" : "Decline");
+    const { proposal, change, answeredAt, note, approval } = approvedHarness(answer.approval, branch, choiceForOutcome(outcome));
     const base = { ...harnessIdentity(proposal), timestamp, sessionId };
     if (outcome !== "applied") {
       if (answer.publication !== undefined) throw new Error("only an applied executable change cites publication");
@@ -334,6 +332,10 @@ function harnessRecord(answer: HarnessAnswer, branch: readonly SessionEntry[], t
   }
   return { record: { ...harnessIdentity(proposal), outcome, timestamp, sessionId,
     ...laterReoffer({ outcome, reoffer: answer.reoffer?.trim() ? `${deferred} ${answer.reoffer.trim()}` : deferred }) } };
+}
+
+function choiceForOutcome(outcome: ProposalOutcome): "Apply" | "Later" | "Decline" {
+  return outcome === "applied" ? "Apply" : outcome === "later" ? "Later" : "Decline";
 }
 
 /** A removed hook withdraws every fix for its scoped file, or uses its own identity if it held none. */

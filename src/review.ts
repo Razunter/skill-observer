@@ -246,8 +246,7 @@ interface PrepareContext extends ReceiptContext {
   projectRoot: (root: string) => string;
   /** The agent directory, which holds the global hooks directory and the companion extension. */
   agentDir: string;
-  profileOwnerAvailable: boolean;
-  executableTools: ReadonlySet<string>;
+  ownerTools: ReadonlySet<string>;
   decisions: ReviewDecisions;
   /** Filled by Prepare: the `## ` headings of each on-read append's target amendment at the bytes it read, by candidate ID, kept out of the proposal so its content hash ignores them. */
   amendmentSections: Map<string, string[]>;
@@ -387,10 +386,9 @@ export function registerReviewTool(
             throw new Error("Prepare ignores a `diagnosis` beside `candidates`: move `diagnosis` into each candidate it grounds, beside its `change`");
           }
           const ownerTools = new Set(pi.getAllTools().filter(({ sourceInfo }) => sourceInfo?.source === "builtin").map(({ name }) => name));
-          const profileOwnerAvailable = ownerTools.has("write");
           const prepared = withReviewDecisions(files.storeFile(), ctx.cwd, (decisions) =>
             prepareProposals(candidates, { ...guidance, cwd: ctx.cwd, projectRoot, agentDir: ompAgentDir(),
-              profileOwnerAvailable, executableTools: ownerTools, decisions, amendmentSections }));
+              ownerTools, decisions, amendmentSections }));
           details.rejected = prepared.rejected;
           details.eligible = prepared.eligible.map((proposal) => ({
             reference: { reviewToolCallId: toolCallId, candidateId: proposal.candidateId, contentHash: contentHash(proposal) },
@@ -1306,8 +1304,8 @@ function preparedProposal(
     identify(candidateId);
     checkCurrentFingerprint(candidate, fingerprint);
     if (isDeclined(fingerprint)) return undefined;
-    if (!Array.isArray(draft.files) || !context.executableTools.has("bash") ||
-        draft.files.some((file) => !context.executableTools.has(file?.text === undefined ? "edit" : "write"))) {
+    if (!Array.isArray(draft.files) || !context.ownerTools.has("bash") ||
+        draft.files.some((file) => !context.ownerTools.has(file?.text === undefined ? "edit" : "write"))) {
       throw new Error("the ordinary owner tools or foreground Bash check are unavailable; report this finding to its owner");
     }
     const prepared = prepareExecutableEdit(target, path, draft, context);
@@ -1320,7 +1318,7 @@ function preparedProposal(
     const fingerprint = proposalIdentity(candidate, decisions);
     identify(`proposal:${fingerprint}`);
     if (isDeclined(fingerprint)) return undefined;
-    if (!context.profileOwnerAvailable) throw new Error("the built-in write tool is unavailable; ask the operator to apply the documented change through its owner");
+    if (!context.ownerTools.has("write")) throw new Error("the built-in write tool is unavailable; ask the operator to apply the documented change through its owner");
     const prepared = prepareProfileEdit(candidate.target, draft.text, draft.check, context.evidence, context.passStart);
     const skill = prepared.change.installedSkill;
     let diagnosis: CandidateDiagnosis | undefined;
@@ -1612,6 +1610,8 @@ function contentHash(proposal: PreparedProposal): string {
   return createHash("sha256").update(JSON.stringify(proposal)).digest("hex");
 }
 
+export type PreparedReceiptIndex = Map<string, ReadonlyMap<string, PreparedEntry>>;
+
 /**
  * Resolves Select's references to the proposals this branch's successful
  * Prepare results of the current observation pass hold, unchanged, so no form
@@ -1621,11 +1621,12 @@ function contentHash(proposal: PreparedProposal): string {
 function preparedEntries(references: unknown, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): PreparedEntry[] {
   if (!Array.isArray(references)) throw new Error("Select needs `proposals`: the references a successful Prepare returned");
   const seen = new Set<string>();
+  const receipts: PreparedReceiptIndex = new Map();
   return references.map((reference: Partial<PreparedProposalRef> | undefined) => {
     if (!isProposalRef(reference)) throw new Error("each proposal reference needs reviewToolCallId, candidateId and contentHash");
     if (seen.has(reference.candidateId)) throw new Error(`proposal \`${reference.candidateId}\` is referenced twice`);
     seen.add(reference.candidateId);
-    return preparedInPass(reference, evidence, branch);
+    return preparedInPass(reference, evidence, branch, receipts);
   });
 }
 
@@ -1633,11 +1634,25 @@ export function isProposalRef(ref: Partial<PreparedProposalRef> | undefined): re
   return typeof ref?.reviewToolCallId === "string" && typeof ref.candidateId === "string" && typeof ref.contentHash === "string";
 }
 
-export function preparedEntry(evidence: SessionToolEvidence, reference: PreparedProposalRef): PreparedEntry {
+export function preparedEntry(evidence: SessionToolEvidence, reference: PreparedProposalRef, receipts?: PreparedReceiptIndex): PreparedEntry {
   const label = `proposal \`${reference.candidateId}\` of review \`${reference.reviewToolCallId}\``;
+  const { reviewToolCallId, candidateId } = reference;
+  let entries = receipts?.get(reviewToolCallId);
+  if (!entries) {
+    entries = validatedPrepareEntries(evidence, reviewToolCallId, label);
+    receipts?.set(reviewToolCallId, entries);
+  }
+  const entry = entries.get(candidateId);
+  if (!entry) throw new Error(`${label}: that Prepare holds no single proposal with that ID`);
+  const hash = entry.reference.contentHash;
+  if (reference.contentHash !== hash) throw new Error(`${label}: content hash does not match the prepared proposal`);
+  return entry;
+}
+
+function validatedPrepareEntries(evidence: SessionToolEvidence, reviewToolCallId: string, label: string): ReadonlyMap<string, PreparedEntry> {
   let receipt;
   try {
-    receipt = evidence.completedCall(reference.reviewToolCallId);
+    receipt = evidence.completedCall(reviewToolCallId);
   } catch {
     throw new Error(`${label}: this branch holds no completed review call with that ID`);
   }
@@ -1646,23 +1661,18 @@ export function preparedEntry(evidence: SessionToolEvidence, reference: Prepared
   if (result.isError !== false) throw new Error(`${label}: that Prepare did not succeed`);
   const details: unknown = result.details;
   if (!details || typeof details !== "object" || !("eligible" in details) || !Array.isArray(details.eligible)) {
-    throw new CommonReviewError(`review \`${reference.reviewToolCallId}\`: the saved Prepare receipt has no eligible list`);
+    throw new CommonReviewError(`review \`${reviewToolCallId}\`: the saved Prepare receipt has no eligible list`);
   }
-  const seen = new Set<string>();
-  let entry: PreparedEntry | undefined;
+  const entries = new Map<string, PreparedEntry>();
   for (const saved of details.eligible as PreparedEntry[]) {
     const ref = saved?.reference;
     if (!isProposalRef(ref) || !saved.proposal || saved.proposal.candidateId !== ref.candidateId
-      || ref.reviewToolCallId !== reference.reviewToolCallId || ref.contentHash !== contentHash(saved.proposal) || seen.has(ref.candidateId)) {
-      throw new CommonReviewError(`review \`${reference.reviewToolCallId}\`: a saved proposal no longer matches its content hash or has a duplicate identity`);
+      || ref.reviewToolCallId !== reviewToolCallId || ref.contentHash !== contentHash(saved.proposal) || entries.has(ref.candidateId)) {
+      throw new CommonReviewError(`review \`${reviewToolCallId}\`: a saved proposal no longer matches its content hash or has a duplicate identity`);
     }
-    seen.add(ref.candidateId);
-    if (ref.candidateId === reference.candidateId) entry = saved;
+    entries.set(ref.candidateId, saved);
   }
-  if (!entry) throw new Error(`${label}: that Prepare holds no single proposal with that ID`);
-  const hash = entry.reference.contentHash;
-  if (reference.contentHash !== hash) throw new Error(`${label}: content hash does not match the prepared proposal`);
-  return entry;
+  return entries;
 }
 
 function mergeEvidence(evidence: readonly ReviewEvidence[]): ReviewEvidence[] {

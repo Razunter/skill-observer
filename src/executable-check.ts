@@ -3,6 +3,7 @@ import { closeSync, constants, fstatSync, lstatSync, openSync, opendirSync, read
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { isDeepStrictEqual, stripVTControlCharacters } from "node:util";
+import { textOf } from "./digest.js";
 import type { ToolArguments, ToolCallEvent } from "./omp.js";
 import { HOOK_CHECK_PATH } from "./payload.js";
 import type { SessionToolEvidence, ToolResultEvidence } from "./session-tool-evidence.js";
@@ -68,7 +69,7 @@ export function prepareExecutableCheck(kind: "hook" | "extension", files: readon
     throw new Error("the scratch check must cover the exact proposed executable files");
   }
   if (plan.kind === "extension") compareExtension(snapshot, targetRoot, pending);
-  const output = resultOutput(observed.result);
+  const output = textOf(observed.result.content);
   const plain = stripVTControlCharacters(output);
   const passed = plan.kind === "hook"
     ? /^OK: ([1-9]\d*) of \1 samples as expected$/m.test(plain)
@@ -103,11 +104,6 @@ function successful(result: ToolResultEvidence): boolean {
     !details.timedOut && !("async" in details) && !("service" in details) &&
     (details.toolCommands === undefined || (Array.isArray(details.toolCommands) && details.toolCommands.length === 0)) &&
     (details.trace?.status === undefined || details.trace.status === 0);
-}
-
-function resultOutput(result: ToolResultEvidence): string {
-  if (typeof result.content === "string") return result.content;
-  return (result.content ?? []).filter(block => block.type === "text").map(block => block.text ?? "").join("\n");
 }
 
 function foregroundArgs(args: ToolArguments): boolean {
