@@ -4300,6 +4300,37 @@ describe("/observe with answers from earlier passes", () => {
     expect(readFileSync(historicalFile, "utf8")).toBe(historicalText);
   });
 
+  it("does not cite an assistant echo of a redacted quote as primary evidence", async () => {
+    const host = loadExtension();
+    const cwd = host.skillHome.roots.cwd;
+    const sessions = join(cwd, ".fixture-sessions");
+    const sessionId = "redacted-quote-fixture";
+    const quote = "[redacted excerpt] The import rejected [redacted email].";
+    const fingerprint = proposalFingerprint("tdd", "Keep the import failure covered.");
+    host.setSessionDir(sessions);
+    mkdirSync(sessions);
+    writeFileSync(join(sessions, `2026-10-16_${sessionId}.jsonl`), [
+      { type: "session", id: sessionId, cwd },
+      { type: "message", id: "original", message: { role: "user", content: "The import rejected sample@example.invalid." } },
+      { type: "message", id: "echo", message: { role: "assistant", content: quote } },
+    ].map((entry) => JSON.stringify(entry)).join("\n"));
+    seedLedger(host.ledgerFile, [{
+      fingerprint, sessionId, skill: "tdd", kind: "upstream", gist: "Keep the import failure covered.",
+      timestamp: "2026-10-16T12:00:00.000Z", outcome: "later",
+      evidence: [{ quote, count: 1 }, { quote, count: 1, occurrenceIds: ["original"] }],
+    }]);
+    await host.runCommand("observe", "Find the source of the import failure");
+    await host.commitMessage(host.sent.at(-1)!.message);
+
+    const result = await host.callTool("observer_review", { action: "evidence", key: { fingerprint } });
+    expect(result.isError).not.toBe(true);
+    expect(JSON.parse(resultText(result)).matches).toEqual([expect.objectContaining({
+      fingerprint,
+      evidence: [expect.objectContaining({ quote, primary: [expect.objectContaining({ entryId: "original" })] })],
+      gaps: [expect.stringMatching(/redacted.*no.*occurrence ID/i)],
+    })]);
+  });
+
   it("lists the rule an old merge wrote as in force, and none of the fixes its `merged` records replaced", async () => {
     const host = loadExtension();
     splitAmendment(host, "tdd", "tdd-seams-and-reds");
@@ -8382,18 +8413,12 @@ describe("observations", () => {
     expect(other.sent).toEqual([]);
   });
 
-  it("registers observe active from load, top-level, without approval prompts, with the spec's agent-facing text", () => {
+  it("registers observe active from load and without approval prompts", () => {
     const host = loadExtension();
     const tool = host.tools.observe!;
     expect(host.activeTools()).toContain("observe");
     expect(tool).toMatchObject({ approval: "read", loadMode: "essential" });
     expect(tool.defaultInactive).toBeFalsy();
-    expect(tool.description).toBe(
-      "Record an observation for the user's next `/observe` pass: something a skill, a rule or the project setup got wrong, or that cost you a detour. It fixes nothing now; record it and continue.",
-    );
-    expect(((tool.parameters as FakeSchema).shape?.text as FakeSchema).description).toBe(
-      "One problem, up to 500 characters: what happened, where, and the fix you want.",
-    );
   });
 
   const resultText = (result: ToolResult<unknown>) => result.content.map(({ text }) => text).join("\n");

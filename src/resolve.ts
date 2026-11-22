@@ -382,7 +382,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
     name: RESOLVE_TOOL_NAME,
     label: "Observer Resolve",
     description:
-      "Record observation-pass outcomes and carry out the approved rule and amendment changes. Cite the prepared proposal and native Ask approval for changes this tool makes. For direct edits already made through the owner tool, include the publication receipt.",
+      "Record observation-pass outcomes and carry out the approved rule and amendment changes. Before sending new evidence, replace private values with placeholders such as [redacted email] and start altered quotes with [redacted excerpt] followed by a space. Cite the prepared proposal and native Ask approval for changes this tool makes. For direct edits already made through the owner tool, include the publication receipt.",
     parameters: z.object({
       outcomes: z
         .array(
@@ -418,7 +418,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             evidence: z
               .array(
                 z.object({
-                  quote: z.string().describe("The decisive words, quoted exactly from the signal or User note."),
+                  quote: z.string().describe("A short decisive excerpt from the signal or User note."),
                   count: z.number().describe("The quoted signal's `(×N)` count from the digest; 1 without one."),
                   occurrenceIds: z.array(z.string()).optional(),
                 }),

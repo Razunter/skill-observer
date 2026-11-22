@@ -1,7 +1,7 @@
 import { closeSync, constants, fstatSync, openSync, readSync, readdirSync, realpathSync, type Dirent } from "node:fs";
 import { basename, join } from "node:path";
 import { buildDigest } from "./digest.js";
-import { ledgerDecisionInProject, ledgerProjectRoot, type LedgerRecord, readLedgerDecision, targetLabel } from "./ledger.js";
+import { isRedactedExcerpt, ledgerDecisionInProject, ledgerProjectRoot, type LedgerRecord, readLedgerDecision, targetLabel } from "./ledger.js";
 import { readObserverStore } from "./observer-store.js";
 import type { ExtensionContext, SessionEntry } from "./omp.js";
 import { remedyOutcomes } from "./outcomes.js";
@@ -82,6 +82,10 @@ function recordEvidence(record: LedgerRecord, sourceFor: (id: string) => Session
       else gaps.add("Some cited occurrences are missing from the decision's saved session; verify them in primary evidence.");
     }
     if (!occurrenceIds?.length) {
+      if (isRedactedExcerpt(quote)) {
+        gaps.add("A redacted quote has no occurrence ID; its primary evidence could not be verified.");
+        return [];
+      }
       const primary = source.findQuote(quote);
       if (primary) ids.add(primary);
       else gaps.add("For some quotes, no entry ID was recorded and the exact text could not be found in the saved session.");

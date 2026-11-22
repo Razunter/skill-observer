@@ -25,6 +25,18 @@ describe("conservative remedy outcomes", () => {
     expect(remedyOutcomes([record], { ...delivered, toolExercises: [{ ...receipt, args: "other" }] })[0]?.status).toBe("delivered");
     expect(remedyOutcomes([record], { ...delivered, toolExercises: [{ ...receipt, deliveredRules: [] }] })[0]?.status).toBe("delivered");
   });
+  it("does not treat a redacted quote as exact exercise evidence", () => {
+    const redacted = { quote: '[redacted excerpt] Tool error in `bash` "check": "[redacted email]"', count: 1 };
+    const receipt = { entryId: "result", tool: "bash", args: "check", deliveredRules: ["check-first"] };
+    const outcome = (exercise: ToolExercise, evidence = [redacted]) =>
+      remedyOutcomes([{ ...record, evidence }], { ...delivered, toolExercises: [exercise] })[0];
+    const failure = { ...receipt, failed: true, error: "[redacted email]" };
+    expect(outcome(failure)?.status).toBe("delivered");
+    expect(outcome({ ...receipt, failed: false })?.status).toBe("delivered");
+    expect(outcome(failure, [redacted, ...record.evidence!])?.status).toBe("delivered");
+    expect(outcome({ ...receipt, failed: true, error: "failed" }, [redacted, ...record.evidence!]))
+      .toMatchObject({ status: "recurrence", evidence: ["result"] });
+  });
   const env = { provenance: { byName: (name: string) => ({ kind: "unknown" as const, name }),
     byPath: (path: string) => ({ kind: "unknown" as const, name: path }) } };
   const exercise = (details?: unknown) => buildDigest([

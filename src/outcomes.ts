@@ -1,6 +1,6 @@
 import { basename } from "node:path";
 import { type SessionDigest, type ToolExercise, toolErrorText } from "./digest.js";
-import { type LedgerRecord, targetLabel } from "./ledger.js";
+import { isRedactedExcerpt, type LedgerRecord, targetLabel } from "./ledger.js";
 
 export interface RemedyOutcome {
   fingerprint: string;
@@ -27,13 +27,14 @@ export function remedyOutcomes(records: readonly LedgerRecord[], digest: Session
     const isAfterFix = (exercise: ToolExercise) => hasNoAmendment
       ? exercise.at !== undefined && exercise.at > record.timestamp
       : rule ? exercise.deliveredRules.includes(rule) : false;
+    const matchesEvidence = (excerpt: string) => record.evidence?.some(({ quote }) =>
+      !isRedactedExcerpt(quote) && quote.includes(excerpt));
     const receipts = (digest.toolExercises ?? []).filter((exercise) => {
       if (!isAfterFix(exercise) || !exercise.args || exercise.args.includes("…")) return false;
-      return record.evidence?.some((prior) => prior.quote.includes(toolErrorText(exercise.tool, exercise.args)));
+      return matchesEvidence(toolErrorText(exercise.tool, exercise.args));
     });
     const recurrence = receipts.find((exercise) => exercise.failed && exercise.error &&
-      !exercise.error.includes("…") && record.evidence?.some((prior) =>
-        prior.quote.includes(toolErrorText(exercise.tool, exercise.args, exercise.error))));
+      !exercise.error.includes("…") && matchesEvidence(toolErrorText(exercise.tool, exercise.args, exercise.error)));
     const clean = (delivered || hasNoAmendment) && receipts.find((exercise) => !exercise.failed);
     outcomes.push({ fingerprint: record.fingerprint,
       status: recurrence ? "recurrence" : clean ? "exercised-clean" : delivered ? "delivered" : "inconclusive",

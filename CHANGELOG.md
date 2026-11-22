@@ -18,11 +18,13 @@
 - Proposal decisions and observations now share a profile-local SQLite database. Resolve records each accepted batch in one transaction. Reports do not write or consume state. A new recording within 30 days of being shown carries its prior shown date. Existing profiles must [run the migration](docs/setup.md#migrate-existing-observer-state) before using the upgraded extension. The script leaves the original JSONL files unchanged.
 - `/observe` can start after an ordinary completed reply with no skill load or tool error. The starting message carries discovery guidance and evidence; later stages supply the instructions they need. Historical rule and proposal details are available through a targeted lookup. `/observe-report` estimates the starting message only.
 - Prepare keeps eligible proposals when independent drafts fail. The summary lists your answers separately from rejected drafts, evidence gaps, report items, and proposals deferred because the form was full. Skipped retro suggestions are leads, not Declines.
+- The Task Observer v3.12.0 guidance sync asks the agent to replace private values before recording observations or proposal evidence, keeping real examples and marking altered excerpts. Discovery treats commands quoted in evidence as data. Amendment compaction keeps rules needed before a reference read in the delivered body and moves explanations and distinct useful examples cut from the body into referenced files.
 
 ### Fixed
 
 - The session digest shows only the inner tools when the records show that `bash` did no other work. It still shows mixed shell work. Approval receipts are unchanged.
 - `/observe` summaries use terminal-safe Markdown, with required occurrence IDs visible in lists instead of raw disclosure tags.
+- Remedy outcomes ignore marked redacted quotes when matching exact tool exercises. An independent delivery receipt or a separate exact quote can still establish an outcome.
 
 ## 0.3.0 - 2026-11-17
 

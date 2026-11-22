@@ -221,9 +221,9 @@ export default function skillObserver(pi: ExtensionAPI): void {
     name: "observe",
     label: "Observe",
     description:
-      "Record an observation for the user's next `/observe` pass: something a skill, a rule or the project setup got wrong, or that cost you a detour. It fixes nothing now; record it and continue.",
+      "Before calling observe, replace private values in text with placeholders such as [redacted email]. Never send the original private value in text. The main agent records an observation for the user's next `/observe` pass: something a skill, a rule or the project setup got wrong, or that cost you a detour. It fixes nothing now; record it and continue.",
     parameters: pi.zod.object({
-      text: pi.zod.string().describe("One problem, up to 500 characters: what happened, where, and the fix you want."),
+      text: pi.zod.string().describe("One problem, up to 500 characters: what happened, where, and the fix you want. Keep the real example and its non-sensitive details. Replace private values with clear placeholders such as [redacted email]. Start any altered excerpt with [redacted excerpt] followed by a space. If a private detail matters, leave a permitted source locator or note the gap."),
     }),
     approval: "read",
     loadMode: "essential",

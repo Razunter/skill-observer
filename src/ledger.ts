@@ -42,6 +42,10 @@ export interface Evidence {
   occurrenceIds?: string[];
 }
 
+export function isRedactedExcerpt(quote: string): boolean {
+  return quote.startsWith("[redacted excerpt] ");
+}
+
 interface LedgerEntry {
   type?: never;
   fingerprint: string;

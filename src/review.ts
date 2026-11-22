@@ -303,7 +303,10 @@ export function registerReviewTool(
     remedy: z.string().describe(`How this fixes the finding and how to verify it.${formatting}`),
     change: z.union([changes["direct-edit"], changes["project-edit"], changes["project-edits"], changes["profile-edit"],
       changes["on-read-append"], changes.rule, changes["stale-update"], changes["stale-delete"], changes.withdrawal, changes.compaction, changes.harness]),
-    evidence: z.array(z.object({ quote: z.string(), count: z.number(), source: z.string().optional(), occurrenceIds: z.array(z.string()).optional() })).optional(),
+    evidence: z.array(z.object({
+      quote: z.string().describe("Short excerpt. Replace private values with placeholders such as [redacted email]. Start altered quotes with [redacted excerpt] followed by a space."),
+      count: z.number(), source: z.string().optional(), occurrenceIds: z.array(z.string()).optional(),
+    })).optional(),
     fingerprint: z.string().optional(),
     reconciles: z.object({
       approval: z.object(approvalShape(z)).describe("Exact original approval as cited to observer_resolve."),
