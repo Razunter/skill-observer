@@ -64,7 +64,7 @@ function fixture() {
   registerResolveTool(pi, files);
   registerReviewTool(pi, files, () => undefined);
   let branch: SessionEntry[] = [{ type: "custom_message", customType: OBSERVATION_MESSAGE_TYPE, content: "Observation pass." }];
-  const ctx = { cwd: roots.cwd, sessionManager: { getSessionId: () => "test", getBranch: () => branch } } as unknown as ExtensionContext;
+  const ctx = { cwd: roots.cwd, hasUI: true, sessionManager: { getSessionId: () => "test", getBranch: () => branch } } as unknown as ExtensionContext;
   /** Runs a registered tool, then saves its native call and result on the branch, as OMP does. */
   const call = async (name: string, params: unknown) => {
     const id = `${name}-${branch.length}`;
@@ -502,8 +502,8 @@ it("rolls back a deletion's record and all its generated records without restori
   await addAll(f, ["first", "second"]);
   const file = f.files.storeFile();
   const amendment = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!;
-  const [approval] = await f.approve([{ kind: "upstream", skill: "tdd", gist: "Settle it", priority: "stale",
-    remedy: "Settle it", change: { operation: "stale-delete", rule: amendment.name } }], "Delete");
+  const [approval] = await f.approve(["stale-update", "stale-delete"].map((operation) => ({ kind: "upstream", skill: "tdd", gist: "Settle it", priority: "stale",
+    remedy: "Settle it", change: { operation, rule: amendment.name, ...(operation === "stale-update" && { body: amendment.body }) } })), "Delete");
   const result = await withReadLock(file, () => f.run({ outcomes: [], stale: [{ rule: amendment.name, action: "delete", approval }] }));
   expect(existsSync(amendment.path)).toBe(false);
   expect(result.details.recording.rows).toEqual(["unrecorded", "unrecorded", "unrecorded"]);
@@ -649,8 +649,10 @@ it.each(["withdrawal", "stale Delete"])("reports a %s that deleted the amendment
   const folder = join(f.files.referencesDir(), "tdd");
   replaceReferenceFiles(f.files.referencesDir(), "tdd", [{ name: "old.md", body: "Original" }]);
   const params = mode === "withdrawal" ? { outcomes: await f.withdraw(readLedger(f.files.storeFile()), () => ({ body: "" })) } : {
-    outcomes: [], stale: [{ rule: amendment.name, action: "delete", approval: (await f.approve([{ kind: "upstream", skill: "tdd", gist: "Settle it", priority: "stale",
-      remedy: "Settle it", change: { operation: "stale-delete", rule: amendment.name } }], "Delete"))[0] }],
+    outcomes: [], stale: [{ rule: amendment.name, action: "delete", approval: (await f.approve(["stale-update", "stale-delete"].map((operation) => ({
+      kind: "upstream", skill: "tdd", gist: "Settle it", priority: "stale", remedy: "Settle it",
+      change: { operation, rule: amendment.name, ...(operation === "stale-update" && { body: amendment.body }) },
+    })), "Delete"))[0] }],
   };
   renameFault.check = (from) => { if (String(from) === folder) throw new Error("EACCES: injected cleanup failure"); };
   const result = await f.run(params);
@@ -796,9 +798,17 @@ it("restores previous references without writing the body when reference install
 });
 it("keeps the result of a carried-out publication when its guidance can't be loaded", async () => {
   const f = fixture();
-  readFault.check = (file) => { if (file === INSTRUCTIONS_PATH) throw new Error("EACCES: permission denied"); };
+  const [approval] = await f.approve([{
+    kind: "upstream", skill: "tdd", gist: "first", priority: "evidence", remedy: "Fix",
+    change: { operation: "on-read-append", section: "## first\nFix first." },
+  }]);
+  readFault.check = (file) => {
+    if (file === INSTRUCTIONS_PATH && amendments.skillAmendment(f.files.amendmentsDir(), "tdd")) {
+      throw new Error("EACCES: permission denied");
+    }
+  };
   const logged = vi.spyOn(console, "error").mockImplementation(() => {});
-  const result = await withReadLock(f.files.storeFile(), () => f.add("first"));
+  const result = await withReadLock(f.files.storeFile(), () => f.run({ outcomes: [{ outcome: "applied", approval }] }));
   const amendment = amendments.skillAmendment(f.files.amendmentsDir(), "tdd")!;
   expect(result.isError).toBe(true);
   expect(result.details.publications).toEqual([{ operation: "on-read-append", skill: "tdd", rule: amendment.path, fingerprint: expect.any(String) }]);

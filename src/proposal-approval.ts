@@ -396,7 +396,7 @@ function revisedChange(
  * the rule of a stale answer, withdrawal or compaction whose only change is a
  * re-pin, which shows no instruction content the preview did not.
  */
-function checkTarget(change: ApprovedChange, since: string): void {
+export function checkTarget(change: ApprovedChange, since: string): void {
   if (change.operation === "withdrawal" && change.effect === "record") return;
   const { target } = change;
   const bytes = existsSync(target.path) ? readFileSync(target.path) : null;

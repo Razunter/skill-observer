@@ -3,60 +3,43 @@
  * Adapted from task-observer by Eoghan Henn / rebelytics.com (CC BY 4.0),
  * https://github.com/rebelytics/one-skill-to-rule-them-all
  */
-import { randomUUID } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
-import { join } from "node:path";
 import {
   amendmentsDir,
   findStaleAmendments,
   migrateObserverRules,
-  type ObserverRule,
-  parseFrontmatter,
-  readHandWrittenRules,
-  readObserverRules,
-  readOnReadAmendments,
-  renderStaleAmendments,
   type RuleDirs,
   userRulesDir,
 } from "./amendments.js";
 import {
   buildDigest,
-  isEmptyDigest,
   OBSERVATION_MESSAGE_TYPE,
-  renderDigest,
-  type SessionDigest,
   type SkillSignal,
 } from "./digest.js";
-import { type CatalogSummary, catalogSummary, registerCatalogCapture, renderCatalogSummary } from "./catalog.js";
+import { catalogSummary, registerCatalogCapture } from "./catalog.js";
 import { registerAmendmentDelivery } from "./delivery.js";
-import { harnessRootDirs, type LedgerRecord, ledgerForProject, readLedgerRows, renderLedger } from "./ledger.js";
-import type { AskDetails, ExtensionAPI, ExtensionContext, ObservationLead } from "./omp.js";
+import { ledgerForProject, readLedgerRows } from "./ledger.js";
+import type { AskDetails, ExtensionAPI, ExtensionContext, SessionEntry } from "./omp.js";
 import {
   createProvenanceResolver,
   defaultSkillRoots,
   ompAgentDir,
-  type ProvenanceResolver,
-  type SkillRoots,
 } from "./provenance.js";
 import {
-  activeGates, describePayloadEstimate, HOOK_CHECK_PATH, HOOKS_AND_COMPANION_PATH, INSTRUCTIONS_PATH, instructionText, type PayloadSection, payloadEstimate, type ToolResultCondition, whatToDoNow,
+  describePayloadEstimate, DRAFT_RECORD_GATES, hasPassEvidence, instructionText, loadInstructionStage, observationPayload, type ObservationPayload, type PassEvidence,
+  referencesDir, type ToolResultCondition, whatToDoNow,
 } from "./payload.js";
 import { CHECK_TOOL_NAME, registerCheckTool } from "./replay.js";
 import { RESOLVE_TOOL_NAME, registerResolveTool } from "./resolve.js";
-import { rankingModelUnavailable, registerReviewTool, REVIEW_TOOL_NAME } from "./review.js";
-import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
-import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
-import { evidenceReport, isEmptyEvidenceReport, renderEvidenceReport } from "./report.js";
-import { recordHookCall, recordHookResult } from "./session-tool-evidence.js";
-import { countPendingObservations, markObservationsShown, type Observation, readPendingObservations, recordObservation, renderObservations } from "./observations.js";
+import { hasReviewedPublication, registerReviewTool, reviewSelectionForForm, REVIEW_TOOL_NAME } from "./review.js";
+import { evidenceReport, renderEvidenceReport } from "./report.js";
+import { recordHookCall, recordHookResult, sessionToolEvidence } from "./session-tool-evidence.js";
+import { countPendingObservations, markObservationsShown, type Observation, readPendingObservations, recordObservation } from "./observations.js";
 import { ObserverCommitUnknownError, observerStorePath, readObserverStore } from "./observer-store.js";
-import { hasApprovalNote, hasCustomInput, observationPassStart } from "./proposal-approval.js";
+import { APPLY, hasApprovalNote, hasCustomInput, observationPassStart, STALE_OPTIONS } from "./proposal-approval.js";
 
 const STATUS_KEY = "skill-observer";
 /** Global skills and scoped project state share one database per profile. */
 const storeFile = () => observerStorePath(ompAgentDir());
-/** Next to the ledger, outside the rules directory, so OMP never loads a reference file as a rule. */
-const referencesDir = () => join(ompAgentDir(), "skill-observer", "references");
 const ruleDirs = (): RuleDirs => ({ rulesDir: userRulesDir(), amendmentsDir: amendmentsDir() });
 
 function readPassState(cwd: string, now: Date): Pick<PassEvidence, "observations" | "ledger"> {
@@ -70,6 +53,15 @@ function readPassState(cwd: string, now: Date): Pick<PassEvidence, "observations
 /** Only the main agent with a UI has a user who can answer the pass's questions. */
 function isObservable(ctx: ExtensionContext): boolean {
   return ctx.hasUI && ctx.agent?.kind !== "sub";
+}
+
+function activeSessionSource(session: ExtensionContext["sessionManager"], branch: readonly SessionEntry[]): PassEvidence["sessionSource"] {
+  return {
+    id: session.getSessionId(),
+    file: session.getSessionFile?.(),
+    leaf: branch.at(-1)?.id,
+    compaction: branch.findLast((entry) => entry.type === "compaction")?.id,
+  };
 }
 
 const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
@@ -101,117 +93,6 @@ function refreshHint(_event: unknown, ctx: ExtensionContext): void {
   ctx.ui.setStatus(STATUS_KEY, hint && `skill-observer: ${hint} → /observe`);
 }
 
-/** The evidence `/observe` gathered before it decided to start a pass. */
-interface PassEvidence {
-  note: string;
-  digest: SessionDigest;
-  stale: readonly ObserverRule[];
-  /** The project's pending observations. */
-  observations: readonly Observation[];
-  ledger: readonly LedgerRecord[];
-  roots: SkillRoots;
-  provenance: ProvenanceResolver;
-  catalog: CatalogSummary;
-}
-
-/** The message that starts an observation pass, by section; sections without text are left out. */
-interface ObservationPayload {
-  sections: PayloadSection[];
-  content: string;
-  leads: ObservationLead[];
-  /** The project gate is on and no installed `retro` could be read. */
-  retroUnavailable: boolean;
-}
-
-/**
- * Assembles the observation payload: the instructions the evidence can reach,
- * then the note, digest, ledger, remedy outcomes, rules in force and the
- * sections their gates allow. `observer.md` is parsed on every run, so an
- * approved edit to it applies to the next pass. The directories it names are
- * resolved here, so profile overrides carry through. Throws when a gate
- * marker in `observer.md` is malformed.
- */
-async function observationPayload(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  { note, digest, stale, observations, ledger, roots, provenance, catalog }: PassEvidence,
-): Promise<ObservationPayload> {
-  const hookDirs = harnessRootDirs(ctx.cwd, ompAgentDir());
-  const inForce = rulesInForce(ledger, readObserverRules(ruleDirs()), digest, referencesDir());
-  const onReadAmendments = readOnReadAmendments(amendmentsDir());
-  const gates = activeGates({
-    digest,
-    stale,
-    rulesInForce: inForce,
-    note,
-    observations,
-    rankingAvailable: (await rankingModelUnavailable(pi, ctx).catch(() => "unreadable")) === undefined,
-    onReadAmendmentFor: (skill) => onReadAmendments.some((rule) => rule.amends === skill),
-    catalog,
-  });
-  const retro = gates.has("project") ? retroReference(provenance) : undefined;
-  const leads: ObservationLead[] = [];
-  const leadLabel = (kind: ObservationLead["kind"], text: string) => {
-    const ref = randomUUID();
-    leads.push({ ref, kind, text });
-    return `lead: \`${ref}\``;
-  };
-  const sections: PayloadSection[] = [
-    {
-      name: "instructions",
-      text: [
-        instructionText(gates),
-        "",
-        `These observer instructions live in \`${INSTRUCTIONS_PATH}\`. Hook and companion procedure file: \`${HOOKS_AND_COMPANION_PATH}\`. Hook check script: \`${HOOK_CHECK_PATH}\`.`,
-        `Skills directory: \`${roots.skillsDir}\`. Managed-skills directory: \`${roots.managedDir}\`. User rules directory: \`${userRulesDir()}\`. On-read amendments directory: \`${amendmentsDir()}\`. Reference files directory: \`${referencesDir()}\`. ` +
-          `Project hooks directory: \`${hookDirs["project-hooks"]}\`. Global hooks directory: \`${hookDirs["global-hooks"]}\`. Companion extension directory: \`${hookDirs.companion}\`.`,
-      ].join("\n"),
-    },
-    { name: "note", text: note && `## User note (${leadLabel("note", note)})\n\n${note}` },
-    { name: "digest", text: `## Session digest\n\n${renderDigest(digest)}` },
-    { name: "observations", text: renderObservations(observations, (text) => leadLabel("observation", text)) },
-    { name: "catalog", text: renderCatalogSummary(catalog) },
-    { name: "ledger", text: renderLedger(ledger) },
-    { name: "outcomes", text: renderRemedyOutcomes(remedyOutcomes(ledger, digest), ledger, digest) },
-    { name: "rules-in-force", text: renderRulesInForce(inForce, readHandWrittenRules(userRulesDir())) },
-    { name: "project", text: gates.has("project") ? projectSections(ctx.cwd, provenance) : "" },
-    { name: "retro", text: retro?.text ?? "" },
-    { name: "stale", text: stale.length > 0 ? renderStaleAmendments(stale, provenance) : "" },
-  ];
-  const present = sections.filter(({ text }) => text !== "");
-  return { sections: present, content: present.map(({ text }) => text).join("\n\n"), leads, retroUnavailable: retro?.available === false };
-}
-
-/** Project scope and the `correct` offer, which only a project-environment pass needs. */
-function projectSections(cwd: string, provenance: ProvenanceResolver): string {
-  const correct = provenance.byName("correct");
-  return [
-    `## Project scope\n\nCurrent project root: \`${realpathSync(cwd)}\`. Project proposals and check working directories stay under this root; a User note does not change it.`,
-    `## Recurring mistake workflow\n\n${correct.kind !== "unknown" ? `The existing user-only skill is available at \`${correct.path}\`. If at least two distinct occurrences demonstrate the same mistake class, explain that class with its occurrence IDs and decisive evidence, and offer the user /skill:correct as a separate next action. Its remedy order is architecture, types/enforceable checks, tests, then docs. Read its instructions only as reference; disable-model-invocation: true means only the user may invoke it. Observer approval never authorizes invocation, remediation or commits. Merge evidence and offer each mechanism once; do not duplicate an ordinary proposal for that mechanism. Different mistakes or repeated descriptions of one event are not recurrence. With insufficient evidence or a non-fitting purpose, continue ordinary observation without an offer.` : "The correct skill is unavailable. Continue ordinary observation without offering it or emitting a skill reference."}`,
-  ].join("\n\n");
-}
-
-/** The installed `retro` skill's body inline, framed for this pass, or the sentence saying it is unavailable. */
-function retroReference(provenance: ProvenanceResolver): { text: string; available: boolean } {
-  const retro = provenance.byName("retro");
-  if (retro.kind !== "unknown") {
-    try {
-      const text = readFileSync(retro.path, "utf8");
-      const body = parseFrontmatter(text)?.body ?? text.trim();
-      return {
-        available: true,
-        text: `## Retrospective reference\n\nUse its candidate categories for project-environment findings; its own steps and Files section describe a standalone retrospective and do not apply.\n\n${body}`,
-      };
-    } catch (error) {
-      console.error(`skill-observer: reading the retro skill at ${retro.path} failed:`, error);
-    }
-  }
-  return {
-    available: false,
-    text: "## Retrospective reference\n\nRetro reference unavailable. Disclose this limitation; continue ordinary skill observation and evidence-backed project review using the remedy guidance above.",
-  };
-}
-
 export default function skillObserver(pi: ExtensionAPI): void {
   try {
     migrateObserverRules(ruleDirs(), createProvenanceResolver(defaultSkillRoots(process.cwd())));
@@ -220,8 +101,25 @@ export default function skillObserver(pi: ExtensionAPI): void {
   }
   registerAmendmentDelivery(pi, amendmentsDir);
   const catalogGap = registerCatalogCapture(pi, isObservable);
-  pi.on("tool_call", async (event) => {
+  pi.on("tool_call", (event, ctx) => {
     try {
+      const nativeAsk = event.toolName === "ask" && event.parentToolCallId === undefined;
+      const ownerWrite = ["write", "edit", "manage_skill"].includes(event.toolName);
+      if ((nativeAsk || ownerWrite) && isObservable(ctx)) {
+        const branch = ctx.sessionManager.getBranch();
+        const passStart = observationPassStart(branch);
+        if (passStart !== undefined && nativeAsk && reviewSelectionForForm(sessionToolEvidence(branch), passStart, event.input.html)) {
+          loadInstructionStage("approve");
+        }
+        if (passStart !== undefined && ownerWrite) {
+          try {
+            loadInstructionStage("publish");
+          } catch (error) {
+            // Owner tools also run outside review. Fail closed only when the pass has a reviewed publication.
+            if (hasReviewedPublication(sessionToolEvidence(branch), passStart, true)) throw error;
+          }
+        }
+      }
       recordHookCall(pi, event);
     } catch (error) {
       return { block: true, reason: error instanceof Error ? error.message : String(error) };
@@ -230,13 +128,40 @@ export default function skillObserver(pi: ExtensionAPI): void {
 
   pi.on("tool_result", (event, ctx) => {
     const isReceiptTool = ["write", "edit", "bash", "manage_skill", "ask", REVIEW_TOOL_NAME].includes(event.toolName);
-    recordHookResult(pi, event, ctx.sessionManager.getBranch());
-    if (event.isError || !isReceiptTool || observationPassStart(ctx.sessionManager.getBranch()) === undefined) return;
+    const branch = ctx.sessionManager.getBranch();
+    recordHookResult(pi, event, branch);
+    if (event.isError || !isReceiptTool || !isObservable(ctx)) return;
+    const passStart = observationPassStart(branch);
+    if (passStart === undefined) return;
     const details = event.toolName === "ask" ? event.details as AskDetails | undefined : undefined;
+    const guidance: { type: "text"; text: string }[] = [];
+    if (Array.isArray(details?.answers) && details.timedOut !== true) {
+      const evidence = sessionToolEvidence(branch);
+      const selected = evidence.isNativeCall(event.toolCallId, "ask") && reviewSelectionForForm(evidence, passStart, event.input?.html);
+      if (selected) {
+        let stage: "publish" | "record" | undefined;
+        for (const choice of details.answers) {
+          if (!selected.some(({ proposal }) => proposal.candidateId === choice?.name)) continue;
+          const answer = choice?.answer;
+          if (answer === APPLY || answer === STALE_OPTIONS["stale-update"] || answer === STALE_OPTIONS["stale-delete"]) {
+            stage = "publish";
+            break;
+          }
+          if (answer === "Later" || answer === "Decline" || answer === "Keep") stage = "record";
+        }
+        if (stage !== undefined) {
+          try {
+            guidance.push({ type: "text", text: instructionText(stage, DRAFT_RECORD_GATES) });
+          } catch (error) {
+            guidance.push({ type: "text", text: `Publication and recording stopped: ${(error as Error).message}` });
+          }
+        }
+      }
+    }
     const conditions: ToolResultCondition[] = [];
     if (hasCustomInput(details)) conditions.push("custom-input");
     if (hasApprovalNote(details)) conditions.push("approval-note");
-    const guidance = conditions.length > 0 ? [{ type: "text", text: whatToDoNow(conditions) }] : [];
+    if (conditions.length > 0) guidance.push({ type: "text", text: whatToDoNow(conditions) });
     // Opaque host IDs are absent from ordinary model-visible outputs; snapshot tags and commands cannot identify branch receipts.
     return {
       content: [...event.content, { type: "text", text: JSON.stringify({ observerToolCallId: event.toolCallId }) }, ...guidance],
@@ -250,7 +175,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
   // Active tools live only in this process, so a restored or switched branch still inside a pass needs them back to resolve its saved approvals.
   const restorePass = async (event: unknown, ctx: ExtensionContext) => {
     refreshHint(event, ctx);
-    if (observationPassStart(ctx.sessionManager.getBranch()) !== undefined) await activatePassTools();
+    if (isObservable(ctx) && observationPassStart(ctx.sessionManager.getBranch()) !== undefined) await activatePassTools();
   };
   pi.on("session_start", restorePass);
   pi.on("session_switch", restorePass);
@@ -294,15 +219,15 @@ export default function skillObserver(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("observe", {
-    description: "Review session evidence for skill improvements and project-environment fixes; text after the command adds a note",
+    description: "Review completed work and session evidence for improvements; text after the command adds a note",
     handler: async (args, ctx) => {
       if (!isObservable(ctx)) return;
       const note = args.trim();
       const cwd = ctx.cwd;
-      const sessionId = ctx.sessionManager.getSessionId();
       const roots = defaultSkillRoots(cwd);
       const provenance = createProvenanceResolver(roots);
       const branch = ctx.sessionManager.getBranch();
+      const sessionSource = activeSessionSource(ctx.sessionManager, branch);
       const digest = buildDigest(branch, { provenance });
       const stale = findStaleAmendments(ruleDirs(), provenance);
       let observations: readonly Observation[];
@@ -310,21 +235,23 @@ export default function skillObserver(pi: ExtensionAPI): void {
       try {
         const state = readPassState(cwd, new Date());
         observations = state.observations;
-        if (!note && isEmptyDigest(digest) && stale.length === 0 && observations.length === 0) {
-          ctx.ui.notify("Nothing to observe: no skill signals, stale amendments or pending observations, and no note.", "info");
+        if (!hasPassEvidence({ note, digest, stale, observations })) {
+          ctx.ui.notify("Nothing to observe: no skill signals, loaded skills, completed work, stale amendments, pending observations or User note.", "info");
           return;
         }
-        payload = await observationPayload(pi, ctx, { note, digest, stale, ...state, roots, provenance, catalog: catalogSummary(branch, ctx.sessionManager.getEntries(), catalogGap(branch)) });
+        payload = observationPayload(cwd, { note, digest, stale, ...state, roots, provenance,
+          sessionSource,
+          catalog: catalogSummary(branch, ctx.sessionManager.getEntries(), catalogGap(branch)) });
       } catch (error) {
         ctx.ui.notify(`Observation pass not started: ${error instanceof Error ? error.message : String(error)}`, "error");
         return;
       }
-      if (payload.retroUnavailable) ctx.ui.notify("Retro reference unavailable; ordinary skill observation remains usable.", "warning");
+      if (payload.retroUnavailable) ctx.ui.notify("Retro reference unavailable; evidence-backed discovery can continue.", "warning");
       await activatePassTools();
       pi.sendMessage(
         {
           customType: OBSERVATION_MESSAGE_TYPE, content: payload.content, display: false, attribution: "user",
-          details: { observationLeads: { cwd, sessionId, leads: payload.leads } },
+          details: { observationLeads: { cwd, sessionId: sessionSource.id, leads: payload.leads } },
         },
         { triggerTurn: true, deliverAs: "followUp" },
       );
@@ -335,14 +262,14 @@ export default function skillObserver(pi: ExtensionAPI): void {
       }
       refreshHint(undefined, ctx);
       ctx.ui.notify(
-        `Observation pass started: ${note ? "your note, " : ""}${digest.signals.length} signal(s), ${digest.skills.length} loaded skill(s), ${stale.length} stale amendment(s), ${observations.length} observation(s); payload ${describePayloadEstimate(payloadEstimate(payload.sections))}.`,
+        `Observation pass started: ${note ? "your note, " : ""}${digest.signals.length} signal(s), ${digest.skills.length} loaded skill(s), ${stale.length} stale amendment(s), ${observations.length} observation(s); payload ${describePayloadEstimate(payload.estimate)}.`,
         "info",
       );
     },
   });
 
   pi.registerCommand("observe-report", {
-    description: "Show this branch's skill evidence and remedy outcomes without starting an observation pass",
+    description: "Show this branch's evidence and initial payload estimate without starting an observation pass",
     handler: async (_args, ctx) => {
       if (!isObservable(ctx)) return;
       const roots = defaultSkillRoots(ctx.cwd);
@@ -356,8 +283,9 @@ export default function skillObserver(pi: ExtensionAPI): void {
         const report = evidenceReport({
           digest, ledger, stale, observations: observations.length, catalog,
         });
-        if (!isEmptyEvidenceReport(report)) {
-          report.payload = payloadEstimate((await observationPayload(pi, ctx, { note: "", digest, stale, observations, ledger, roots, provenance, catalog })).sections);
+        if (hasPassEvidence({ note: "", digest, stale, observations })) {
+          report.payload = observationPayload(ctx.cwd, { note: "", digest, stale, observations, ledger, roots, provenance, catalog,
+            sessionSource: activeSessionSource(ctx.sessionManager, branch) }).estimate;
         }
         ctx.ui.notify(renderEvidenceReport(report), "info");
       } catch (error) {

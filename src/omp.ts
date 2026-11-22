@@ -32,6 +32,8 @@ export interface AgentMessage {
   attribution?: "user" | "agent";
   /** Set on harness-written messages, such as reminders. */
   synthetic?: boolean;
+  /** Present on native assistant replies. */
+  stopReason?: "stop" | "length" | "toolUse" | "error" | "aborted";
   toolName?: string;
   toolCallId?: string;
   isError?: boolean;
@@ -193,7 +195,14 @@ export interface ExtensionContext {
   /** Optional on older hosts; review needs authenticated models of every judge-compatible kind. */
   modelRegistry?: { getAvailable(kind: "all"): Array<{ provider: string; id: string; kind?: string }> };
   /** `getEntries`: every entry of the session file, abandoned branches included. */
-  sessionManager: { getBranch(): SessionEntry[]; getEntries(): SessionEntry[]; getSessionId(): string };
+  sessionManager: {
+    getBranch(): SessionEntry[];
+    getEntries(): SessionEntry[];
+    getSessionId(): string;
+    getSessionFile?(): string | undefined;
+    getSessionDir?(): string | undefined;
+    getHeader?(): { cwd: string } | null;
+  };
   /** The current effective system prompt; missing on older hosts. */
   getSystemPrompt?(): string[];
   ui: {
@@ -234,6 +243,7 @@ export interface BeforeAgentStartResult {
 export interface ToolCallEvent {
   toolName: string;
   toolCallId: string;
+  parentToolCallId?: string;
   input: ToolArguments;
 }
 

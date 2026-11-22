@@ -48,6 +48,7 @@ function host(options: { assignment?: string; settings?: boolean; models?: boole
   const branch: SessionEntry[] = [{ type: "custom_message", id: "observe", customType: "skill-observer", content: "Observation pass." }];
   const ctx = {
     cwd: root,
+    hasUI: true,
     sessionManager: { getBranch: () => branch, getSessionId: () => "review-model" },
     ...(options.models !== false && { modelRegistry: { getAvailable: () => options.available === false ? [] : [{ ...model, kind: options.kind }] } }),
   } as unknown as ExtensionContext;
@@ -174,6 +175,6 @@ it("keeps scoped Prepare and Select eligibility when other projects have decisio
   expect(forged.result.isError).toBe(true);
   expect(forged.output.selected).toEqual([]);
   const refused = await call({ action: "prepare", candidates: [{ ...candidates[4], skill: "other-workflow" }] });
-  expect(refused.result.isError).toBe(true);
-  expect(refused.output.failures).toEqual([expect.stringContaining("belongs to another target")]);
+  expect(refused.result.isError).toBe(false);
+  expect(refused.output.rejected).toEqual([{ index: 0, gist: "Take back the recorded fix", reason: expect.stringContaining("belongs to another target") }]);
 });

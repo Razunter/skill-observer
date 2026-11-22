@@ -113,12 +113,7 @@ export function rulesInForce(
 }
 
 function fixLine(record: LedgerRecord): string {
-  const quotes = (record.evidence ?? []).map(({ quote, count }) => `${JSON.stringify(quote)} (×${count})`);
-  return [
-    `fingerprint \`${record.fingerprint}\`: ${record.gist}`,
-    `${record.outcome[0]!.toUpperCase()}${record.outcome.slice(1)} ${record.timestamp.slice(0, 10)}.`,
-    ...(quotes.length > 0 ? [`Quotes: ${quotes.join(", ")}.`] : []),
-  ].join(" ");
+  return `fingerprint \`${record.fingerprint}\`: ${record.gist} ${record.outcome[0]!.toUpperCase()}${record.outcome.slice(1)} ${record.timestamp.slice(0, 10)}.`;
 }
 
 /**

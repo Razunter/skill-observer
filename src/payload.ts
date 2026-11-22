@@ -2,13 +2,22 @@
  * The observation payload: the evidence-gated instruction text `/observe`
  * sends, cut from `observer.md` by its gate markers, and the payload estimate.
  */
-import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ObserverRule } from "./amendments.js";
-import type { CatalogSummary } from "./catalog.js";
-import type { SessionDigest } from "./digest.js";
-import type { Observation } from "./observations.js";
-import type { SkillRulesInForce } from "./rules-in-force.js";
+import { amendmentsDir, type ObserverRule, readHandWrittenRules, readObserverRules, readOnReadAmendments, renderStaleAmendments, userRulesDir } from "./amendments.js";
+import { type CatalogSummary, renderCatalogSummary } from "./catalog.js";
+import { isEmptyDigest, renderDigest, type SessionDigest } from "./digest.js";
+import { harnessRootDirs, type LedgerRecord, renderLedger } from "./ledger.js";
+import { type Observation, renderObservations } from "./observations.js";
+import type { ObservationLead } from "./omp.js";
+import { remedyOutcomes, renderRemedyOutcomes } from "./outcomes.js";
+import { ompAgentDir, type ProvenanceResolver, type SkillRoots } from "./provenance.js";
+import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
+
+/** Outside the rules directory so OMP never loads a reference file as a rule. */
+export const referencesDir = () => join(ompAgentDir(), "skill-observer", "references");
 
 export const INSTRUCTIONS_PATH = fileURLToPath(new URL("../observer.md", import.meta.url));
 /** The procedure for observer hooks and the companion extension: read by a pass only when it proposes one, so never inlined. */
@@ -117,41 +126,54 @@ export function joinFragments(fragments: readonly Fragment[]): string {
 
 const observerFragments = () => parseFragments(readFileSync(INSTRUCTIONS_PATH, "utf8"));
 
-/** What the extension knows at `/observe` time that decides which gated fragments the pass gets. */
-export interface GateInput {
-  digest: SessionDigest;
-  stale: readonly ObserverRule[];
-  rulesInForce: readonly SkillRulesInForce[];
-  note: string;
-  rankingAvailable: boolean;
-  /** The project's pending observations. */
-  observations: readonly Observation[];
-  /** Whether the skill has an on-read amendment in the amendments directory. */
-  onReadAmendmentFor(skill: string): boolean;
-  catalog: CatalogSummary;
+const STAGE_SECTIONS = {
+  discover: ["observation-pass", "find-candidates", "attribution"],
+  draft: ["draft", "prepare"],
+  select: ["select"],
+  ask: ["ask"],
+  approve: ["ask", "apply", "record", "summarise"],
+  publish: ["apply", "record", "summarise"],
+  record: ["record", "summarise"],
+} as const;
+
+/** Parse the maintained source and verify the required procedure before a stage can proceed. */
+export function loadInstructionStage(stage: keyof typeof STAGE_SECTIONS): Fragment[] {
+  try {
+    const sections: readonly string[] = STAGE_SECTIONS[stage];
+    const selected = observerFragments().filter(({ section }) => sections.includes(section.slice(section.indexOf("-") + 1)));
+    for (const section of sections) {
+      if (!selected.some((fragment) => fragment.section.slice(fragment.section.indexOf("-") + 1) === section
+        && fragment.gate === undefined && /^(?!#)[^\s]/m.test(fragment.text))) {
+        throw new Error(`missing ${section} section`);
+      }
+    }
+    if (stage === "approve") findToolResultGuidance(selected, "custom-input");
+    if (stage === "approve" || stage === "publish") findToolResultGuidance(selected, "approval-note");
+    return selected;
+  } catch (error) {
+    throw new Error(`Cannot load ${stage} guidance from observer.md: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
-const GATE_EVIDENCE: Record<Exclude<Gate, "tool-result">, (input: GateInput) => boolean> = {
-  stale: ({ stale }) => stale.length > 0,
-  compaction: ({ digest, onReadAmendmentFor }) =>
-    digest.skills.some((skill) => (skill.kind === "upstream" || skill.kind === "plugin") && onReadAmendmentFor(skill.name)),
-  project: ({ digest }) => digest.signals.some((signal) => signal.kind === "workflow" || signal.kind === "tool-error"),
-  withdrawal: ({ rulesInForce, note }) =>
-    note !== "" || rulesInForce.some(({ rules, edits }) => edits.length > 0 || rules.some(({ fixes }) => fixes.length > 0)),
-  ranking: ({ rankingAvailable }) => rankingAvailable,
-  note: ({ note }) => note !== "",
-  observations: ({ observations }) => observations.length > 0,
-  catalog: ({ catalog }) => catalog.latest !== undefined || catalog.gaps.length > 0,
-};
-
-/** The gates whose evidence is present; never `tool-result`. */
-export function activeGates(input: GateInput): ReadonlySet<Gate> {
-  return new Set(Object.entries(GATE_EVIDENCE).filter(([, present]) => present(input)).map(([gate]) => gate as Gate));
+export function instructionText(stage: keyof typeof STAGE_SECTIONS, gates?: ReadonlySet<Gate>): string {
+  return joinFragments(loadInstructionStage(stage).filter(({ gate }) =>
+    gate === undefined || (gate !== "tool-result" && gates?.has(gate))));
 }
 
-/** The always-on fragments of `observer.md` and those of the active gates, in document order; read on every call, so an edit applies to the next pass. */
-export function instructionText(gates: ReadonlySet<Gate>): string {
-  return joinFragments(observerFragments().filter(({ gate }) => gate === undefined || (gate !== "tool-result" && gates.has(gate))));
+export const DRAFT_RECORD_GATES: ReadonlySet<Gate> = new Set(["project", "stale", "compaction", "withdrawal"]);
+
+/** Discovery uses only gates that occur in the starting instructions. */
+function discoveryGates({ catalog, digest, note, observations, stale }: PassEvidence): ReadonlySet<Gate> {
+  const gates = new Set<Gate>();
+  if (stale.length > 0) gates.add("stale");
+  if (digest.primaryWork || digest.signals.some((signal) => signal.kind === "workflow" || signal.kind === "tool-error")) gates.add("project");
+  if (note) gates.add("note");
+  if (observations.length > 0) gates.add("observations");
+  if (catalog.latest !== undefined || catalog.gaps.length > 0) gates.add("catalog");
+  const onReadAmendments = readOnReadAmendments(amendmentsDir());
+  if (digest.skills.some(({ kind, name }) => (kind === "upstream" || kind === "plugin")
+    && onReadAmendments.some((rule) => rule.amends === name))) gates.add("compaction");
+  return gates;
 }
 
 export type ToolResultCondition = "changed-target" | "ledger-recording-failed" | "cleanup-failed" | "custom-input" | "approval-note";
@@ -166,8 +188,12 @@ const TOOL_RESULT_TITLES: Record<ToolResultCondition, string> = {
 
 /** The `tool-result` fragment of `observer.md` for `condition`, found by its bold lead title. */
 export function toolResultGuidance(condition: ToolResultCondition): string {
+  return findToolResultGuidance(observerFragments(), condition);
+}
+
+function findToolResultGuidance(fragments: readonly Fragment[], condition: ToolResultCondition): string {
   const lead = `**${TOOL_RESULT_TITLES[condition]}**`;
-  const fragment = observerFragments().find(({ gate, text }) => gate === "tool-result" && text.startsWith(lead));
+  const fragment = fragments.find(({ gate, text }) => gate === "tool-result" && text.startsWith(lead));
   if (!fragment) throw new Error(`observer.md has no tool-result paragraph starting ${lead}`);
   return fragment.text;
 }
@@ -209,4 +235,102 @@ export function payloadEstimate(sections: readonly { name: string; text: string 
 /** The estimate as notices show it: `≈ N tokens (section N, …; chars/4 estimate)`. */
 export function describePayloadEstimate({ total, bySection }: PayloadEstimate): string {
   return `≈ ${total} tokens (${Object.entries(bySection).map(([name, tokens]) => `${name} ${tokens}`).join(", ")}; chars/4 estimate)`;
+}
+/** The evidence `/observe` gathered before it decided to start a pass. */
+export interface PassEvidence {
+  note: string;
+  sessionSource: { id: string; file?: string; leaf?: string; compaction?: string };
+  digest: SessionDigest;
+  stale: readonly ObserverRule[];
+  /** The project's pending observations. */
+  observations: readonly Observation[];
+  ledger: readonly LedgerRecord[];
+  roots: SkillRoots;
+  provenance: ProvenanceResolver;
+  catalog: CatalogSummary;
+}
+
+/** The same early exit applies to the pass and the estimate. */
+export function hasPassEvidence({ note, digest, stale, observations }: Pick<PassEvidence, "note" | "digest" | "stale" | "observations">): boolean {
+  return note !== "" || !isEmptyDigest(digest) || stale.length > 0 || observations.length > 0;
+}
+
+export interface ObservationPayload {
+  estimate: PayloadEstimate;
+  content: string;
+  leads: ObservationLead[];
+  /** The project gate is on and no installed `retro` could be read. */
+  retroUnavailable: boolean;
+}
+
+/** The starting message and its accounting are identical for Observe and the evidence report. */
+export function observationPayload(cwd: string, evidence: PassEvidence): ObservationPayload {
+  const { note, sessionSource, digest, stale, observations, ledger, roots, provenance, catalog } = evidence;
+  const hookDirs = harnessRootDirs(cwd, ompAgentDir());
+  const inForce = rulesInForce(ledger, readObserverRules({ rulesDir: userRulesDir(), amendmentsDir: amendmentsDir() }), digest, referencesDir());
+  const gates = discoveryGates(evidence);
+  const retro = gates.has("project") ? retroReference(provenance) : undefined;
+  const leads: ObservationLead[] = [];
+  const leadLabel = (kind: ObservationLead["kind"], text: string) => {
+    const ref = randomUUID();
+    leads.push({ ref, kind, text });
+    return `lead: \`${ref}\``;
+  };
+  const sections: PayloadSection[] = [
+    {
+      name: "instructions",
+      text: [
+        instructionText("discover", gates),
+        "",
+        `These observer instructions live in \`${INSTRUCTIONS_PATH}\`. Hook and companion procedure file: \`${HOOKS_AND_COMPANION_PATH}\`. Hook check script: \`${HOOK_CHECK_PATH}\`.`,
+        `Skills directory: \`${roots.skillsDir}\`. Managed-skills directory: \`${roots.managedDir}\`. User rules directory: \`${userRulesDir()}\`. On-read amendments directory: \`${amendmentsDir()}\`. Reference files directory: \`${referencesDir()}\`. ` +
+          `Project hooks directory: \`${hookDirs["project-hooks"]}\`. Global hooks directory: \`${hookDirs["global-hooks"]}\`. Companion extension directory: \`${hookDirs.companion}\`.`,
+      ].join("\n"),
+    },
+    { name: "note", text: note && `## User note (${leadLabel("note", note)})\n\n${note}` },
+    { name: "digest", text: `## Session digest\n\n${renderSessionSource(sessionSource)}\n\n${renderDigest(digest)}` },
+    { name: "observations", text: renderObservations(observations, (text) => leadLabel("observation", text)) },
+    { name: "catalog", text: renderCatalogSummary(catalog) },
+    { name: "ledger", text: renderLedger(ledger) },
+    { name: "outcomes", text: renderRemedyOutcomes(remedyOutcomes(ledger, digest), ledger, digest) },
+    { name: "rules-in-force", text: renderRulesInForce(inForce, readHandWrittenRules(userRulesDir())) },
+    { name: "project", text: gates.has("project") ? projectSections(cwd, provenance) : "" },
+    { name: "retro", text: retro?.text ?? "" },
+    { name: "stale", text: stale.length > 0 ? renderStaleAmendments(stale, provenance) : "" },
+  ];
+  const present = sections.filter(({ text }) => text !== "");
+  return { estimate: payloadEstimate(present), content: present.map(({ text }) => text).join("\n\n"), leads, retroUnavailable: retro?.available === false };
+}
+
+function renderSessionSource({ id, file, leaf, compaction }: PassEvidence["sessionSource"]): string {
+  return [
+    `Active session: \`${id}\`.`,
+    leaf && `Active branch leaf: \`${leaf}\`.`,
+    compaction && `Latest branch compaction: \`${compaction}\`.`,
+    file ? `Saved session file: \`${file}\`.` : "Saved session file unavailable from the host.",
+  ].filter(Boolean).join(" ");
+}
+
+/** Project scope and the `correct` offer, which only a project-environment pass needs. */
+function projectSections(cwd: string, provenance: ProvenanceResolver): string {
+  const correct = provenance.byName("correct");
+  return [
+    `## Project scope\n\nCurrent project root: \`${realpathSync(cwd)}\`. Project proposals and check working directories stay under this root; a User note does not change it.`,
+    `## Recurring mistake workflow\n\n${correct.kind !== "unknown" ? `The existing user-only skill is available at \`${correct.path}\`. If at least two distinct occurrences demonstrate the same mistake class, explain that class with its occurrence IDs and decisive evidence, and offer the user /skill:correct as a separate next action. Its remedy order is architecture, types/enforceable checks, tests, then docs. Read its instructions only as reference; disable-model-invocation: true means only the user may invoke it. Observer approval never authorizes invocation, remediation or commits. Merge evidence and offer each mechanism once; do not duplicate an ordinary proposal for that mechanism. Different mistakes or repeated descriptions of one event are not recurrence. With insufficient evidence or a non-fitting purpose, continue ordinary observation without an offer.` : "The correct skill is unavailable. Continue ordinary observation without offering it or emitting a skill reference."}`,
+  ].join("\n\n");
+}
+
+/** A pointer to optional category guidance, not the standalone retro workflow. */
+function retroReference(provenance: ProvenanceResolver): { text: string; available: boolean } {
+  const retro = provenance.byName("retro");
+  if (retro.kind !== "unknown") {
+    return {
+      available: true,
+      text: `## Retrospective reference\n\nIf category guidance would help, read \`${retro.path}\` for candidate categories only. Do not invoke retro or follow its standalone workflow.`,
+    };
+  }
+  return {
+    available: false,
+    text: "## Retrospective reference\n\nRetro reference unavailable. Continue discovery from the branch and the remedy categories above.",
+  };
 }

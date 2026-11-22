@@ -1,3 +1,3 @@
 # Observation pass
 
-The user ran `/observe`. Turn this session's evidence into concrete skill improvements and project-environment fixes the user reviews before publication. Work from the current session branch, the digest below (including compacted history), the conversation still available and the User note. This is one observation pass: consult the retrospective reference inlined under **Retrospective reference**, when present, as guidance, then use the review and recording steps here.
+The user ran `/observe`. Find grounded improvements in this session's work, including application code, tests, CI, navigation, documentation, skills and the harness. A completed ordinary reply, an observation or a User note can lead to an improvement even when no skill was loaded and no tool failed.

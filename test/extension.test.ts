@@ -7,7 +7,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { canonicalProjectTarget, harnessFingerprint, type LedgerRecord, projectFingerprint, proposalFingerprint, putLedgerRecords, readLedger as ledgerRecords } from "../src/ledger.js";
+import { canonicalProjectTarget, harnessFingerprint, type LedgerRecord, projectFingerprint, proposalFingerprint, putLedgerRecords, readLedger as ledgerRecords, type SkillLedgerRecord } from "../src/ledger.js";
 import { PENDING_OBSERVATION_COUNT_SQL } from "../src/observations.js";
 import { observerStorePath, writeObserverStore } from "../src/observer-store.js";
 import skillObserver from "../src/skill-observer.js";
@@ -34,6 +34,11 @@ import { type Gate, HOOK_CHECK_PATH, HOOKS_AND_COMPANION_PATH, INSTRUCTIONS_PATH
 import { entries as fx } from "./fixtures.js";
 import { groundRepairs } from "./grounding.js";
 import { CE_PLUGIN, copySkillEntry, installPlugin, makeSkillHome, uninstallPlugin, writeSkill } from "./skill-home.js";
+
+vi.mock(import("node:fs"), async (importOriginal) => {
+  const fs = await importOriginal();
+  return { ...fs, readFileSync: vi.fn(fs.readFileSync) as typeof fs.readFileSync };
+});
 
 /** The environment `omp` runs under, taken before tests point HOME at a temp skill home; `test/setup.ts` already pointed the agent dir at a temp one. */
 const ompEnv = { ...process.env };
@@ -75,7 +80,7 @@ let customEntryIds = 0;
  * available judge role unless `judge` is false. Given another host's
  * `skillHome`, it is a second session of the same agent dir and project.
  */
-function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; sessionId?: string; allTools?: ExtensionAPI["getAllTools"]; systemPrompt?: string[]; onSend?: () => void } = {}) {
+function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; sessionId?: string; sessionFile?: string; allTools?: ExtensionAPI["getAllTools"]; systemPrompt?: string[]; onSend?: () => void } = {}) {
   const skillHome = options.skillHome ?? makeSkillHome();
   mkdirSync(skillHome.roots.cwd, { recursive: true });
   vi.stubEnv("HOME", skillHome.home);
@@ -86,6 +91,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
   const tools: Record<string, ToolDefinition<unknown, unknown>> = {};
   const sent: Array<{ message: CustomMessage; options?: SendMessageOptions }> = [];
   let activeTools = ["read", "ask"];
+  const resolveScopedModels = vi.fn(async () => [{ model: { provider: "fixture", id: "explicit-judge" } }]);
   const pi: ExtensionAPI = {
     on: (event, handler) => {
       handlers[event] ??= [];
@@ -118,12 +124,13 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     zod,
     pi: {
       settings: { getModelRole: (role) => role === "judge" && options.judge !== false ? "fixture/explicit-judge" : undefined },
-      resolveScopedModels: async () => [{ model: { provider: "fixture", id: "explicit-judge" } }],
+      resolveScopedModels,
     },
   };
   skillObserver(pi);
 
   let branch: SessionEntry[] = [];
+  let sessionDir: string | undefined;
   /** Every entry the session ever held, by ID, as OMP keeps abandoned branches in the session file. */
   const session = new Map<string, SessionEntry>();
   const sessionEntries = () => {
@@ -140,7 +147,8 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     hasUI: options.hasUI ?? true,
     agent: options.agentKind === "unknown" ? undefined : { kind: options.agentKind ?? "main" },
     cwd: skillHome.roots.cwd,
-    sessionManager: { getBranch: () => branch, getEntries: sessionEntries, getSessionId: () => options.sessionId ?? "fixture-session" },
+    sessionManager: { getBranch: () => branch, getEntries: sessionEntries, getSessionId: () => options.sessionId ?? "fixture-session", getSessionFile: () => options.sessionFile,
+      getSessionDir: () => sessionDir, getHeader: () => ({ cwd: skillHome.roots.cwd }) },
     ...(options.systemPrompt && { getSystemPrompt: () => options.systemPrompt! }),
     modelRegistry: { getAvailable: () => [{ provider: "fixture", id: "explicit-judge" }] },
     ui: {
@@ -231,13 +239,14 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
   return {
     getBranch: () => branch,
     sessionEntries,
-    toolCall: async (toolName: string, input: Record<string, unknown>, toolCallId: string) => {
+    toolCall: async (toolName: string, input: Record<string, unknown>, toolCallId: string, parentToolCallId?: string) => {
       for (const handler of handlers.tool_call ?? []) {
-        const result = await handler({ type: "tool_call", toolName, input, toolCallId }, ctx);
+        const result = await handler({ type: "tool_call", toolName, input, toolCallId, parentToolCallId }, ctx);
         if (result) return result;
       }
     },
     setCwd: (cwd: string) => { ctx.cwd = cwd; },
+    setSessionDir: (dir: string) => { sessionDir = dir; },
     /** Moves to `entries` as the active branch; the entries of the branch it leaves stay in the session. */
     setBranch: (entries: SessionEntry[]) => {
       sessionEntries();
@@ -262,6 +271,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
      * A Prepare's skill-text repair drafts are grounded first, as {@link groundRepairs} describes.
      */
     callTool,
+    resolveScopedModels,
     ledgerFile: observerStorePath(join(skillHome.home, ".omp/agent")),
     observationsFile: observerStorePath(join(skillHome.home, ".omp/agent")),
     rulesDir: join(skillHome.home, ".omp/agent/rules"),
@@ -376,6 +386,13 @@ describe("status hint", () => {
   });
 });
 
+const ordinaryWork: SessionEntry[] = [
+  { type: "message", id: "checkout-request", parentId: null,
+    message: { role: "user", attribution: "user", content: "The two-line discount preview quoted 5 cents, but checkout charged 6. Fix the rounding." } },
+  { type: "message", id: "checkout-reply", parentId: "checkout-request",
+    message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "Round the total, not each line. The existing single-line test passed with both calculations." }] } },
+];
+
 describe("/observe", () => {
   it("says there is nothing to observe and starts no turn when the session has no signals", async () => {
     const host = loadExtension();
@@ -383,6 +400,124 @@ describe("/observe", () => {
     await host.runCommand("observe");
     expect(host.sent).toEqual([]);
     expect(host.notices).toEqual([expect.stringMatching(/no skill signals/i)]);
+  });
+
+  it.each([
+    ["startup", []],
+    ["a startup reply without a user request", [ordinaryWork[1]!]],
+    ["harness prompts and replies", [
+      ...fx.harnessNoise.filter((entry) => entry.customType !== "skill-prompt"),
+      { ...ordinaryWork[0]!, message: { role: "user", synthetic: true, steering: true, content: "A reminder." } },
+      { ...ordinaryWork[0]!, id: "harness-nudge", message: { role: "user", attribution: "agent", content: "A harness nudge." } },
+      ordinaryWork[1]!,
+    ]],
+    ["a real request with an interrupted reply", [
+      ordinaryWork[0]!, { ...ordinaryWork[1]!, message: { ...ordinaryWork[1]!.message!, stopReason: "aborted" } },
+    ]],
+  ] as const)("does not start a pass or estimate one for %s", async (_label, entries) => {
+    const host = loadExtension();
+    host.setBranch([...entries]);
+    await host.runCommand("observe-report");
+    await host.runCommand("observe");
+    expect(host.sent).toEqual([]);
+    expect(host.notices[0]).not.toContain("payload estimate");
+    expect(host.notices[1]).toMatch(/nothing to observe/i);
+    expect(host.activeTools()).not.toContain("observer_review");
+    expect(existsSync(host.ledgerFile)).toBe(false);
+  });
+
+  it("does not mistake observer bookkeeping for a new pass once the pending observation was shown", async () => {
+    const host = loadExtension();
+    host.setBranch([ordinaryWork[0]!]);
+    await host.callTool("observe", { text: "The checkout check did not cover two lines." });
+    await host.runCommand("observe");
+    expect(host.sent).toHaveLength(1);
+    await host.commitMessage(host.sent[0]!.message);
+    host.setBranch([...host.getBranch(), ...fx.skillUrlRead, ordinaryWork[1]!]);
+    await host.runCommand("observe-report");
+    await host.runCommand("observe");
+    expect(host.sent).toHaveLength(1);
+    expect(host.notices.at(-2)).not.toContain("payload estimate");
+    expect(host.notices.at(-1)).toMatch(/nothing to observe/i);
+  });
+
+  it("delivers an ordinary completed branch and estimates the equivalent initial pass without a model", async () => {
+    const host = loadExtension();
+    host.setBranch(ordinaryWork);
+    await host.endTurn();
+    await host.runCommand("observe-report");
+    expect(host.sent).toEqual([]);
+    expect(host.statusTexts()).toEqual([]);
+    expect(host.activeTools()).not.toContain("observer_review");
+    expect(existsSync(host.ledgerFile)).toBe(false);
+    const [, estimate = ""] = /Initial \/observe payload estimate \(hidden message only\): (.+)/.exec(host.notices[0] ?? "") ?? [];
+    expect(estimate).toMatch(/^≈ \d+ tokens /);
+    await host.runCommand("observe");
+    expect(host.sent).toHaveLength(1);
+    expect(host.sent[0]?.options?.triggerTurn).toBe(true);
+    expect(String(host.sent[0]?.message.content)).toContain("`checkout-reply`");
+    expect(String(host.sent[0]?.message.content)).not.toContain("Round the total, not each line");
+    expect(host.notices.at(-1)).toContain(`payload ${estimate}.`);
+    expect(host.resolveScopedModels).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("delivers the active branch locator for compacted evidence (saved file: %s)", async (saved) => {
+    const skillHome = makeSkillHome();
+    const sessionFile = join(skillHome.home, "checkout-session.jsonl");
+    const kept: SessionEntry = { type: "message", id: "checkout-kept", parentId: "checkout-reply", message: { role: "developer", content: "Context notice." } };
+    const compacted: SessionEntry = { type: "compaction", id: "checkout-compact", parentId: kept.id, firstKeptEntryId: kept.id };
+    const leaf: SessionEntry = { type: "custom", id: "checkout-leaf", parentId: compacted.id, customType: "fixture-marker" };
+    const host = loadExtension({ skillHome, ...(saved && { sessionFile }) });
+    const unrelated = { ...ordinaryWork[1]!, id: "abandoned-leaf" };
+    if (saved) writeFileSync(sessionFile, [...ordinaryWork, unrelated, kept, compacted, leaf].map((entry) => JSON.stringify(entry)).join("\n"));
+    host.setBranch([...ordinaryWork, unrelated]);
+    host.setBranch([...ordinaryWork, kept, compacted, leaf]);
+    await host.runCommand("observe");
+    expect(host.sent).toHaveLength(1);
+    const content = String(host.sent[0]?.message.content);
+    expect(content).toContain("`fixture-session`");
+    expect(content).toContain("`checkout-compact`");
+    expect(content).toContain("`checkout-leaf`");
+    expect(content).not.toContain("abandoned-leaf");
+    expect(content).not.toContain("The existing single-line test passed");
+    if (saved) expect(content).toContain(`\`${sessionFile}\``);
+    else expect(content).toMatch(/saved session file unavailable/i);
+  });
+
+  it("reviews an invoice regression-test draft from completed work without retro or a failing tool call", async () => {
+    const host = loadExtension();
+    const root = host.skillHome.roots.cwd;
+    const invoice = "export const discountedCents = (lines, rate) => Math.round(lines.reduce((a, b) => a + b, 0) * (1 - rate));\n";
+    const singleLine = "test('single line', () => expect(discountedCents([100], 0.5)).toBe(50));";
+    const tests = `import { expect, test } from 'bun:test';\nimport { discountedCents } from './invoice.js';\n${singleLine}\n`;
+    const regression = "test('two half-cent lines', () => expect(discountedCents([5, 5], 0.5)).toBe(5));";
+    writeFileSync(join(root, "package.json"), '{"type":"module","scripts":{"check":"bun test"}}\n');
+    writeFileSync(join(root, "invoice.js"), invoice);
+    writeFileSync(join(root, "invoice.test.js"), tests);
+    mkdirSync(join(root, ".github/workflows"), { recursive: true });
+    writeFileSync(join(root, ".github/workflows/check.yml"), "on: [push]\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bun run check\n");
+    host.setBranch(ordinaryWork);
+    await host.runCommand("observe");
+    expect(host.sent).toHaveLength(1);
+    expect(String(host.sent[0]?.message.content)).toContain("Retro reference unavailable");
+    await host.commitMessage(host.sent[0]!.message);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{
+      kind: "project", target: { scope: "project", root, path: "invoice.test.js", mechanism: "Per-line discount rounding" },
+      priority: "evidence", gist: "Cover two half-cent lines in the existing invoice suite",
+      remedy: "Run the existing check with this test: total rounding returns 5, but per-line rounding charges 6.",
+      evidence: [{ quote: "The two-line discount preview quoted 5 cents, but checkout charged 6.", count: 1, source: "checkout-request" }],
+      change: { operation: "direct-edit", preview: `--- a/invoice.test.js\n+++ b/invoice.test.js\n@@ -3 +3,2 @@\n ${singleLine}\n+${regression}` },
+    }] });
+    expect(prepared.isError).toBeFalsy();
+    const selected = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
+    expect(selected.isError).toBeFalsy();
+    expect(selected.details).toMatchObject({
+      selected: [{ proposal: { target: { path: "invoice.test.js" }, preview: expect.stringContaining(regression) } }],
+      deferred: [],
+    });
+    expect(readFileSync(join(root, "invoice.js"), "utf8")).toBe(invoice);
+    expect(readFileSync(join(root, "invoice.test.js"), "utf8")).toBe(tests);
+    expect(existsSync(host.ledgerFile)).toBe(false);
   });
 
   it("starts one turn carrying current evidence and skill provenance", async () => {
@@ -567,12 +702,14 @@ describe("/observe", () => {
     expect(new Set(refs).size).toBe(refs.length);
   });
 
-  it("runs a pass for a note alone, in a session with no signals", async () => {
+  it("runs a pass for an explicit User note alone and makes it a source lead", async () => {
     const host = loadExtension();
-    host.setBranch(fx.plainUserMessage);
-    await host.runCommand("observe", "jj-vcs keeps suggesting git commands");
+    const note = "Check whether push CI runs the project's existing test command.";
+    await host.runCommand("observe", note);
     expect(host.sent).toHaveLength(1);
-    expect(String(host.sent[0]?.message.content)).toContain("jj-vcs keeps suggesting git commands");
+    const message = host.sent[0]?.message;
+    expect(message?.details?.observationLeads?.leads).toEqual([{ kind: "note", ref: expect.any(String), text: note }]);
+    expect(String(message?.content)).toContain(note);
   });
 
   it("treats a blank note as no note: a session without signals still has nothing to observe", async () => {
@@ -600,6 +737,7 @@ describe("retrospective availability", () => {
   const retroBranches = [
     ["a workflow outline", fx.skillLessTurn, true],
     ["a tool error", fx.skillTurnToolError, true],
+    ["ordinary completed work", ordinaryWork, true],
     ["only a correction", [...fx.plainUserMessage, ...fx.steeringUserMessage], false],
   ] as const;
 
@@ -613,15 +751,15 @@ describe("retrospective availability", () => {
     expect(host.activeTools()).toContain("observer_resolve");
   });
 
-  it.each(retroBranches)("with %s, inlines the installed retro body without its frontmatter only under the project gate", async (_label, branch, projectGate) => {
+  it.each(retroBranches)("with %s, points to optional categories without inlining the standalone workflow", async (_label, branch, projectGate) => {
     const host = loadExtension();
     mkdirSync(join(host.skillHome.roots.skillsDir, "retro"), { recursive: true });
     writeFileSync(join(host.skillHome.roots.skillsDir, "retro", "SKILL.md"), `---\nname: retro\ndescription: Run a retrospective.\ndisable-model-invocation: true\n---\n\n${RETRO_BODY}\n`);
     host.setBranch([...branch]);
     await host.runCommand("observe");
     const content = String(host.sent[0]?.message.content);
-    expect(content.includes(RETRO_BODY)).toBe(projectGate);
-    expect(content).not.toContain("description: Run a retrospective.");
+    expect(content.includes(`\`${join(host.skillHome.roots.skillsDir, "retro", "SKILL.md")}\``)).toBe(projectGate);
+    expect(content).not.toContain(RETRO_BODY);
     expect(host.noticeEvents.filter((notice) => notice.type === "warning")).toEqual([]);
     expect(host.sent).toHaveLength(1);
   });
@@ -856,6 +994,10 @@ const observerBytes = (host: ReturnType<typeof loadExtension>) =>
   ({ ...ownedFiles(host), ledger: existsSync(host.ledgerFile) ? readFileSync(host.ledgerFile, "base64") : null });
 const resolve = (host: ReturnType<typeof loadExtension>, outcomes: unknown[]) => host.callTool("observer_resolve", { outcomes });
 const failures = (result: ToolResult<unknown>) => (result.details as { failures: string[] }).failures;
+const rejectionReasons = (result: ToolResult<unknown>) => {
+  const details = result.details as { rejected: Array<{ reason: string }> };
+  return details.rejected.map(({ reason }) => reason);
+};
 
 const lastCallId = (host: ReturnType<typeof loadExtension>) => String(host.getBranch().at(-1)?.message?.toolCallId);
 
@@ -948,7 +1090,7 @@ async function approve(host: ReturnType<typeof loadExtension>, candidates: Reado
 }
 
 type ReferenceDraft = Array<{ name: string; body: string }>;
-/** A stale amendment the user answers by selecting `select`; `body` and `references` draft its Update, which is offered only with a body. */
+/** A stale amendment's native choice. An orphaned amendment can offer Delete alone. */
 interface StaleDraft { rule: string; select: "Update" | "Delete"; skill?: string; kind?: string; body?: string; references?: ReferenceDraft }
 /** A withdrawal of the applied fix under `fingerprint`, recorded with `gist`; `body` and `references` rewrite the skill's on-read amendment without it. */
 interface WithdrawalDraft { fingerprint: unknown; gist: string; skill?: string; kind?: string; body?: string; references?: ReferenceDraft }
@@ -983,7 +1125,14 @@ async function approveAll(
   { stale = [], withdrawals = [], fixes = [], rules = [], compactions = [], note }:
     { stale?: StaleDraft[]; withdrawals?: WithdrawalDraft[]; fixes?: OnReadDraft[]; rules?: RuleProposalDraft[]; compactions?: CompactionDraft[]; note?: string },
 ) {
-  const candidates = [...stale.flatMap(staleCandidates), ...withdrawals.map(withdrawalCandidate), ...fixes.map(onReadCandidate), ...rules.map(ruleCandidate),
+  const provenance = createProvenanceResolver(host.skillHome.roots);
+  const staleDrafts = stale.flatMap((draft) => {
+    const kind = provenance.byName(draft.skill ?? "tdd").kind;
+    if (draft.body !== undefined || (kind !== "upstream" && kind !== "plugin")) return staleCandidates(draft);
+    const rule = amendments.readObserverRule({ rulesDir: host.rulesDir, amendmentsDir: host.amendmentsDir }, draft.rule);
+    return staleCandidates({ ...draft, body: rule.body });
+  });
+  const candidates = [...staleDrafts, ...withdrawals.map(withdrawalCandidate), ...fixes.map(onReadCandidate), ...rules.map(ruleCandidate),
     ...compactions.map(compactionCandidate)];
   const { entry, approval } = await approveCandidates(host, candidates, (proposal) => {
     const option = stale.find(({ rule }) => proposal.gist === staleGist(rule))?.select ?? "Apply";
@@ -1011,8 +1160,10 @@ const approveOnRead = (host: ReturnType<typeof loadExtension>, drafts: readonly 
 const approveRules = (host: ReturnType<typeof loadExtension>, drafts: readonly RuleProposalDraft[], answer?: AnswerUser) =>
   approve(host, drafts.map(ruleCandidate), answer);
 /** Runs the registered Prepare over pattern amendment and barrier rule drafts. */
-const prepareRules = (host: ReturnType<typeof loadExtension>, drafts: readonly RuleProposalDraft[]) =>
-  host.callTool("observer_review", { action: "prepare", candidates: drafts.map(ruleCandidate) });
+const prepareRules = (host: ReturnType<typeof loadExtension>, drafts: readonly RuleProposalDraft[]) => {
+  startPass(host);
+  return host.callTool("observer_review", { action: "prepare", candidates: drafts.map(ruleCandidate) });
+};
 
 describe("observer_review selection", () => {
   const candidate = (gist: string, priority = "evidence", count = 1) => ({
@@ -1059,15 +1210,166 @@ describe("observer_review selection", () => {
     expect(suppressed.details).toMatchObject({ eligible: [], judgeStates: {}, needsRanking: false });
   });
 
+  it("reports a rejected draft and uses the independent prepared reference through native Apply and Resolve", async () => {
+    const host = loadExtension();
+    host.setBranch([...fx.plainUserMessage, ...fx.skillUrlRead]);
+    await host.runCommand("observe", "Review the missing check guidance");
+    await host.commitMessage(host.sent[0]!.message);
+    const good = candidate("Document the working check");
+    const bad = { ...candidate("Draft missing its body"), change: { operation: "on-read-append", section: "" } };
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [bad, good] });
+    expect(prepared.isError).toBe(false);
+    const output = JSON.parse(resultText(prepared));
+    expect(output.eligible).toHaveLength(1);
+    expect(output.rejected).toHaveLength(1);
+    expect(output).toMatchObject({
+      eligible: [{ gist: good.gist, reference: expect.any(Object) }],
+      rejected: [{ index: 0, gist: bad.gist, reason: expect.stringContaining("needs its `section`") }],
+      failures: [],
+    });
+    const [entry] = reviewEntries(prepared);
+    const badRef = { ...entry!.reference, candidateId: `proposal:${proposalFingerprint("tdd", bad.gist)}` };
+    const refused = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference, badRef] });
+    expect(refused.isError).toBe(true);
+    expect(JSON.parse(resultText(refused))).not.toHaveProperty("askHtml");
+    expect(failures(await resolve(host, [{ proposal: badRef, outcome: "declined" }]))).toEqual([expect.stringContaining("no single proposal")]);
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [entry!.reference] });
+    const selectionToolCallId = lastCallId(host);
+    const askToolCallId = askUser(host, selection);
+    const result = await resolve(host, [{
+      outcome: "applied", approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId },
+    }]);
+    expect(failures(result)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toMatchObject([{ gist: good.gist, outcome: "applied" }]);
+    expect(readFileSync(join(host.amendmentsDir, "tdd-amendment.md"), "utf8")).toContain(good.change.section);
+  });
+
+  it.each(["absent pass", "ended pass", "unreadable common ledger"] as const)("emits no successful Prepare for an %s", async (failure) => {
+    const host = loadExtension();
+    const root = host.skillHome.roots.cwd;
+    if (failure !== "absent pass") startPass(host);
+    if (failure === "ended pass") await host.commitPrompt("A different request");
+    if (failure === "unreadable common ledger") {
+      mkdirSync(dirname(host.ledgerFile), { recursive: true });
+      writeFileSync(host.ledgerFile, "Not an observer store");
+    }
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{
+      kind: "project", target: { scope: "project", root, path: "checks.json", mechanism: "Wire check" },
+      gist: "Wire check", remedy: "Wire the existing check", priority: "note", change: { operation: "direct-edit", preview: "Exact patch" },
+    }] });
+    expect(prepared.isError).toBe(true);
+    expect(prepared.details).toMatchObject({
+      eligible: [], rejected: [],
+      failures: [expect.stringContaining(failure === "unreadable common ledger" ? "invalid or unsupported SQLite header" : "no observation pass is current")],
+    });
+  });
+
+  it("refuses an otherwise valid Select reference when another entry corrupts its shared Prepare receipt", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [candidate("First fix"), candidate("Sibling fix")] });
+    const [first] = reviewEntries(prepared);
+    const saved = host.getBranch().at(-1)?.message?.details as { eligible: ReviewEntry[] };
+    saved.eligible[1]!.proposal.preview += "\nSubstituted.";
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [first!.reference] });
+    expect(selection.isError).toBe(true);
+    expect(selection.details).toMatchObject({ eligible: [], selected: [], failures: [expect.stringContaining("saved proposal no longer matches")] });
+    expect(JSON.parse(resultText(selection))).not.toHaveProperty("askHtml");
+  });
+
+  it("keeps fresh drafts when a stale inspection rejects only its dependants and their compaction", async () => {
+    const host = loadExtension();
+    splitAmendment(host, "tdd", "tdd-amendment");
+    startPass(host);
+    const inspected = await host.callTool("observer_review", { action: "inspect", skill: "tdd" });
+    const receipt = inspected.details as { inspection: { sources: Array<{ path: string }> } };
+    const [source] = receipt.inspection.sources;
+    const diagnosis = {
+      inspection: lastCallId(host), explanation: "The old guidance has no check.", delta: "Name the check first.",
+      citations: [{ source: source!.path, lines: { from: 1, to: 1 } }],
+    };
+    changeSkillFile(host, "tdd");
+    const stale = { ...candidate("Name the check"), diagnosis };
+    const independent = { ...candidate("Define the term first"), skill: "domain-modeling" };
+    const compaction = compactionCandidate({ includes: [stale.gist], body: "## Short\n\nName the check first." });
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [stale, independent, compaction] });
+    expect(prepared.isError).toBe(false);
+    expect(JSON.parse(resultText(prepared))).toMatchObject({
+      eligible: [{ gist: independent.gist }],
+      rejected: [
+        { index: 0, gist: stale.gist, reason: expect.stringContaining("is no longer current") },
+        { index: 2, gist: compaction.gist, reason: expect.stringContaining("names no on-read append") },
+      ],
+    });
+  });
+
+  it("fails the entire Prepare when a cited successful inspection receipt is corrupt", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const result = await host.callTool("observer_review", { action: "inspect", skill: "tdd" });
+    const receipt = result.details as { inspection: { sources: Array<{ path: string }> } };
+    const inspection = lastCallId(host);
+    host.getBranch().at(-1)!.message!.details = {};
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
+      { ...candidate("Define the term first"), skill: "domain-modeling" },
+      { ...candidate("Name the check"), diagnosis: {
+        inspection, explanation: "No check is named.", delta: "Name the check first.",
+        citations: [{ source: receipt.inspection.sources[0]!.path, lines: { from: 1, to: 1 } }],
+      } },
+    ] });
+    expect(prepared.isError).toBe(true);
+    expect(prepared.details).toMatchObject({ eligible: [], rejected: [], failures: [expect.stringContaining("saved inspection receipt is corrupt")] });
+  });
+
+  it("rejects conflicting identities, incomplete stale choices, and compactions that omit covered fixes", async () => {
+    const host = loadExtension();
+    splitAmendment(host, "tdd", "tdd-stale");
+    splitAmendment(host, "domain-modeling", "domain-modeling-amendment");
+    startPass(host);
+    const conflicting = candidate("Check first");
+    const eligible = { ...candidate("Define the term first"), skill: "domain-modeling" };
+    const [update, remove] = staleCandidates({ rule: "tdd-stale", select: "Update", body: " " });
+    const compaction = compactionCandidate({ skill: "domain-modeling", includes: [], body: "## Short\n\nOther instructions." });
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
+      conflicting, { ...conflicting, change: { operation: "on-read-append", section: "## Different check\n\nDo this instead." } },
+      update, remove, eligible, compaction,
+    ] });
+    expect(prepared.isError).toBe(false);
+    expect(reviewEntries(prepared).map(({ proposal }) => proposal.gist)).toEqual([eligible.gist]);
+    expect(JSON.parse(resultText(prepared)).rejected).toEqual([
+      { index: 0, gist: conflicting.gist, reason: expect.stringContaining("conflicting changes for the same identity") },
+      { index: 1, gist: conflicting.gist, reason: expect.stringContaining("conflicting changes for the same identity") },
+      { index: 2, gist: update!.gist, reason: expect.stringContaining("stale Update needs") },
+      { index: 3, gist: remove!.gist, reason: expect.stringContaining("stale Update needs") },
+      { index: 5, gist: compaction.gist, reason: expect.stringContaining(`leaves out eligible on-read fixes: "${eligible.gist}"`) },
+    ]);
+  });
+
+  it("does not show a compaction when Select omits the prepared fix it would absorb", async () => {
+    const host = loadExtension();
+    splitAmendment(host, "tdd", "tdd-amendment");
+    startPass(host);
+    const fix = candidate("Check the outcome");
+    const compaction = compactionCandidate({ includes: [fix.gist], body: "## Short\n\nCheck the outcome." });
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [fix, compaction] });
+    const [addition, compacted] = reviewEntries(prepared);
+    const omitted = await host.callTool("observer_review", { action: "select", proposals: [compacted!.reference] });
+    expect(failures(omitted)).toEqual([expect.stringContaining("with exactly the on-read appends it covers")]);
+    expect(JSON.parse(resultText(omitted))).not.toHaveProperty("askHtml");
+    const complete = await host.callTool("observer_review", { action: "select", proposals: [compacted!.reference, addition!.reference] });
+    expect(reviewEntries(complete, "selected").map(({ proposal }) => proposal.gist)).toEqual([fix.gist, compaction.gist]);
+  });
+
   it("rejects out-of-scope project review candidates without recording any outcome", async () => {
     const host = loadExtension();
     const root = host.skillHome.roots.cwd;
+    startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [{
       kind: "project", target: { scope: "project", root, path: "../outside.json", mechanism: "Escape" },
       gist: "Escape", priority: "note", remedy: "Write outside", change: { operation: "direct-edit", preview: "Unscoped diff" },
     }] });
-    expect(result.isError).toBe(true);
-    expect(result.details).toMatchObject({ eligible: [], selected: [], deferred: [], failures: [expect.any(String)] });
+    expect(result.isError).toBe(false);
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.any(String) }] });
     expect(existsSync(host.ledgerFile)).toBe(false);
   });
 
@@ -1077,7 +1379,7 @@ describe("observer_review selection", () => {
     splitAmendment(host, "domain-modeling", "domain-modeling-amendment");
     const candidates = [
       candidate("Low evidence", "evidence", 1), candidate("High evidence", "evidence", 4),
-      { ...candidate("Stale update"), priority: "stale", change: { operation: "stale-update", rule: "tdd-stale", body: "Rewritten stale body." } },
+      ...staleCandidates({ rule: "tdd-stale", select: "Update", body: "Rewritten stale body." }),
       candidate("Explicit note", "note", 1), candidate("Other evidence", "evidence", 2),
       { ...candidate("Compact guidance"), skill: "domain-modeling", priority: "compaction", change: { operation: "compaction", includes: [], body: "## Compact\n\nShorter.", references: [] } },
       candidate("Overflow evidence", "evidence", 1),
@@ -1093,9 +1395,15 @@ describe("observer_review selection", () => {
       ],
       deferred: [{ proposal: { gist: "Overflow evidence" } }, { proposal: { priority: "compaction" } }],
     });
-    const { deferred: [overflow] } = JSON.parse(resultText(result));
-    expect(failures(await host.callTool("observer_resolve", { outcomes: [{ proposal: overflow, outcome: "later" }] }))).toEqual([]);
-    expect(ledgerRecords(host.ledgerFile).at(-1)).toMatchObject({ gist: "Overflow evidence", outcome: "later", evidence: [{ quote: "Evidence for Overflow evidence", count: 1 }] });
+    const { deferred: [overflow], deferredReason, askHtml } = JSON.parse(resultText(result));
+    expect(deferredReason).toContain("five other proposals filled the main Ask");
+    expect(askHtml).not.toContain(overflow.candidateId);
+    askUser(host, result);
+    const declined = await resolve(host, [{ proposal: overflow, outcome: "declined" }]);
+    expect(failures(declined)).toEqual([expect.stringContaining("was not answered")]);
+    const later = await resolve(host, [{ proposal: overflow, outcome: "later" }]);
+    expect(failures(later)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile).slice(2)).toMatchObject([{ gist: "Overflow evidence", outcome: "later", reoffer: deferredReason, evidence: [{ quote: "Evidence for Overflow evidence", count: 1 }] }]);
   });
 
   it.each(["missing", "failed", "partial", "low confidence", "inconsistent", "unknown ID", "duplicate ID"] as const)(
@@ -1271,7 +1579,7 @@ describe("observer_review prepared proposals", () => {
     const host = loadExtension();
     startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...onReadCandidate({ gist: "Name the seam", section: SEAMS }), ...fields }] });
-    expect(failures(result)).toEqual([`\`${field}\` bolds 3 phrases; bold at most two`]);
+    expect(rejectionReasons(result)).toEqual([`\`${field}\` bolds 3 phrases; bold at most two`]);
   });
 
   it("suppresses a declined proposal whose target is no longer writable, and prepares the rest", async () => {
@@ -1380,6 +1688,7 @@ describe("observer_review prepared proposals", () => {
     expect(JSON.parse(resultText(selected))).toEqual({
       selected: [eligible[1]?.reference, eligible[0]?.reference], deferred: [],
       askHtml: expect.stringMatching(/^<form>/), failures: [],
+      guidance: expect.stringContaining("## 3. Ask"),
     });
     expect(ownedFiles(host)).toEqual(before);
   });
@@ -1411,6 +1720,7 @@ describe("observer_review prepared proposals", () => {
         { ...shown(question), kind: "upstream", skill: "grill-with-docs", previews: question?.proposal.alternatives?.map(({ preview }) => preview) },
       ],
       needsRanking: false, judgeStates: {}, failures: [],
+      guidance: expect.stringContaining("## 3. Select"),
     });
     expect(resultText(prepared)).not.toContain("the quoted signal");
   });
@@ -1513,8 +1823,8 @@ describe("observer_review prepared proposals", () => {
       await host.callTool("observer_resolve", { outcomes: [] });
       return { proposals: [{ ...reference, reviewToolCallId: lastCallId(host) }] };
     }],
-    ["a failed Prepare", "did not succeed", async ({ host, draft, reference }) => {
-      const failed = await host.callTool("observer_review", { action: "prepare", candidates: [draft, { ...draft, kind: "project" }] });
+    ["a failed Prepare", "did not succeed", async ({ host, reference }) => {
+      const failed = await host.callTool("observer_review", { action: "prepare" });
       expect(failed.isError).toBe(true);
       return { proposals: [{ ...reference, reviewToolCallId: lastCallId(host) }] };
     }],
@@ -1570,19 +1880,22 @@ describe("observer_review prepared proposals", () => {
       body: `## Short\n\nWhen you need r.md, read \`${join(referencesDir(host), "tdd", "r.md")}\`.`, references: [{ name: "r.md", body: "One.\r\nTwo." }] } })],
   ])("refuses %s at Prepare, which the Ask would preview without it", async (_label, draft) => {
     const host = loadExtension();
+    startPass(host);
+    splitAmendment(host, "tdd", "tdd-amendment");
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [{ kind: "upstream", skill: "tdd", gist: "Name the seam", remedy, ...draft(host) }] });
-    expect(result.isError).toBe(true);
-    expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining("carriage return")] });
+    expect(result.isError).toBe(false);
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining("carriage return") }] });
   });
 
   it("refuses at Prepare a compaction over a reference folder holding a subfolder, which replacing it would delete unseen", async () => {
     const host = loadExtension();
+    startPass(host);
     const nested = join(referencesDir(host), "tdd", "drafts", "keep.md");
     mkdirSync(dirname(nested), { recursive: true });
     writeFileSync(nested, "The user's draft.\n");
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [{ kind: "upstream", skill: "tdd", gist: "Compact", remedy,
       priority: "compaction", change: { operation: "compaction", includes: [], body: "## Short\n\nName the seam.", references: [] } }] });
-    expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining("holds more than reference files")] });
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining("holds more than reference files") }] });
     expect(readFileSync(nested, "utf8")).toBe("The user's draft.\n");
   });
 
@@ -1594,8 +1907,9 @@ describe("observer_review prepared proposals", () => {
     ["a rule for a new skill", { kind: "new", skill: "deploy-notes", change: { operation: "rule", name: "notes", body: "Draft notes.", pattern: "notes" } }, "prepare its barrier rule once the skill exists"],
   ])("names the Prepare field of %s", async (_label, draft, reason) => {
     const host = loadExtension();
+    startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [{ gist: "Name the seam", priority: "evidence", remedy, ...draft }] });
-    expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining(reason) }] });
   });
 });
 
@@ -1810,6 +2124,9 @@ describe("proposal approval of on-read appends", () => {
       { type: "message", id: "text", message: { role: "assistant", content: [{ type: "text", text: "Recording the answers." }] } },
     );
     host.setBranch(JSON.parse(JSON.stringify(host.getBranch())));
+    const recovered = await host.callTool("observer_review", { action: "record" });
+    expect(resultText(recovered)).toContain("## 4. Apply");
+    expect(resultText(recovered)).toContain("## 5. Record");
     const result = await resolve(host, [applied]);
     expect(result.isError).toBeFalsy();
     expect(readRule(amendment(host)).body).toBe("## Seams\n\nName the seam first.");
@@ -1907,8 +2224,7 @@ describe("proposal reconciliation of on-read appends", () => {
   ])("refuses to prepare %s", async (_label, reason, overrides) => {
     const fixture = await changedAfterApproval();
     const result = await prepareRevision(fixture.host, reviseCandidate(fixture, overrides(fixture)));
-    expect(result.isError).toBe(true);
-    expect((result.details as { failures: string[] }).failures).toEqual([expect.stringContaining(reason)]);
+    expect(rejectionReasons(result)).toEqual([expect.stringContaining(reason)]);
   });
 
   it("refuses to prepare a revision for an amendment that did not change", async () => {
@@ -1916,7 +2232,7 @@ describe("proposal reconciliation of on-read appends", () => {
     await addOnReadFix(host, "tdd", "Name the seam before the first test.", SEAMS);
     const [applied] = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }]);
     const result = await prepareRevision(host, reviseCandidate({ host, applied: applied! }));
-    expect((result.details as { failures: string[] }).failures).toEqual([expect.stringContaining("unchanged")]);
+    expect(rejectionReasons(result)).toEqual([expect.stringContaining("unchanged")]);
   });
 
   it.each<[string, string, (fixture: Changed, answer: Awaited<ReturnType<typeof reconciled>>) => unknown]>([
@@ -1993,7 +2309,7 @@ describe("proposal reconciliation of on-read appends", () => {
     it("covers the note and a target changed after Prepare with one revision, which states how the target changed", async () => {
       const fixture = await noted();
       appendFileSync(amendment(fixture.host), `\n${MINE}\n`);
-      expect(failures(await revise(fixture))).toEqual([expect.stringContaining("changedTarget")]);
+      expect(rejectionReasons(await revise(fixture))).toEqual([expect.stringContaining("changedTarget")]);
       const answer = await citing(fixture, { reconciles: { approval: fixture.applied.approval, ...judgment, changedTarget: claim.changedTarget } });
       const result = await resolve(fixture.host, [answer]);
       expect(result.isError).toBeFalsy();
@@ -2017,7 +2333,7 @@ describe("proposal reconciliation of on-read appends", () => {
       ["under another ledger identity", "approved proposal's own", { gist: "Reds are diffs of assertions." }],
     ])("refuses to prepare a revision %s", async (_label, reason, overrides) => {
       const result = await revise(await noted(), overrides);
-      expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
+      expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining(reason) }] });
     });
 
     it("writes nothing for a revision saved before the user answered", async () => {
@@ -2623,13 +2939,13 @@ describe("observer hook and companion intents", () => {
     ["a companion change naming a file", { root: "companion", path: "index.ts" }, "not by a file"],
   ])("refuses a target with %s", async (_label, target, reason) => {
     const host = loadExtension();
+    startPass(host);
     const hooks = join(agentDir(host), "hooks/pre");
     mkdirSync(hooks, { recursive: true });
     symlinkSync(host.skillHome.home, join(hooks, "out"));
     const { root = "global-hooks", ...rest } = target;
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [intent(String(root), "Escape", rest)] });
-    expect(result.isError).toBe(true);
-    expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining(reason) }] });
   });
 
   it.each<[string, string, string, (root: string) => void]>([
@@ -2646,11 +2962,11 @@ describe("observer hook and companion intents", () => {
     const root = host.skillHome.roots.cwd;
     arrange(root);
     const target = { scope: "project", root, path, mechanism: "Block git commit" };
+    startPass(host);
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{
       kind: "project", target, gist: "Block git commit", priority: "evidence", remedy: "Write a hook", change: { operation: "direct-edit", preview: "export default () => {}" },
     }] });
-    expect(prepared.isError).toBe(true);
-    expect(failures(prepared)).toEqual([expect.stringContaining(`\`harness\` target scope, ${scope}`)]);
+    expect(rejectionReasons(prepared)).toEqual([expect.stringContaining(`\`harness\` target scope, ${scope}`)]);
     const resolved = await resolve(host, [{ kind: "project", target, gist: "Block git commit", outcome: "later" }]);
     expect(failures(resolved)).toEqual([expect.stringContaining(`\`harness\` target scope, ${scope}`)]);
   });
@@ -2725,8 +3041,7 @@ describe("observer hook and companion intents", () => {
       const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
         code("global-hooks", "Block git commit everywhere", approval, [{ path: `skill-observer-${fingerprint}.ts`, text: hookText }]),
       ] });
-      expect(prepared.isError).toBe(true);
-      expect(prepared.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
+      expect(prepared.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining(reason) }] });
     });
 
     it("shows the hook file's exact text, the check command and its result in an Ask of its own", async () => {
@@ -2783,7 +3098,7 @@ describe("observer hook and companion intents", () => {
       if (stage === "intent") {
         await askCode(host, candidate, () => "Decline");
         const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [codeCandidate] });
-        expect(failures(prepared)).toEqual([expect.stringContaining("superseded")]);
+        expect(rejectionReasons(prepared)).toEqual([expect.stringContaining("superseded")]);
         return;
       }
       const { entry, approval } = await askCode(host, codeCandidate);
@@ -2821,7 +3136,7 @@ describe("observer hook and companion intents", () => {
       const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
         code("global-hooks", "Block git commit everywhere", approval, [{ path: file, text: hookText }], {}, { command: command(file), output: checkOutput }),
       ] });
-      expect(failures(prepared)).toEqual([expect.stringContaining(HOOK_CHECK_PATH)]);
+      expect(rejectionReasons(prepared)).toEqual([expect.stringContaining(HOOK_CHECK_PATH)]);
     });
 
     it.each([
@@ -2884,7 +3199,7 @@ describe("observer hook and companion intents", () => {
       startPass(host);
       expect(String(host.sent.at(-1)?.message.content)).toMatch(/Block git commit here Re-offer when: A draft existed/);
       const again = await host.callTool("observer_review", { action: "prepare", candidates: [code("project-hooks", "Block git commit here", intentApproval, [{ path: file, text: hookText }])] });
-      expect(failures(again)).toEqual([expect.stringContaining("earlier observation pass")]);
+      expect(rejectionReasons(again)).toEqual([expect.stringContaining("earlier observation pass")]);
       const asIntent = await host.callTool("observer_review", { action: "prepare", candidates: [intent("project-hooks", "Block git commit here")] });
       expect(reviewEntries(asIntent).map(({ proposal: { fingerprint } }) => fingerprint)).toEqual([proposal.fingerprint]);
     });
@@ -3007,8 +3322,7 @@ describe("observer hook and companion intents", () => {
       }
       const { approval } = await askIntent(host, intent("companion", "Register a jj tool"));
       const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [companionCode(approval, files, checked)] });
-      expect(prepared.isError).toBe(true);
-      expect(failures(prepared)).toEqual([expect.stringContaining(reason)]);
+      expect(rejectionReasons(prepared)).toEqual([expect.stringContaining(reason)]);
     });
 
     it.each([
@@ -3087,9 +3401,9 @@ describe("observer hook and companion intents", () => {
       ["the companion extension", "companion", undefined, "only a hook file"],
     ] as const)("refuses removing %s", async (_label, root, path, reason) => {
       const host = loadExtension();
+      startPass(host);
       const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [removal(root, path)] });
-      expect(prepared.isError).toBe(true);
-      expect(failures(prepared)).toEqual([expect.stringContaining(reason)]);
+      expect(rejectionReasons(prepared)).toEqual([expect.stringContaining(reason)]);
     });
 
     it("refuses recording a removal once a folder above the hook leads out of the hooks directory", async () => {
@@ -3266,25 +3580,123 @@ describe("/observe with answers from earlier passes", () => {
     expect(ledgerList(content, "Later")).toContain("Ask one question at a time.");
   });
 
-  it("shows each fix's fingerprint, gist, date and quotes under its rule", async () => {
+  it("defers rich historical evidence until a keyed lookup during a registered pass", async () => {
     const host = loadExtension();
-    const evidence = [
-      { quote: "which seam is this testing?", count: 2 },
-      { quote: "the ticket names the seams", count: 1 },
-    ];
-    await host.callTool("observer_resolve", {
-      outcomes: await approveOnRead(host, [{ gist: "Take seams from the ticket.", section: "## Seams\n\nTake seams from the ticket.", evidence }]),
+    const cwd = host.skillHome.roots.cwd;
+    const sessions = join(cwd, ".fixture-sessions");
+    host.setSessionDir(sessions);
+    mkdirSync(sessions);
+    const historical = "earlier-observation-fixture";
+    const historicalFile = join(sessions, `2026-10-16_${historical}.jsonl`);
+    const decisive = "The ticket names the seams. Use its acceptance cases.";
+    const historicalId = "earlier-steering";
+    const historicalText = [
+      { type: "session", id: historical, cwd },
+      { type: "message", id: historicalId, message: { role: "user", steering: true, content: decisive } },
+      { type: "message", id: "prior-call", message: { role: "assistant", content: [{ type: "toolCall", id: "earlier-check", name: "bash", arguments: { command: "bun test" } }] } },
+      { type: "message", id: "prior-result", message: { role: "toolResult", toolCallId: "earlier-check", toolName: "bash", isError: true, content: [{ type: "text", text: "1 failed" }] } },
+    ].map((entry) => JSON.stringify(entry)).join("\n");
+    writeFileSync(historicalFile, historicalText);
+    splitAmendment(host, "tdd", "tdd-seams", { body: `## Seams\n\n${"Keep every approved check. ".repeat(170)}` });
+    markedRule(host, { name: "ts-no-tiny-functions", amends: "tdd", scope: "text", pinned: true });
+    const record = (skill: string, name: string, patch: Partial<SkillLedgerRecord>): SkillLedgerRecord => ({
+      skill, kind: "upstream", fingerprint: proposalFingerprint(skill, `Gist of ${name}.`),
+      gist: `Gist of ${name}.`, outcome: "applied", rule: join(host.amendmentsDir, `${name}.md`),
+      timestamp: "2026-10-16T12:00:00.000Z", sessionId: historical, ...patch,
     });
-    const [record] = ledgerRecords(host.ledgerFile);
+    const oldQuote = `Old bulk quote: ${"This entire historical excerpt is not needed in every pass. ".repeat(22)}`;
+    const amendments = Array.from({ length: 12 }, (_, index) => record("tdd", "tdd-seams", {
+      gist: `Retained fix ${index}.`, fingerprint: proposalFingerprint("tdd", `Retained fix ${index}.`),
+      evidence: [{ quote: `${index} ${oldQuote}`, count: 1 }],
+    }));
+    const prior = record("tdd", "tdd-seams", {
+      evidence: [{ quote: 'Tool error in `bash` "bun test": "1 failed"', count: 1, occurrenceIds: ["tool-result:earlier-check:tool-error:"] }],
+    });
+    const duplicate = record("domain-modeling", "dm-terms", {
+      outcome: "declined", evidence: [{ quote: decisive, count: 1, occurrenceIds: [`${historicalId}:steering:`] }],
+    });
+    const withdrawn = record("tdd", "tdd-retired", {
+      outcome: "withdrawn", sessionId: "deleted-fixture-session", evidence: [{ quote: "Unverified old excerpt.", count: 1 }],
+    });
+    const projectTarget = (root: string) => canonicalProjectTarget(root, {
+      scope: "project", root, path: "package.json", mechanism: "Run the fixture check.",
+    });
+    const foreignRoot = join(host.skillHome.home, "foreign-project");
+    mkdirSync(foreignRoot);
+    const foreign: LedgerRecord = {
+      kind: "project", target: projectTarget(foreignRoot), fingerprint: projectFingerprint(projectTarget(foreignRoot)),
+      gist: "Foreign project decision must stay hidden.", outcome: "declined", sessionId: historical, timestamp: "2026-10-16T12:00:00.000Z",
+    };
+    const localTarget = projectTarget(cwd);
+    const local = { ...foreign, target: localTarget, fingerprint: projectFingerprint(localTarget), gist: "Same project decision." };
+    const global = record("domain-modeling", "dm-global", {
+      sessionId: "foreign-source", evidence: [{ quote: "Private foreign transcript excerpt.", count: 1,
+        occurrenceIds: [`${historicalId}:steering:`] }],
+    });
+    writeFileSync(join(sessions, "2026-10-16_foreign-source.jsonl"), [
+      { type: "session", id: "foreign-source", cwd: foreignRoot },
+      { type: "message", id: historicalId, message: { role: "user", content: "Private foreign transcript excerpt." } },
+    ].map((entry) => JSON.stringify(entry)).join("\n"));
+    const inconclusive = record("tdd", "ts-no-tiny-functions", {});
+    seedLedger(host.ledgerFile, [...amendments, prior, duplicate, withdrawn, foreign, local, global, inconclusive]);
+    host.setBranch([
+      ...fourSkillsLoaded.filter((entry) => !fx.physicalSkillRead.includes(entry)),
+      { type: "ttsr_injection", id: "fixture-rule-fired", injectedRules: ["ts-no-tiny-functions"] },
+      { type: "custom", id: "delivery-evidence", customType: AMENDMENT_DELIVERY_TYPE, data: { skill: "tdd", rules: ["tdd-seams"] } },
+      { type: "message", id: "recur-call", message: { role: "assistant", content: [{ type: "toolCall", id: "recur", name: "bash", arguments: { command: "bun test" } }] } },
+      { type: "message", id: "recur-result", message: { role: "toolResult", toolCallId: "recur", toolName: "bash", isError: true, content: [{ type: "text", text: "1 failed" }] } },
+    ]);
+    const ledgerBefore = readFileSync(host.ledgerFile);
+    await host.runCommand("observe-report");
+    expect(host.sent).toHaveLength(0);
+    const beforePass = host.notices.at(-1);
+    await host.runCommand("observe");
+    const payload = String(host.sent.at(-1)?.message.content);
+    const rules = ledgerList(payload, RULES_IN_FORCE);
+    expect(rules.length).toBeLessThan(2_500);
+    expect(rules).not.toContain("Old bulk quote");
+    expect(rules).toContain('sections "Seams"');
+    expect(rules).toContain("over the compaction limit");
+    expect(rules).toContain("fired 1 time");
+    expect(rules).toContain(prior.fingerprint);
+    expect(rules).not.toContain(withdrawn.fingerprint);
+    expect(payload).toContain(`${prior.fingerprint}: recurrence`);
+    expect(payload).toContain(`${inconclusive.fingerprint}: inconclusive`);
+    expect(payload).toContain("not loaded in this session");
+    expect(payload).not.toContain(decisive);
+    const estimate = beforePass?.match(/rules-in-force (\d+)/)?.[0];
+    expect(estimate).toEqual(expect.any(String));
+    expect(estimate).toBe(host.notices.at(-1)?.match(/rules-in-force (\d+)/)?.[0]);
 
-    const lines = skillEntry(await observe(host, fourSkillsLoaded), "tdd").split("\n");
-    const rule = lines.findIndex((l) => l.includes("`tdd-amendment`"));
-    const fix = lines[rule + 1] ?? "";
-    expect(fix).toContain("Take seams from the ticket.");
-    expect(fix).toContain(String(record?.fingerprint));
-    expect(fix).toContain(String(record?.timestamp).slice(0, 10));
-    expect(fix).toContain('"which seam is this testing?" (×2)');
-    expect(fix).toContain('"the ticket names the seams" (×1)');
+    await host.commitMessage(host.sent.at(-1)!.message);
+    const lookup = async (key: Record<string, string>, cursor?: string) => {
+      const result = await host.callTool("observer_review", { action: "evidence", key, ...(cursor && { cursor }) });
+      expect(result.isError).not.toBe(true);
+      return JSON.parse(resultText(result));
+    };
+    const named = await lookup({ skill: "domain-modeling" });
+    expect(named.matches).toContainEqual(expect.objectContaining({
+      fingerprint: duplicate.fingerprint, outcome: "declined",
+      evidence: [expect.objectContaining({ quote: decisive, primary: [expect.objectContaining({ sessionId: historical, entryId: historicalId })] })],
+    }));
+    expect(named.matches).toContainEqual(expect.objectContaining({ fingerprint: global.fingerprint, scope: "global", gaps: expect.arrayContaining([expect.stringMatching(/source unavailable/i)]) }));
+    expect(JSON.stringify(named)).not.toMatch(/Private foreign transcript excerpt|foreign-source/);
+    const byRule = await lookup({ rule: "tdd-seams" });
+    expect(byRule.matches).toContainEqual(expect.objectContaining({
+      fingerprint: prior.fingerprint, remedyOutcome: "recurrence", remedyEvidence: ["tool-result:recur"],
+      evidence: [expect.objectContaining({ primary: [{ sessionId: historical, entryId: "prior-result", file: historicalFile }] })],
+    }));
+    expect(byRule.next).toEqual(expect.any(String));
+    expect((await lookup({ rule: "tdd-seams" }, byRule.next)).matches).toContainEqual(expect.objectContaining({ fingerprint: amendments[0]!.fingerprint }));
+    expect((await lookup({ fingerprint: withdrawn.fingerprint })).matches).toEqual([
+      expect.objectContaining({ outcome: "withdrawn", gaps: expect.arrayContaining([expect.stringMatching(/source unavailable/i)]) }),
+    ]);
+    expect((await lookup({ fingerprint: foreign.fingerprint })).matches).toEqual([]);
+    expect((await lookup({ fingerprint: local.fingerprint })).matches).toEqual([
+      expect.objectContaining({ fingerprint: local.fingerprint, scope: "project" }),
+    ]);
+    expect(readFileSync(host.ledgerFile)).toEqual(ledgerBefore);
+    expect(readFileSync(historicalFile, "utf8")).toBe(historicalText);
   });
 
   it("lists the rule an old merge wrote as in force, and none of the fixes its `merged` records replaced", async () => {
@@ -3700,7 +4112,6 @@ describe("observer_resolve with upstream fixes", () => {
 
     const result = await prepareRules(host, [{ skill: "tdd", kind: "upstream", gist: "Run the whole file.", rule: { ...focusedTestsRule, name: "domain-modeling-amendment" } }]);
 
-    expect(result.isError).toBe(true);
     expect(resultText(result)).toContain(join(host.amendmentsDir, "domain-modeling-amendment.md"));
     expect(rulesWritten(host)).toEqual(["domain-modeling-amendment.md"]);
   });
@@ -3711,7 +4122,7 @@ describe("observer_resolve with upstream fixes", () => {
     const result = await prepareRules(host, [{ skill: "tdd", kind: "upstream", gist: "Keep each test at one seam.",
       rule: { name: "tdd-seams", body: "Test at one seam only.", pattern: "\\bseams\\b", matches: ["two seams"], spares: ["one seam"] } }]);
 
-    expect(result.isError).toBe(true);
+    expect(rejectionReasons(result)).toHaveLength(1);
     expect(reviewEntries(result)).toEqual([]);
     expect(readRule(join(host.amendmentsDir, "tdd-seams.md")).body).toBe("Name the seam first.");
   });
@@ -3722,11 +4133,12 @@ describe("observer_resolve with upstream fixes", () => {
     ["a section that opens with no `##` heading", "tdd", "Fix.\n\n## Later heading\n\nMore."],
   ])("prepares no on-read append for %s, so nothing can approve it", async (_label, skill, section) => {
     const host = loadExtension();
+    startPass(host);
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
       { kind: "upstream", skill, gist: "Fix the skill.", priority: "evidence", remedy: "Fix it", change: { operation: "on-read-append", section } },
     ] });
 
-    expect(prepared.isError).toBe(true);
+    expect(rejectionReasons(prepared)).toHaveLength(1);
     expect(reviewEntries(prepared)).toEqual([]);
     expect(rulesWritten(host)).toEqual([]);
   });
@@ -3743,7 +4155,7 @@ describe("observer_resolve with upstream fixes", () => {
     const host = loadExtension();
     const result = await prepareRules(host, [{ skill: "tdd", kind: "upstream", gist: "Fix the skill.", rule: rule as PatternRule }]);
 
-    expect(result.isError).toBe(true);
+    expect(rejectionReasons(result)).toHaveLength(1);
     expect(reviewEntries(result)).toEqual([]);
     expect(rulesWritten(host)).toEqual([]);
     expect(existsSync(dirname(host.rulesDir) + "/escape.md")).toBe(false);
@@ -3861,8 +4273,7 @@ describe("withdrawing applied fixes", () => {
 
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [withdrawalCandidate({ fingerprint: red?.fingerprint, gist: "A red is an assertion diff." })] });
 
-    expect(result.isError).toBe(true);
-    expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining("the withdrawal needs its `body`")] });
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining("the withdrawal needs its `body`") }] });
     expect(readFileSync(file, "utf8")).toBe(rule);
     expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
   });
@@ -3930,12 +4341,12 @@ describe("withdrawing applied fixes", () => {
     const rule = readFileSync(file, "utf8");
     const ledger = readFileSync(host.ledgerFile, "base64");
 
+    startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [
       withdrawalCandidate({ skill, gist: "Gist of tdd-afk-seams.", fingerprint: earlier === undefined ? "0123456789ab" : applied?.fingerprint }),
     ] });
 
-    expect(result.isError).toBe(true);
-    expect(result.details).toMatchObject({ eligible: [], failures: [expect.any(String)] });
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.any(String) }] });
     expect(readFileSync(file, "utf8")).toBe(rule);
     expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
   });
@@ -4094,10 +4505,19 @@ describe("compacting on-read amendments", () => {
     const file = join(host.amendmentsDir, "tdd-amendment.md");
     const before = readRule(file).body;
 
-    const result = await host.callTool("observer_resolve", await approveAll(host, {
-      fixes: [{ gist: "A red is an assertion diff.", section: RED }],
-      compactions: [{ includes: [], body: SEAMS }],
-    }));
+    // Separate Prepares do not see one another's drafts. Resolve still protects the combined writes.
+    const { compactions } = await approveAll(host, { compactions: [{ includes: [], body: SEAMS }] });
+    const drafted = onReadCandidate({ gist: "A red is an assertion diff.", section: RED });
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [drafted] });
+    const [entry] = reviewEntries(prepared);
+    const reference = entry!.reference;
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [reference] });
+    const selectionToolCallId = lastCallId(host);
+    const askToolCallId = askUser(host, selection);
+    const result = await host.callTool("observer_resolve", {
+      outcomes: [{ outcome: "applied", approval: { proposal: reference, selectionToolCallId, askToolCallId } }],
+      compactions,
+    });
 
     expect(result.isError).toBeFalsy();
     expect(readRule(file).body).toBe(`${before}\n\n${RED}`);
@@ -4115,7 +4535,9 @@ describe("compacting on-read amendments", () => {
     const addition = onReadCandidate({ gist, fingerprint: later, section: RED });
 
     const unknown = await host.callTool("observer_review", { action: "prepare", candidates: [addition, compactionCandidate({ includes: [gist, "Never prepared"], body })] });
-    expect(unknown).toMatchObject({ isError: true, details: { eligible: [], failures: [expect.stringContaining("Never prepared")] } });
+    expect(unknown).toMatchObject({ isError: false, details: {
+      eligible: [{ proposal: { gist } }], rejected: [{ reason: expect.stringContaining("Never prepared") }],
+    } });
     const { entry, approval } = await approveCandidates(host, [compactionCandidate({ includes: [gist], body }), addition]);
     expect(entry(compactionGist("tdd")).proposal.change.includes).toEqual([later]);
     const result = await host.callTool("observer_resolve", {
@@ -4222,10 +4644,9 @@ describe("compacting on-read amendments", () => {
         ? [withdrawalCandidate({ fingerprint: red?.fingerprint, gist: "A red is an assertion diff.", body, references })]
         : staleCandidates({ rule: "tdd-amendment", select: "Update", body, references }) });
 
-    expect(result.isError).toBe(true);
-    const failures = (result.details as { failures: string[] }).failures.join("\n");
-    expect(failures).toMatch(/pointer[\s\S]*seams\.md/);
-    expect(failures).not.toMatch(/reds\.md/);
+    const reasons = rejectionReasons(result).join("\n");
+    expect(reasons).toMatch(/pointer[\s\S]*seams\.md/);
+    expect(reasons).not.toMatch(/reds\.md/);
     expect(readFileSync(file, "utf8")).toBe(rule);
     expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
     expect(existsSync(referencesDir(host))).toBe(false);
@@ -4328,8 +4749,7 @@ describe("compacting on-read amendments", () => {
       withdrawalCandidate({ fingerprint: compaction?.fingerprint, gist: "Compact.", body: "" }),
     ] });
 
-    expect(result.isError).toBe(true);
-    expect(result.details).toMatchObject({ failures: [expect.stringContaining("is a compaction, not a fix")] });
+    expect(rejectionReasons(result)).toEqual([expect.stringContaining("is a compaction, not a fix")]);
     expect(rulesWritten(host)).toEqual(["tdd-amendment.md"]);
   });
 
@@ -4345,7 +4765,7 @@ describe("compacting on-read amendments", () => {
 
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [compactionCandidate({ includes: [], body: "## Short\n\nOne line.", references: [{ name, body: "Escaped." }] })] });
 
-    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.any(String) }] });
     expect(readFileSync(join(host.amendmentsDir, "tdd-amendment.md"), "utf8")).toBe(rule);
     expect(readFileSync(host.ledgerFile, "base64")).toBe(ledger);
     expect(existsSync(referencesDir(host))).toBe(false);
@@ -4478,8 +4898,7 @@ describe("observer_resolve with barrier rules for local and managed skills", () 
     const host = loadExtension();
     const result = await prepareRules(host, [{ skill, kind, gist: "Commit with jj, not git.", rule: { ...JJ_NOT_GIT, ...rule } as PatternRule }]);
 
-    expect(result.isError).toBe(true);
-    expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringMatching(reason)] });
+    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringMatching(reason) }] });
     expect(rulesWritten(host)).toEqual([]);
   });
 
@@ -4493,7 +4912,6 @@ describe("observer_resolve with barrier rules for local and managed skills", () 
     const result = await prepareRules(host, [{ skill: "ce-commit-jj", kind: "local", gist: "Commit with jj, not git.", rule: JJ_NOT_GIT }]);
 
     expect(readFileSync(foreign, "utf8")).toBe(handWritten);
-    expect(result.isError).toBe(true);
     expect(resultText(result)).toContain(foreign);
   });
 
@@ -4530,7 +4948,6 @@ describe("observer_resolve with barrier rules for local and managed skills", () 
     const result = await prepareRules(host, [{ skill: "implement-spec", kind: "managed", gist: "Commit with jj in specs.", rule: JJ_NOT_GIT }]);
 
     expect(readFileSync(file, "utf8")).toBe(before);
-    expect(result.isError).toBe(true);
     expect(resultText(result)).toContain("pick another name");
   }, 30_000);
 });
@@ -4697,7 +5114,7 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
     it("refuses to prepare a revision under another rule name", async () => {
       const fixture = await changedAfterApproval();
       const result = await prepareRevision(fixture, { ...JJ_NOT_GIT, name: "jj-not-git-either" });
-      expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining("approved proposal's own rule")] });
+      expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining("approved proposal's own rule") }] });
     });
   });
 
@@ -4729,7 +5146,7 @@ describe("proposal approval of pattern amendments and barrier rules", () => {
       ["under another rule name", "approved proposal's own rule", { name: "jj-not-git-either", body: REVISED_BODY }],
     ])("refuses to prepare a revision %s", async (_label, reason, rule) => {
       const result = await prepareRevision(await noted(), { ...JJ_NOT_GIT, ...rule });
-      expect(result.details).toMatchObject({ eligible: [], failures: [expect.stringContaining(reason)] });
+      expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining(reason) }] });
     });
   });
 });
@@ -5054,9 +5471,10 @@ describe("stale amendments", () => {
     const foreign = join(host.rulesDir, "use-ask-tool.md");
     mkdirSync(host.rulesDir, { recursive: true });
     writeFileSync(foreign, "---\ncondition: \"x\"\namends: \"tdd\"\n---\n\nThe user's own rule.\n");
+    startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: staleCandidates({ rule: "use-ask-tool", select: "Delete" }) });
 
-    expect(result.isError).toBe(true);
+    expect(rejectionReasons(result)).toHaveLength(1);
     expect(existsSync(foreign)).toBe(true);
   });
 });
@@ -5492,6 +5910,7 @@ describe("answers citing their prepared proposal", () => {
     const gists = ["First", "Second", "Third", "Fourth", "Fifth", "Sixth"];
     const { selection, reference } = await preparedFixes(host, gists);
     expect(reviewEntries(selection, "deferred").map(({ proposal }) => proposal.gist)).toEqual(["Sixth"]);
+    const { deferredReason } = JSON.parse(resultText(selection));
     askUser(host, selection, ({ gist }) => (gist === "First" ? "Later" : gist === "Second" ? "Decline" : ""));
 
     const result = await resolve(host, [
@@ -5508,7 +5927,7 @@ describe("answers citing their prepared proposal", () => {
     expect(ledgerRecords(host.ledgerFile)).toEqual([
       answered("First", "later", "Once the seam is named twice more."),
       answered("Second", "declined"),
-      answered("Sixth", "later", "Selected past the cap; offer it next pass."),
+      answered("Sixth", "later", `${deferredReason} Selected past the cap; offer it next pass.`),
     ]);
   });
 
@@ -5890,10 +6309,11 @@ describe("amendment rules for plugin skills", () => {
 
   it("prepares no fix whose candidate names another provenance than the plugin skill's", async () => {
     const host = loadExtension();
+    startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [{ kind: "upstream", skill: "ce-code-review",
       gist: "Name the review mode before the findings.", priority: "evidence", remedy: "Fix it", change: { operation: "on-read-append", section: MODE } }] });
 
-    expect(result.isError).toBe(true);
+    expect(rejectionReasons(result)).toHaveLength(1);
     expect(rulesWritten(host)).toEqual([]);
   });
 
@@ -6411,6 +6831,119 @@ describe("evidence-gated instructions", () => {
   const fragments = parseFragments(readFileSync(INSTRUCTIONS_PATH, "utf8"));
   /** A correction with `tdd` (upstream) loaded: no gate's evidence. */
   const base = [...fx.plainUserMessage, ...fx.steeringUserMessage, ...fx.skillUrlRead];
+
+  it.each([
+    ["a correction", base, ""],
+    ["an explicit note", [], "Name the missing check in the guide."],
+  ] as const)("starts discovery for %s without downstream procedure", async (_label, branch, note) => {
+    const host = loadExtension();
+    host.setBranch([...branch]);
+    await host.runCommand("observe", note);
+    const payload = String(host.sent[0]?.message.content);
+    expect(payload).toContain("## Session digest");
+    expect(payload).toContain("## 1. Find candidates");
+    expect(payload).not.toMatch(/^## \d+\. (Draft|Ask|Apply|Record|Summarise)/m);
+    expect(payload).toContain('`action: "draft"`');
+    expect(payload).toContain("finish now with the findings or why you found none");
+    expect(host.sent).toHaveLength(1);
+  });
+
+  it("delivers Draft, Select, Ask, Apply and Record as the registered pass reaches them", async () => {
+    const host = loadExtension();
+    host.setBranch(base);
+    await host.runCommand("observe");
+    await host.commitMessage(host.sent[0]!.message);
+    const draft = await host.callTool("observer_review", { action: "draft" });
+    expect(resultText(draft)).toContain("## 2. Draft");
+    expect(resultText(draft)).not.toContain("## 3. Ask");
+    const prepared = await host.callTool("observer_review", {
+      action: "prepare", candidates: [onReadCandidate({ gist: "Name the seam before the first test.", section: SEAMS })],
+    });
+    expect(JSON.parse(resultText(prepared)).guidance).toContain("## 3. Select");
+    const selection = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
+    const selectionToolCallId = lastCallId(host);
+    const { askHtml, guidance } = JSON.parse(resultText(selection));
+    expect(guidance).toContain("## 3. Ask");
+    expect(guidance).not.toContain("## 4. Apply");
+    expect(await host.toolCall("ask", { html: askHtml }, "native-question")).toBeUndefined();
+    const askToolCallId = askUser(host, selection);
+    const answer = await host.toolResult({
+      toolName: "ask", toolCallId: askToolCallId, input: { html: askHtml }, content: [{ type: "text", text: "User answers" }],
+      details: host.getBranch().at(-1)?.message?.details, isError: false,
+    });
+    const text = answer.content.map(({ text }) => text).join("\n");
+    expect(text).toContain("## 4. Apply");
+    expect(text).toContain("## 5. Record");
+    const { reference } = reviewEntries(prepared)[0]!;
+    const resolved = await resolve(host, [{ outcome: "applied", approval: { proposal: reference, selectionToolCallId, askToolCallId } }]);
+    expect(failures(resolved)).toEqual([]);
+    expect(readFileSync(join(host.amendmentsDir, "tdd-amendment.md"), "utf8")).toContain(SEAMS);
+  });
+
+  it("stops the reviewed Ask when required publication guidance is missing", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const prepared = await host.callTool("observer_review", {
+      action: "prepare", candidates: [onReadCandidate({ gist: "Name the seam before the first test.", section: SEAMS })],
+    });
+    const selection = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
+    const { askHtml } = JSON.parse(resultText(selection));
+    await withoutGuidance("## 4. Apply", async () => {
+      expect(await host.toolCall("ask", { html: askHtml }, "native-question")).toMatchObject({
+        block: true, reason: expect.stringContaining("missing apply section"),
+      });
+      expect(await host.toolCall("ask", { html: "<form>Unrelated</form>" }, "unrelated-question")).toBeUndefined();
+      expect(await host.toolCall("ask", { html: askHtml }, "nested-question", "eval-wrapper")).toBeUndefined();
+    });
+  });
+
+  it("stops Resolve before publishing on a restored pass if Record guidance is missing", async () => {
+    const host = loadExtension();
+    const outcomes = await approveOnRead(host, [{ gist: "Name the seam before the first test.", section: SEAMS }]);
+    const restored = loadExtension({ skillHome: host.skillHome });
+    restored.setBranch(host.getBranch());
+    await restored.emit("session_start");
+    expect(restored.activeTools()).toContain("observer_resolve");
+    await withoutGuidance("## 5. Record", async () => {
+      const result = await resolve(restored, outcomes);
+      expect(resultText(result)).toContain("missing record section");
+      expect(existsSync(restored.ledgerFile)).toBe(false);
+      expect(existsSync(join(restored.amendmentsDir, "tdd-amendment.md"))).toBe(false);
+    });
+  });
+
+  it("stops native and nested owner-tool publication when Apply guidance disappears after Ask", async () => {
+    const host = loadExtension();
+    const root = host.skillHome.roots.cwd;
+    const path = join(root, "package.json");
+    await approveCandidates(host, [{
+      kind: "project", target: { scope: "project", root, path: "package.json", mechanism: "Wire the typecheck." },
+      gist: "Wire the typecheck.", priority: "evidence", remedy: "Run the existing script.",
+      change: { operation: "direct-edit", preview: "Wire typecheck in package.json." },
+    }]);
+    await withoutGuidance("## 4. Apply", async () => {
+      for (const parent of [undefined, "eval-wrapper"]) {
+        expect(await host.toolCall("write", { path, content: "{}" }, `publication-${parent}`, parent)).toMatchObject({
+          block: true, reason: expect.stringContaining("missing apply section"),
+        });
+      }
+      expect(await host.toolCall("read", { path }, "inspection")).toBeUndefined();
+      await host.commitPrompt("Do ordinary work now.");
+      expect(await host.toolCall("write", { path, content: "{}" }, "ordinary-write")).toBeUndefined();
+    });
+  });
+
+  async function withoutGuidance(heading: string, run: () => Promise<void>) {
+    const original = vi.mocked(readFileSync).getMockImplementation()!;
+    const edited = readFileSync(INSTRUCTIONS_PATH, "utf8").replace(heading, "## Lost");
+    vi.mocked(readFileSync).mockImplementation(((...args: Parameters<typeof readFileSync>) =>
+      args[0] === INSTRUCTIONS_PATH ? edited : original(...args)) as typeof readFileSync);
+    try {
+      await run();
+    } finally {
+      vi.mocked(readFileSync).mockRestore();
+    }
+  }
   type Evidence = { branch: SessionEntry[]; note?: string };
   type Setup = (host: ReturnType<typeof loadExtension>) => Evidence | Promise<Evidence>;
   /** An on-read amendment of `skill` with no fix of the ledger in force under it. */
@@ -6418,9 +6951,7 @@ describe("evidence-gated instructions", () => {
     splitAmendment(host, skill, `${skill}-amendment`);
     rmSync(host.ledgerFile);
   };
-  const appliedManagedEdit = (host: ReturnType<typeof loadExtension>) => seedApplied(host, "implement-spec", "managed", "Run the typecheck before each commit.");
-
-  const table: Array<[string, Gate[], Setup, Setup, { judge?: boolean }?]> = [
+  const table: Array<[string, Gate[], Setup, Setup]> = [
     ["stale: an amendment whose skill changed since its pin", ["stale"],
       (host) => { splitAmendment(host, "domain-modeling", "dm-terms"); changeSkillFile(host, "domain-modeling"); return { branch: base }; },
       (host) => { splitAmendment(host, "domain-modeling", "dm-terms"); return { branch: base }; }],
@@ -6429,11 +6960,7 @@ describe("evidence-gated instructions", () => {
       (host) => { amendmentWithoutFix(host, "grill-with-docs"); return { branch: base }; }],
     ["project: a workflow outline", ["project"], () => ({ branch: [...base, ...fx.skillLessTurn] }), () => ({ branch: base })],
     ["project: a tool error", ["project"], () => ({ branch: [...base, ...fx.skillTurnToolError] }), () => ({ branch: base })],
-    ["withdrawal: a fix in force for a loaded skill", ["withdrawal"],
-      async (host) => { await appliedManagedEdit(host); return { branch: [...base, ...fx.skillPromptManaged] }; },
-      () => ({ branch: [...base, ...fx.skillPromptManaged] })],
-    ["note and withdrawal: a User note", ["note", "withdrawal"], () => ({ branch: base, note: "tdd should name the seam first" }), () => ({ branch: base })],
-    ["ranking: an explicit, available judge role", ["ranking"], () => ({ branch: base }), () => ({ branch: base }), { judge: false }],
+    ["note: a User note", ["note"], () => ({ branch: base, note: "tdd should name the seam first" }), () => ({ branch: base })],
     ["observations: a pending observation", ["observations"],
       async (host) => { await host.callTool("observe", { text: "The tdd skill names no seam for HTTP clients." }); return { branch: base }; },
       () => ({ branch: base })],
@@ -6443,8 +6970,8 @@ describe("evidence-gated instructions", () => {
   ];
 
   /** The fragments of `observer.md` the payload `/observe` sends with `setup`'s evidence holds. */
-  async function present(setup: Setup, options?: { judge?: boolean }) {
-    const host = loadExtension(options);
+  async function present(setup: Setup) {
+    const host = loadExtension();
     const { branch, note = "" } = await setup(host);
     host.setBranch(branch);
     await host.runCommand("observe", note);
@@ -6452,18 +6979,33 @@ describe("evidence-gated instructions", () => {
     return new Set(fragments.filter(({ text }) => content.includes(text)));
   }
 
-  it.each(table)("%s turns on exactly its gated fragments", async (_label, gates, on, off, offOptions) => {
+  it.each(table)("%s turns on exactly its discovery fragments", async (_label, gates, on, off) => {
     // Each host points HOME and the agent dir at its own temp home, so the two assemblies run one after the other.
     const withEvidence = await present(on);
-    const without = await present(off, offOptions);
-    const gated = fragments.filter(({ gate }) => gate !== undefined && gates.includes(gate));
+    const without = await present(off);
+    const gated = fragments.filter(({ section, gate }) => section === "1-find-candidates" && gate !== undefined && gates.includes(gate));
     expect(gated.length).toBeGreaterThan(0);
     for (const assembly of [withEvidence, without]) {
-      expect(fragments.filter(({ gate }) => gate === undefined).every((fragment) => assembly.has(fragment))).toBe(true);
+      expect(fragments.filter(({ section, gate }) => ["0-observation-pass", "1-find-candidates"].includes(section) && gate === undefined)
+        .every((fragment) => assembly.has(fragment))).toBe(true);
       expect([...assembly].filter(({ gate }) => gate === "tool-result")).toEqual([]);
     }
     expect([...withEvidence].filter((fragment) => !without.has(fragment))).toEqual(gated);
     expect([...without].filter((fragment) => !withEvidence.has(fragment))).toEqual([]);
+  });
+
+  it("reports the same initial message estimate without resolving a judge or starting a pass", async () => {
+    const host = loadExtension();
+    host.setBranch(base);
+    await host.runCommand("observe-report");
+    expect(host.sent).toEqual([]);
+    expect(host.activeTools()).not.toContain("observer_review");
+    expect(host.resolveScopedModels).not.toHaveBeenCalled();
+    const [, estimate] = /Initial \/observe payload estimate \(hidden message only\): (.+)/.exec(host.notices[0] ?? "") ?? [];
+    expect(estimate ?? "").toMatch(/^≈ \d+ tokens /);
+    await host.runCommand("observe");
+    expect(host.notices.at(-1)).toContain(`payload ${estimate}.`);
+    expect(host.resolveScopedModels).not.toHaveBeenCalled();
   });
 
   it("notifies the pass start with the payload estimate of each non-empty section", async () => {
@@ -6817,7 +7359,7 @@ describe("/observe-report", () => {
       `- ${fingerprint("tdd", "tdd-afk-seams")}: exercised-clean (tdd)`,
       `- ${fingerprint("domain-modeling", "dm-terms")}: inconclusive (domain-modeling)`,
       "Stale amendments: dm-terms (domain-modeling)",
-      expect.stringMatching(/^Payload estimate for \/observe now: ≈ \d+ tokens \(instructions \d+, digest \d+, .*stale \d+; chars\/4 estimate\)$/),
+      expect.stringMatching(/^Initial \/observe payload estimate \(hidden message only\): ≈ \d+ tokens \(instructions \d+, digest \d+, .*stale \d+; chars\/4 estimate\)$/),
       "Later proposals: 1",
       "Pending observations: 0",
       "Skill catalog observations: none on this branch (unknown)",
@@ -7364,7 +7906,7 @@ describe("observations", () => {
     expect(second.noticeEvents).toEqual([{ message: expect.any(String), type: "info" }]);
     const report = second.notices[0]!;
     expect(report).toContain("\nPending observations: 1");
-    expect(report).toMatch(/\nPayload estimate for \/observe now: ≈ \d+ tokens \(.*observations \d+/);
+    expect(report).toMatch(/\nInitial \/observe payload estimate \(hidden message only\): ≈ \d+ tokens \(.*observations \d+/);
     expect(report).not.toContain("twelve entries");
     expect(readFileSync(first.observationsFile)).toEqual(before);
     expect(readdirSync(dirname(first.observationsFile))).toEqual(beforeFiles);
@@ -7645,14 +8187,14 @@ describe("observer_review inspect and grounded repairs", () => {
     for (const draft of drafts) {
       for (const [diagnosis, missing] of cases) {
         const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...draft, diagnosis }] });
-        expect(prepared.isError).toBe(true);
+        expect(prepared.isError).toBe(false);
         expect(reviewEntries(prepared)).toEqual([]);
-        const reason = failures(prepared).join("\n");
+        const reason = rejectionReasons(prepared).join("\n");
         for (const name of missing) expect(reason).toContain(`\`${name}\``);
       }
     }
     const outOfRange = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...drafts[0], diagnosis: { ...complete, citations: [{ source: guidePath(host), lines: { from: 1, to: 99 } }] } }] });
-    expect(failures(outOfRange).join("\n")).toContain("lines 1–99");
+    expect(rejectionReasons(outOfRange).join("\n")).toContain("lines 1–99");
   });
 
   it("names where a diagnosis goes when the call carries it beside the candidates or a candidate has none", async () => {
@@ -7671,7 +8213,7 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(resultText(topLevel)).toContain("move `diagnosis` into each candidate");
 
     const none = await host.callTool("observer_review", { action: "prepare", candidates: [draft] });
-    expect(failures(none).join("\n")).toContain("`diagnosis` is a field of the candidate, beside `change`");
+    expect(rejectionReasons(none).join("\n")).toContain("`diagnosis` is a field of the candidate, beside `change`");
   });
 
   it("prepares project proposals without inspection evidence", async () => {
@@ -7718,9 +8260,9 @@ describe("observer_review inspect and grounded repairs", () => {
       startPass(host);
       const inspection = await receipt(host);
       const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, inspection)] });
-      expect(prepared.isError, label).toBe(true);
+      expect(prepared.isError, label).toBe(false);
       expect(reviewEntries(prepared), label).toEqual([]);
-      const reason = failures(prepared).join("\n");
+      const reason = rejectionReasons(prepared).join("\n");
       expect(reason, label).toContain(inspection);
       expect(reason, label).toContain(named);
       expect(reason, label).toMatch(/inspect/);
@@ -7743,9 +8285,9 @@ describe("observer_review inspect and grounded repairs", () => {
     ];
     for (const [citation, named] of cases) {
       const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id, [citation])] });
-      expect(prepared.isError, named).toBe(true);
+      expect(prepared.isError, named).toBe(false);
       expect(reviewEntries(prepared), named).toEqual([]);
-      expect(failures(prepared).join("\n"), named).toContain(named);
+      expect(rejectionReasons(prepared).join("\n"), named).toContain(named);
     }
   });
 
@@ -7783,9 +8325,9 @@ describe("observer_review inspect and grounded repairs", () => {
     const { host, id } = await inspectedGuide(before);
     change(host);
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [groundedDraft(host, id)] });
-    expect(prepared.isError, label).toBe(true);
+    expect(prepared.isError, label).toBe(false);
     expect(reviewEntries(prepared), label).toEqual([]);
-    const reason = failures(prepared).join("\n");
+    const reason = rejectionReasons(prepared).join("\n");
     expect(reason, label).toContain(id);
     expect(reason, label).toContain(named);
     expect(reason, label).toContain(`inspect \`${GUIDE}\` again`);
@@ -7843,9 +8385,9 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(inspectionOf(result)?.kind).toBe("local");
     setLockHash(host, skill, "fixture-lock-hash");
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [descriptionFix(skill, "local", id, firstSource(result))] });
-    expect(prepared.isError).toBe(true);
+    expect(prepared.isError).toBe(false);
     expect(reviewEntries(prepared)).toEqual([]);
-    const reason = failures(prepared).join("\n");
+    const reason = rejectionReasons(prepared).join("\n");
     expect(reason).toContain("now an upstream skill");
     expect(reason).toContain(`inspect \`${skill}\` again`);
   });
@@ -7885,14 +8427,14 @@ describe("observer_review inspect and grounded repairs", () => {
     expect(failures(selection).join("\n")).toContain("content hash");
   });
 
-  it("merges same-identity repairs only when every diagnosis holds, keeping the chosen draft's diagnosis and change together", async () => {
+  it("merges evidence for identical same-identity repairs only when every diagnosis holds", async () => {
     const host = loadExtension();
     installGuide(host);
     startPass(host);
     const { id } = await inspect(host);
     const evidenceDraft = { ...groundedDraft(host, id), evidence: [{ quote: "no fixture again", count: 1 }] };
     const noteDraft = {
-      ...onReadCandidate({ skill: GUIDE, gist: "One fixture per seam.", section: "## Fixtures\n\nBuild one fixture per seam, named for it." }),
+      ...evidenceDraft,
       priority: "note", evidence: [{ quote: "fixtures, please", count: 1, source: "user" }],
       diagnosis: { inspection: id, explanation: "The user's note asks for named fixtures; Seams says nothing on them.", delta: "A future agent names each fixture after its seam.",
         citations: [{ source: guidePath(host), section: "Seams" }] },
@@ -7903,13 +8445,14 @@ describe("observer_review inspect and grounded repairs", () => {
     const [entry, ...rest] = reviewEntries(merged);
     expect(rest).toEqual([]);
     expect(entry!.proposal).toMatchObject({ priority: "note", diagnosis: noteDraft.diagnosis });
-    expect((entry!.proposal as { preview: string }).preview).toContain("named for it");
+    expect(entry!.proposal.preview).toContain("Build one fixture per seam.");
     expect(entry!.proposal.evidence.map(({ quote }) => quote).sort()).toEqual(["fixtures, please", "no fixture again"]);
 
     for (const broken of [{ ...evidenceDraft, diagnosis: { ...evidenceDraft.diagnosis, citations: [{ source: guidePath(host), section: "Absent" }] } },
       { ...evidenceDraft, diagnosis: { ...evidenceDraft.diagnosis, inspection: "observer_review-call-999" } }]) {
       const refused = await host.callTool("observer_review", { action: "prepare", candidates: [broken, noteDraft] });
-      expect(refused.isError).toBe(true);
+      expect(refused.isError).toBe(false);
+      expect(rejectionReasons(refused)).toHaveLength(2);
       expect(reviewEntries(refused)).toEqual([]);
     }
   });
@@ -7936,9 +8479,9 @@ describe("observer_review inspect and grounded repairs", () => {
     for (const [skill, kind, { id, result }] of cases) {
       const label = `${skill} as ${kind}`;
       const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [descriptionFix(skill, kind, id, firstSource(result))] });
-      expect(prepared.isError, label).toBe(true);
+      expect(prepared.isError, label).toBe(false);
       expect(reviewEntries(prepared), label).toEqual([]);
-      expect(failures(prepared).join("\n"), label).toMatch(/amendment rules/);
+      expect(rejectionReasons(prepared).join("\n"), label).toMatch(/amendment rules/);
       if (kind !== "upstream" && kind !== "plugin") continue;
       const recorded = await resolve(host, [{ skill, kind, gist: "Name the request in the description.", outcome: "applied" }]);
       expect(recorded.isError, label).toBe(true);
@@ -8135,7 +8678,7 @@ describe("observer_review new-skill search", () => {
       expect(failures(result).join("\n"), label).toContain(named(host));
       const prepared = await prepare(host, [newDraft(id)]);
       expect(reviewEntries(prepared), label).toEqual([]);
-      expect(failures(prepared).join("\n"), label).toContain("failed");
+      expect(rejectionReasons(prepared).join("\n"), label).toContain("failed");
     }
   });
 
@@ -8186,9 +8729,9 @@ describe("observer_review new-skill search", () => {
       const { id } = await search(host);
       change(host);
       const prepared = await prepare(host, [newDraft(id)]);
-      expect(prepared.isError, label).toBe(true);
+      expect(prepared.isError, label).toBe(false);
       expect(reviewEntries(prepared), label).toEqual([]);
-      const reason = failures(prepared).join("\n");
+      const reason = rejectionReasons(prepared).join("\n");
       expect(reason, label).toContain(named);
       expect(reason, label).toContain("search again with its `terms`");
     }
@@ -8225,7 +8768,7 @@ describe("observer_review new-skill search", () => {
     for (const [diagnosis, named] of cases) {
       const prepared = await prepare(host, [{ ...newDraft(fresh), diagnosis }]);
       expect(reviewEntries(prepared), named).toEqual([]);
-      expect(failures(prepared).join("\n"), named).toContain(named);
+      expect(rejectionReasons(prepared).join("\n"), named).toContain(named);
     }
   });
 });
@@ -8302,9 +8845,9 @@ describe("approval compatibility under the evidence gate", () => {
 
     const stale = await prepare(host, [{ ...revision, diagnosis: { inspection: approvedInspection, explanation: "Seams says nothing on reds.", delta: "A future agent reads a red as a diff.",
       citations: [{ source: tddSkill(host), lines: { from: 1, to: 1 } }] } }]);
-    expect(failures(stale)).toEqual([expect.stringContaining("no longer current")]);
-    expect(failures(stale)[0]).toContain("inspect `tdd` again");
-    expect(failures(stale)[0]).not.toMatch(/ask/i);
+    expect(rejectionReasons(stale)).toEqual([expect.stringContaining("no longer current")]);
+    expect(rejectionReasons(stale)[0]).toContain("inspect `tdd` again");
+    expect(rejectionReasons(stale)[0]).not.toMatch(/ask/i);
 
     const fresh = await prepare(host, [revision]);
     expect(failures(fresh)).toEqual([]);
@@ -8558,7 +9101,7 @@ describe("skill catalog observations", () => {
     const report = host.notices.at(-1)!;
     expect(report).toContain("\nSkill catalog observations: 1 on this branch; the latest, at entry `user-");
     expect(report).toContain("listed 2 skills");
-    expect(report).toMatch(/\nPayload estimate for \/observe now: ≈ \d+ tokens \(.*catalog \d+/);
+    expect(report).toMatch(/\nInitial \/observe payload estimate \(hidden message only\): ≈ \d+ tokens \(.*catalog \d+/);
     expect(report).not.toContain(SEAMS[1]);
 
     await host.runCommand("observe");

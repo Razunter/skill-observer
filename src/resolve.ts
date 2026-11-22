@@ -56,9 +56,9 @@ import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
 import { checkHarnessPublication, checkProjectPublication, checkSkillEditPublication, type SkillEditPublication } from "./project-publication.js";
-import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, laterNote, latestPrepared, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
-import { type ToolResultCondition, whatToDoNow } from "./payload.js";
-import { isProposalRef, type PreparedProposal, type PreparedProposalRef, proposalRefSchema } from "./review.js";
+import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, laterNote, latestPrepared, observationPassStart, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
+import { loadInstructionStage, type ToolResultCondition, whatToDoNow } from "./payload.js";
+import { isProposalRef, overflowDeferral, type PreparedProposal, type PreparedProposalRef, proposalRefSchema } from "./review.js";
 import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 
 export const RESOLVE_TOOL_NAME = "observer_resolve";
@@ -270,7 +270,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
     name: RESOLVE_TOOL_NAME,
     label: "Observer Resolve",
     description:
-      "Record the user's answers to an `/observe` pass in the proposal ledger, which later passes read to skip declined proposals and re-offer deferred ones. A skill outcome that cites its prepared proposal, through `approval` or `proposal`, is recorded under that proposal's skill, kind, gist, fingerprint and evidence. An applied upstream or plugin fix is written here: an on-read fix as a section appended to the skill's one on-read amendment, `<skill>-amendment`, created with that section when the skill has none; a pattern amendment as its own rule. An applied barrier for a local or managed skill is written as its barrier rule. An applied direct edit of a local, managed or new skill is made by you, not here: it carries the `approval` of its prepared proposal and `publication`, the call that made the edit after that Apply, and is recorded only when both hold. An applied on-read fix, pattern amendment or barrier rule, a `withdrawn` answer, a stale `update` or `delete` and an applied compaction carry `approval`: the section, rule, body, reference files or deletion is the one its prepared proposal holds (for a stale answer, the alternative of the selected option), carried out only when this observation pass holds that proposal's Prepare, its Select and a native `ask` called with that Select's `askHtml` unchanged, in which the user explicitly chose the proposal's Apply option (for a stale amendment, Update or Delete) before any timeout, custom input approving nothing, and only while the amendment or rule file and its reference files hold the bytes Prepare read, a re-pin aside for a stale answer, withdrawal or compaction; when the user attached a note to an on-read fix's or rule's Apply, or its target changed, `revision` cites a reconciliation prepared through observer_review, whose content is written while the target holds the bytes that reconciliation read, and a noted or changed stale answer, withdrawal or compaction is prepared and asked again. Otherwise it writes and records nothing. A rule with a pattern is replayed as `observer_check` does and written only when it passes, else recorded as `later`; the approval is checked again after the replay, right before the write. A `withdrawn` answer takes back an earlier applied fix: it deletes the rule file the fix wrote, or, for a fix inside the skill's on-read amendment, rewrites the amendment with the body its withdrawal proposal prepared; a fix moved to another skill is a `withdrawn` answer plus an `applied` one. An applied compaction rewrites the skill's on-read amendment with its prepared body and replaces its reference files with its prepared set, after this call's additions, only when its prepared `includes` names every on-read fix this call applied for the skill and only fixes this call applied, and no stale update or delete or withdrawal in this call changed the amendment; otherwise it is recorded as `later`. Stale answers are carried out before every other answer: Keep re-pins its rule without an approval, leaving its body and reference files byte for byte, and Update and Delete rewrite or delete it, and deleting a skill's on-read amendment takes its fixes out of force and deletes its reference files. Returns the records and rule files written, what each change carried out from a prepared proposal rests on (a note and the text written under it included), the answers held back as `later`, and any answer that wrote nothing.",
+      "Record observation-pass outcomes and carry out the approved rule and amendment changes. Cite the prepared proposal and native Ask approval for changes this tool makes. For direct edits already made through the owner tool, include the publication receipt.",
     parameters: z.object({
       outcomes: z
         .array(
@@ -507,6 +507,11 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         recording.error = `Could not read the observer store: ${openError}`;
       } else if (outsideAmendments.length > 0 || hasAmendmentWork) {
         try {
+          if (observationPassStart(branch) !== undefined) {
+            const applies = params.outcomes.some(({ outcome }) => outcome === "applied" || outcome === "withdrawn")
+              || stale.some(({ action }) => action !== "keep") || compactions.some(({ outcome }) => outcome === "applied");
+            loadInstructionStage(applies ? "publish" : "record");
+          }
           writeObserverStore(ledger, now, (db) => {
             // Recheck approval targets after taking the writer lock too: a process could change them while it is busy.
             const approved = transitions.settle(verdicts, branch);
@@ -791,8 +796,12 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
     throw new Error(`the cited proposal is \`${proposal.skill}\` (${proposal.kind}) "${proposal.gist}" under fingerprint \`${proposal.fingerprint}\`, not this answer`);
   }
   const quoted = proposal.evidence.length > 0 ? proposal.evidence.map(({ source: _, ...item }) => item) : answer.evidence;
-  const note = reference !== undefined && answer.outcome === "later" && answer.reoffer === undefined ? laterNote(reference, evidence) : undefined;
-  return { ...rest, ...filled, ...(quoted && { evidence: quoted }), ...(note !== undefined && { reoffer: note }) };
+  const deferral = reference !== undefined && answer.outcome !== "applied" ? overflowDeferral(reference, evidence) : undefined;
+  if (deferral && answer.outcome !== "later") throw new Error("a proposal deferred past the Ask cap was not answered; record it as Later, not Decline");
+  const reoffer = deferral
+    ? (answer.reoffer && answer.reoffer !== deferral ? `${deferral} ${answer.reoffer}` : deferral)
+    : (reference !== undefined && answer.outcome === "later" && answer.reoffer === undefined ? laterNote(reference, evidence) : undefined);
+  return { ...rest, ...filled, ...(quoted && { evidence: quoted }), ...(reoffer !== undefined && { reoffer }) };
 }
 
 /** Throws unless `ref` is the reference the branch's last Prepare holding its candidate returned. */

@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
   compactionFingerprint, isOnReadAmendment, isPinKind, isPinned, type ObserverRule, parseFrontmatter, readObserverRule, readOnReadAmendments, readSkillRules,
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
@@ -25,7 +26,8 @@ import {
 import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
 import { type CatalogLookup, type CatalogSkill, lookupCatalog, parseSkillsBlock } from "./catalog.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
-import { APPLY, approvalShape, approvedHarness, checkReconciliation, isReconcilable, observationPassStart, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
+import { APPLY, approvalShape, approvedHarness, checkReconciliation, checkTarget, isReconcilable, observationPassStart, preparedInPass, type ProposalAnswerRef, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
+import { DRAFT_RECORD_GATES, type Gate, instructionText } from "./payload.js";
 import {
   createProvenanceResolver, defaultSkillRoots, type InstalledSkillScan, ompAgentDir, type ProvenanceResolver, scanInstalledSkills, skillHash, type SkillProvenance, type SkillRoots, type SourceCoverage,
 } from "./provenance.js";
@@ -36,9 +38,12 @@ import { type PatternDraft, type Sample, sampleSchemas } from "./replay.js";
 import type { ObserverFiles } from "./resolve.js";
 import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 import { readObserverStore } from "./observer-store.js";
+import { type EvidenceKey, lookupRuleEvidence } from "./rule-evidence.js";
 
 export const REVIEW_TOOL_NAME = "observer_review";
 const PRIORITIES = ["stale", "note", "evidence", "compaction"] as const;
+const ASK_LIMIT = 5;
+const OVERFLOW_REASON = "Deferred because five other proposals filled the main Ask. Reconsider in the next observation pass if the fix is still applicable.";
 type Priority = (typeof PRIORITIES)[number];
 const OPERATIONS = ["direct-edit", "on-read-append", "rule", "stale-update", "stale-delete", "withdrawal", "compaction", "harness"] as const;
 
@@ -173,7 +178,8 @@ export interface PreparedEntry { reference: PreparedProposalRef; proposal: Prepa
 
 interface Ranking { id: string; score: number; confidence: number; consistent: boolean }
 interface ReviewParams {
-  action: "inspect" | "catalog" | "prepare" | "select";
+  action: "draft" | "inspect" | "catalog" | "evidence" | "prepare" | "select" | "record";
+  key?: EvidenceKey;
   skill?: string;
   references?: string[];
   terms?: string[];
@@ -192,8 +198,17 @@ interface JudgeState {
   evidence: ReviewEvidence[];
   repeatCount: number;
 }
+interface RejectedDraft {
+  index: number;
+  gist?: string;
+  reason: string;
+}
+
+class CommonReviewError extends Error {}
+
 interface ReviewDetails {
   eligible: PreparedEntry[];
+  rejected: RejectedDraft[];
   needsRanking: boolean;
   judgeStates: Record<string, JudgeState>;
   selected: PreparedEntry[];
@@ -299,9 +314,11 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Inspect a skill's current guidance before drafting a repair to it: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force), and the reference files requested from its observer reference folder, each with line numbers, `sha256` and `## ` sections, plus the folder's inventory by fingerprint; the successful result is the receipt a candidate `diagnosis` cites by its call ID. With `terms`, inspect searches for a new skill instead: it fails when a skill named `skill` is installed or was created this session, or when the skills directory, managed skills, plugin registry or an enabled plugin's skills exist but can't be read; otherwise it reports each source's coverage and the skills whose name or description holds a term. A fitting match is no new skill: inspect it and repair it. Catalog searches this branch's skill catalog observations for the skill named exactly `skill`, or for skills whose description shown then contains every one of `terms`: per observation, its entry, references and whether the observed skills block listed the skill with the description shown then, did not list it, or left it unknown, then each later change OMP's persisted skill notices and compactions made to it, ordered by observation then skill name, and known capture gaps. With `at`, only the latest observation at or before that entry and the gaps between. Results come `limit` at a time; `next` continues while the catalog evidence is unchanged. It refuses an empty query, never reads installed skills, and no match means unknown, not absent. An observation is what the system prompt listed at `before_agent_start`, not proof the model received it. Prepare canonical eligible observation proposals before optional host judge_batch: canonicalize each exact change into the operation observer_resolve would carry out, read its current target and reference files, render its preview, merge identities/evidence, remove prior declines, and return per proposal its reference, fingerprint, scope, gist and preview (for an on-read append also `amendmentSections`, the `## ` headings its target amendment already holds), plus minimized judgeStates only for classes needing comparison with an explicitly configured available judge model. Prepare refuses a direct edit of a local or managed skill, an on-read append or a rule without a `diagnosis` naming a successful inspect receipt of its skill from this pass on this branch, its explanation, its behavior delta and citations of places that receipt inspected; Prepare, and Select again before producing its form, refuse it once that skill's inspected sources, rules or reference folder inventory changed: inspect again and prepare again. A new skill needs a `diagnosis` naming its new-skill search from this pass on this branch, why the matches do not fit and its behavior delta; Prepare and Select refuse it once a skill of that name exists or the searched inventory or any searched skill file changed. A candidate with `reconciles` revises an approved on-read append or rule by the user's approval note on its Apply, for its changed target, or both: Prepare checks the cited approval still holds in this pass and the revision makes the same operation on the same target under the same identity. Under a note that asks for a check or only acknowledges, the revision may equal the approved change, with `reason` stating what was checked. Select takes only those references, verifies them against this branch's successful Prepare results, rechecks model availability before accepting advisory rankings, or uses stable evidence ordering with a fallback reason. Selection preserves stale/note/evidence/compaction priority and five slots; overflow remains deferred for observer_resolve. Select returns the references it selected and deferred, and `askHtml`, the complete Ask form for the proposals it selected: call `ask` with `html` set to it exactly as returned, since an answer approves only under that form. This tool neither writes, asks, approves nor publishes and never calls a model.",
+    description: "Observation pass: read procedure, skill guidance, catalog or evidence; prepare eligible proposals, explain rejections and select the Ask form. No writes or model calls.",
     parameters: z.object({
-      action: z.enum(["inspect", "catalog", "prepare", "select"]),
+      action: z.enum(["draft", "inspect", "catalog", "evidence", "prepare", "select", "record"]),
+      key: z.object({ skill: z.string().optional(), rule: z.string().optional(), fingerprint: z.string().optional() }).optional()
+        .describe("Evidence: one exact skill name, rule name or proposal fingerprint."),
       skill: z.string().optional().describe("Inspect only: the installed skill whose current guidance to read; with `terms`, the name of the proposed new skill. Catalog: the exact skill name to look up, instead of `terms`."),
       references: z.array(z.string()).optional()
         .describe("Inspect only: file names in the skill's observer reference folder to read too; the others are only listed by fingerprint and are not inspected."),
@@ -309,7 +326,7 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
         .describe("Inspect, for a proposed new skill: the words of its workflow to look for, case-insensitively, in every current skill's name and description. Catalog, instead of `skill`: words that must all appear, case-insensitively and literally, in an observed skill's rendered description; names are not searched."),
       at: z.string().optional().describe("Catalog only: the exact ID of an entry on the active branch; the lookup returns the latest observation at or before it, with the skill notices, compactions and resets up to it and the known gaps in between."),
       limit: z.number().optional().describe("Catalog only: the page size, a whole number of at least 1; 20 when omitted."),
-      cursor: z.string().optional().describe("Catalog only: the `next` cursor of the previous page, with the same `skill`, `terms` and `at`; refused once the branch's catalog evidence changed."),
+      cursor: z.string().optional().describe("Catalog or Evidence: the previous page's `next` for the same lookup."),
       candidates: z.array(z.union([
         z.object({ ...draft, kind: z.enum(PROPOSAL_KINDS), skill: z.string() }),
         z.object({ ...draft, kind: z.enum(["project"]), target: z.object({
@@ -328,19 +345,34 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
     }),
     async execute(toolCallId, params, signal, _update, ctx) {
       signal?.throwIfAborted();
-      if (params?.action === "inspect" || params?.action === "catalog") return readOnlyActionResult(params, files, ctx, catalogGap(ctx.sessionManager.getBranch()));
+      if (params?.action === "inspect" || params?.action === "catalog" || params?.action === "evidence") {
+        return readOnlyActionResult(params, files, ctx, catalogGap);
+      }
       const details = emptyDetails();
       const amendmentSections = new Map<string, string[]>();
+      let next: string | undefined;
       try {
         const guidance = receiptContext(ctx, files);
+        if (params?.action === "draft" || params?.action === "record") {
+          if (!ctx.hasUI || ctx.agent?.kind === "sub" || guidance.passStart === undefined) {
+            throw new Error("only the main agent in a current observation pass can request that procedure");
+          }
+          const stage = params.action === "record" && hasReviewedPublication(guidance.evidence, guidance.passStart) ? "publish" : params.action;
+          return { content: [{ type: "text", text: instructionText(stage, DRAFT_RECORD_GATES) }], details, isError: false };
+        }
+        if (!ctx.hasUI || ctx.agent?.kind === "sub" || guidance.passStart === undefined) {
+          throw new Error("no observation pass is current for this main agent");
+        }
         if (params?.action === "prepare") {
           const { candidates } = params;
           if (!Array.isArray(candidates) || params.proposals !== undefined) throw new Error("Prepare needs a candidate array and no references");
           if ("diagnosis" in params && params.diagnosis !== undefined) {
             throw new Error("Prepare ignores a `diagnosis` beside `candidates`: move `diagnosis` into each candidate it grounds, beside its `change`");
           }
-          details.eligible = withReviewDecisions(files.storeFile(), ctx.cwd, (decisions) =>
-            prepareProposals(candidates, { ...guidance, cwd: ctx.cwd, agentDir: ompAgentDir(), decisions, amendmentSections })).map((proposal) => ({
+          const prepared = withReviewDecisions(files.storeFile(), ctx.cwd, (decisions) =>
+            prepareProposals(candidates, { ...guidance, cwd: ctx.cwd, agentDir: ompAgentDir(), decisions, amendmentSections }));
+          details.rejected = prepared.rejected;
+          details.eligible = prepared.eligible.map((proposal) => ({
             reference: { reviewToolCallId: toolCallId, candidateId: proposal.candidateId, contentHash: contentHash(proposal) },
             proposal,
           }));
@@ -353,20 +385,22 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
             throw new Error("the code of a hook or companion change is asked in its own Select and Ask, apart from every other question");
           }
         } else {
-          throw new Error("review needs inspect/catalog/prepare/select");
+          throw new Error("review needs draft/inspect/catalog/evidence/prepare/select/record");
         }
         const classCounts: Record<Priority, number> = { stale: 0, note: 0, evidence: 0, compaction: 0 };
         for (const { proposal } of details.eligible) classCounts[proposal.priority]++;
-        const cutoff = 5;
         const compared = details.eligible.filter(({ proposal }) => {
           const index = PRIORITIES.indexOf(proposal.priority);
           const preceding = PRIORITIES.slice(0, index).reduce((sum, priority) => sum + classCounts[priority], 0);
-          const slots = Math.max(0, cutoff - preceding);
+          const slots = Math.max(0, ASK_LIMIT - preceding);
           return slots > 0 && classCounts[proposal.priority] > slots;
         });
         const modelUnavailable = compared.length > 0 ? await rankingModelUnavailable(pi, ctx) : undefined;
         details.needsRanking = compared.length > 0 && !modelUnavailable;
         if (params.action === "prepare") {
+          if (details.eligible.some(({ proposal }) => !proposal.reconciles)) {
+            next = instructionText("select", details.needsRanking ? new Set<Gate>(["ranking"]) : undefined);
+          }
           for (const { proposal } of details.needsRanking ? compared : []) {
             details.judgeStates[proposal.candidateId] = {
               target: proposal.kind === "project" ? `project:${proposal.target.path}` : proposal.kind === "harness" ? `harness:${targetLabel(proposal)}` : `skill:${proposal.skill}`,
@@ -377,8 +411,24 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
           }
         } else {
           const selection = selectCandidates(details.eligible, compared, params.rankings, modelUnavailable ?? params.rankingFailure);
-          const selected = selection.ordered.slice(0, 5);
+          const selected = selection.ordered.slice(0, ASK_LIMIT);
           for (const { reference, proposal } of selected) {
+            const staleReason = staleChoiceRefusal(proposal, guidance.provenance);
+            if (staleReason) throw new Error(`proposal \`${reference.candidateId}\`: ${staleReason}`);
+            if ("alternatives" in proposal) {
+              for (const { change } of proposal.alternatives) checkTarget(change, "Prepare");
+            } else if (proposal.change.operation === "compaction" || proposal.change.operation === "withdrawal") {
+              checkTarget(proposal.change, "Prepare");
+            }
+            if ("change" in proposal && proposal.change.operation === "compaction") {
+              const selectedAppends = selected.filter(({ proposal: other }) =>
+                other.skill === proposal.skill && "change" in other && other.change.operation === "on-read-append");
+              const { includes } = proposal.change;
+              if (selectedAppends.length !== includes.length || selectedAppends.some(({ reference: addition, proposal: other }) =>
+                addition.reviewToolCallId !== reference.reviewToolCallId || !includes.includes(other.fingerprint))) {
+                throw new Error(`proposal \`${reference.candidateId}\`: select the compaction with exactly the on-read appends it covers from the same Prepare`);
+              }
+            }
             const { diagnosis } = proposal;
             if (!diagnosis) {
               if (isSkillTextRepair(proposal) || isNewSkill(proposal)) {
@@ -395,31 +445,77 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
               throw new Error(`proposal \`${reference.candidateId}\`: ${error instanceof Error ? error.message : String(error)}, then prepare it again`);
             }
           }
+          if (selected.length > 0) next = instructionText("ask", DRAFT_RECORD_GATES);
           details.selected = selected;
-          details.deferred = selection.ordered.slice(5);
+          details.deferred = selection.ordered.slice(ASK_LIMIT);
           if (selection.fallback) details.fallback = selection.fallback;
         }
       } catch (error) {
         signal?.throwIfAborted();
         details.eligible = [];
-        details.failures.push(error instanceof Error ? error.message : String(error));
+        details.rejected = [];
+        details.selected = [];
+        details.deferred = [];
+        details.needsRanking = false;
+        details.judgeStates = {};
+        next = undefined;
+        details.failures.push(errorMessage(error));
       }
       const output = params?.action === "prepare"
         ? {
             eligible: details.eligible.map((entry) => preparedSummary(entry, amendmentSections)),
+            ...(details.rejected.length > 0 && { rejected: details.rejected }),
             needsRanking: details.needsRanking, judgeStates: details.judgeStates, failures: details.failures,
           }
         : {
             selected: details.selected.map(({ reference }) => reference), deferred: details.deferred.map(({ reference }) => reference),
+            ...(details.deferred.length > 0 && { deferredReason: OVERFLOW_REASON }),
             ...(details.selected.length > 0 && { askHtml: renderAskHtml(details.selected.map(({ proposal }) => proposal)) }),
             ...(details.fallback && { fallback: details.fallback }), failures: details.failures,
           };
-      return { content: [{ type: "text", text: JSON.stringify(output) }], details, isError: details.failures.length > 0 };
+      return { content: [{ type: "text", text: JSON.stringify(next ? { ...output, guidance: next } : output) }], details, isError: details.failures.length > 0 };
     },
   });
 }
 
-const emptyDetails = (): ReviewDetails => ({ eligible: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] });
+const emptyDetails = (): ReviewDetails => ({ eligible: [], rejected: [], needsRanking: false, judgeStates: {}, selected: [], deferred: [], failures: [] });
+
+/** Match the native form to a successful Select, not to a stale or unrelated Ask. */
+export function reviewSelectionForForm(evidence: SessionToolEvidence, passStart: number, html: unknown, before = Infinity) {
+  if (typeof html !== "string") return;
+  for (const { call, result } of evidence.completedCalls(REVIEW_TOOL_NAME).reverse()) {
+    if (call.position <= passStart || result.position >= before || call.args.action !== "select" || result.isError !== false) continue;
+    const selected = (result.details as Partial<ReviewDetails> | undefined)?.selected;
+    if (Array.isArray(selected) && selected.length > 0 && renderAskHtml(selected.map(({ proposal }) => proposal)) === html) return selected;
+  }
+}
+
+/** Receipt lookup for guidance, not authorization: publication still validates its own cited receipts. */
+export function hasReviewedPublication(evidence: SessionToolEvidence, passStart: number, ownerToolsOnly = false): boolean {
+  return evidence.completedCalls("ask").some(({ call, result }) => {
+    if (call.position <= passStart || call.origin !== "native" || result.origin !== "native"
+      || result.isError !== false || result.details?.timedOut === true || !Array.isArray(result.details?.answers)) return false;
+    const selected = reviewSelectionForForm(evidence, passStart, call.args.html, call.position);
+    return selected?.some(({ proposal }) => {
+      const answer = result.details?.answers?.find((choice) => choice?.name === proposal.candidateId)?.answer;
+      if (ownerToolsOnly) {
+        return answer === APPLY && "change" in proposal && (proposal.change.operation === "direct-edit"
+          || (proposal.change.operation === "harness" && proposal.change.stage !== "intent"));
+      }
+      return answer === APPLY || answer === STALE_OPTIONS["stale-update"] || answer === STALE_OPTIONS["stale-delete"];
+    });
+  });
+}
+
+/** A proposal left outside the five questions has no user answer to record. */
+export function overflowDeferral(ref: PreparedProposalRef, evidence: SessionToolEvidence): string | undefined {
+  for (const { call, result } of evidence.completedCalls(REVIEW_TOOL_NAME).reverse()) {
+    if (call.args.action !== "select" || result.isError !== false) continue;
+    const details = result.details as Partial<ReviewDetails> | undefined;
+    if (Array.isArray(details?.selected) && details.selected.some((entry) => isDeepStrictEqual(entry?.reference, ref))) return undefined;
+    if (Array.isArray(details?.deferred) && details.deferred.some((entry) => isDeepStrictEqual(entry?.reference, ref))) return OVERFLOW_REASON;
+  }
+}
 
 function guidanceContext(ctx: ExtensionContext, files: ObserverFiles): GuidanceContext {
   const roots = defaultSkillRoots(ctx.cwd);
@@ -441,15 +537,17 @@ function receiptContext(ctx: ExtensionContext, files: ObserverFiles): ReceiptCon
 
 const searchInventory = (roots: SkillRoots, evidence: SessionToolEvidence): SearchInventory => ({ installed: scanInstalledSkills(roots), created: createdSkills(evidence) });
 
-function readOnlyActionResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext, catalogGap: string | undefined) {
+function readOnlyActionResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext, catalogGap: (branch: readonly SessionEntry[]) => string | undefined) {
   const details = emptyDetails();
   const ok = (text: string) => ({ content: [{ type: "text" as const, text }], details, isError: false });
   try {
+    if (params.action === "evidence") return ok(JSON.stringify(lookupRuleEvidence(params.key, params.cursor, files.storeFile(), ctx)));
     if (params.action === "catalog") {
       if (params.candidates !== undefined || params.proposals !== undefined || params.references !== undefined) {
         throw new Error("A catalog lookup takes `skill` or `terms`, with optional `at`, `limit` and `cursor`");
       }
-      const { lookup, text } = lookupCatalog(params, ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries(), catalogGap);
+      const branch = ctx.sessionManager.getBranch();
+      const { lookup, text } = lookupCatalog(params, branch, ctx.sessionManager.getEntries(), catalogGap(branch));
       details.catalog = lookup;
       return ok(text);
     }
@@ -761,7 +859,18 @@ function withReviewDecisions<T>(file: string, cwd: string, check: (decisions: Re
     const root = realpathSync(cwd);
     const decisions = new Map<string, LedgerRecord | undefined>();
     const get = (fingerprint: string) => {
-      if (!decisions.has(fingerprint)) decisions.set(fingerprint, readLedgerDecision(db, fingerprint));
+      if (!decisions.has(fingerprint)) {
+        try {
+          const record = readLedgerDecision(db, fingerprint);
+          if (record !== undefined && (record?.fingerprint !== fingerprint || typeof record.outcome !== "string"
+            || (record.kind === "project" || record.kind === "harness" ? !record.target : !record.skill))) {
+            throw new Error("invalid stored decision");
+          }
+          decisions.set(fingerprint, record);
+        } catch (error) {
+          throw new CommonReviewError(`could not read the proposal ledger decision for \`${fingerprint}\`: ${errorMessage(error)}`);
+        }
+      }
       return decisions.get(fingerprint);
     };
     return check({
@@ -774,21 +883,69 @@ function withReviewDecisions<T>(file: string, cwd: string, check: (decisions: Re
   }) ?? check({ get: () => undefined, scoped: () => undefined });
 }
 
-function prepareProposals(candidates: readonly ReviewCandidate[], context: PrepareContext): PreparedProposal[] {
-  const grouped = new Map<string, PreparedProposal>();
-  const checked = candidates.map((draft) => checkedCandidate(draft, context));
-  // A compaction's `includes` resolve to this Prepare's on-read appends, so it is prepared after them.
-  const ordered = checked.toSorted((a, b) => Number(a.change.operation === "compaction") - Number(b.change.operation === "compaction"));
-  for (const candidate of ordered) {
-    const prepared = preparedProposal(candidate, [...grouped.values()], context);
-    if (!prepared) continue;
-    const proposal = isSkillTextRepair(candidate) || isNewSkill(candidate)
-      ? { ...prepared, diagnosis: candidateDiagnosis(candidate, context) } : prepared;
-    const previous = grouped.get(proposal.candidateId);
-    grouped.set(proposal.candidateId, previous ? joined(previous, proposal) : proposal);
-  }
-  return [...grouped.values()];
+function prepareProposals(candidates: readonly ReviewCandidate[], context: PrepareContext): {
+  eligible: PreparedProposal[]; rejected: RejectedDraft[];
+} {
+  const eligible = new Map<string, PreparedProposal>();
+  type DraftGroup = { drafts: number[]; reason?: string };
+  const rejected = new Map<number, string>();
+  const collect = (compaction: boolean) => {
+    const groups = new Map<string, DraftGroup>();
+    for (const [index, draft] of candidates.entries()) {
+      if ((draft?.change?.operation === "compaction") !== compaction) continue;
+      let group: DraftGroup | undefined;
+      try {
+        const candidate = checkedCandidate(draft, context);
+        const prepared = preparedProposal(candidate, eligible, context, (id) => {
+          group = groups.get(id) ?? { drafts: [] };
+          group.drafts.push(index);
+          groups.set(id, group);
+        });
+        if (!prepared) continue;
+        const proposal = isSkillTextRepair(candidate) || isNewSkill(candidate)
+          ? { ...prepared, diagnosis: candidateDiagnosis(candidate, context) } : prepared;
+        const previous = eligible.get(proposal.candidateId);
+        eligible.set(proposal.candidateId, previous ? joined(previous, proposal) : proposal);
+      } catch (error) {
+        if (error instanceof CommonReviewError) throw error;
+        const reason = errorMessage(error);
+        rejected.set(index, reason);
+        if (group) group.reason ??= reason;
+      }
+    }
+    for (const [id, { drafts, reason: groupReason }] of groups) {
+      const proposal = eligible.get(id);
+      const reason = groupReason ?? (proposal && staleChoiceRefusal(proposal, context.provenance));
+      if (!reason) continue;
+      eligible.delete(id);
+      for (const index of drafts) {
+        if (!rejected.has(index)) rejected.set(index, drafts.length === 1 ? reason : `another draft for this proposal was rejected: ${reason}`);
+      }
+    }
+  };
+  // A compaction can only cover appends that passed preparation as a complete identity.
+  collect(false);
+  collect(true);
+  return {
+    eligible: [...eligible.values()],
+    rejected: [...rejected].sort(([a], [b]) => a - b).map(([index, reason]) => {
+      const gist = candidates[index]?.gist;
+      return { index, ...(typeof gist === "string" && { gist }), reason };
+    }),
+  };
 }
+
+function staleChoiceRefusal(proposal: PreparedProposal, provenance: ProvenanceResolver): string | undefined {
+  if (!("alternatives" in proposal)) return;
+  if (proposal.skill === undefined) return "a stale choice needs an amendment's skill";
+  const operations = proposal.alternatives.map(({ change }) => change.operation);
+  const canUpdate = isPinKind(provenance.byName(proposal.skill).kind);
+  if (!operations.includes("stale-delete") || operations.includes("stale-update") !== canUpdate) {
+    return "a complete stale choice needs both Update and Delete for an installed upstream or plugin skill; an orphaned amendment takes Delete only";
+  }
+}
+
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 const SKILL_TEXT_OPERATIONS: ReadonlyArray<string> = ["direct-edit", "on-read-append", "rule"];
 
@@ -856,10 +1013,15 @@ function inspectDetails(id: string, { evidence, passStart }: Pick<ReceiptContext
   const { call, result } = completed;
   if (call.name !== REVIEW_TOOL_NAME || call.args.action !== "inspect") throw new Error(`${label}: that call is not an observer_review inspect`);
   const details = result.details as Pick<ReviewDetails, "inspection" | "search"> | undefined;
-  if (result.isError !== false || !(details?.inspection || details?.search)) throw new Error(`${label}: that inspection failed; inspect the skill again`);
+  if (result.isError !== false) throw new Error(`${label}: that inspection failed; inspect the skill again`);
+  const { inspection, search } = details ?? {};
+  if (inspection ? search || typeof inspection.skill !== "string" || !Array.isArray(inspection.sources) || !Array.isArray(inspection.referenceInventory)
+    : !search || typeof search.skill !== "string" || typeof search.fingerprint !== "string" || !Array.isArray(search.terms) || !Array.isArray(search.matches)) {
+    throw new CommonReviewError(`${label}: the saved inspection receipt is corrupt`);
+  }
   if (passStart === undefined) throw new Error(`${label}: no observation pass is current on this branch, so no inspection grounds a repair`);
   if (call.position < passStart) throw new Error(`${label} is from an earlier observation pass; inspect the skill again in this pass`);
-  return details;
+  return { inspection, search };
 }
 
 function checkCurrent(id: string, receipt: GuidanceInspection, context: ReceiptContext): void {
@@ -928,15 +1090,24 @@ function checkedCitation(citation: Partial<Citation> | undefined, receipt: Guida
 /** One proposal from two candidates with the same identity: their evidence merged, and for a stale question each answer drafted. */
 function joined(previous: PreparedProposal, next: PreparedProposal): PreparedProposal {
   const evidence = mergeEvidence([...previous.evidence, ...next.evidence]);
+  if (previous.kind !== next.kind) throw new Error(`proposal \`${previous.candidateId}\` has conflicting kinds`);
   if ("alternatives" in previous && "alternatives" in next) {
     const alternatives = [...previous.alternatives];
     for (const alternative of next.alternatives) {
+      const first = alternatives[0]!;
+      if (first.change.rule.name !== alternative.change.rule.name || !isDeepStrictEqual(first.change.target, alternative.change.target)) {
+        throw new Error(`proposal \`${previous.candidateId}\` has conflicting stale amendment targets`);
+      }
       const same = alternatives.find(({ change }) => change.operation === alternative.change.operation);
       if (!same) alternatives.push(alternative);
-      else if (JSON.stringify(same) !== JSON.stringify(alternative)) throw new Error(`stale \`${same.change.rule.name}\` has two different ${same.change.operation} drafts`);
+      else if (!isDeepStrictEqual(same, alternative)) throw new Error(`stale \`${same.change.rule.name}\` has two different ${same.change.operation} drafts`);
     }
     alternatives.sort((a, b) => OPERATIONS.indexOf(a.change.operation) - OPERATIONS.indexOf(b.change.operation));
     return { ...previous, evidence, alternatives };
+  }
+  if (!("change" in previous) || !("change" in next) || previous.preview !== next.preview
+    || !isDeepStrictEqual(previous.change, next.change) || !isDeepStrictEqual(previous.reconciles, next.reconciles)) {
+    throw new Error(`proposal \`${previous.candidateId}\` has conflicting changes for the same identity`);
   }
   const preferred = PRIORITIES.indexOf(next.priority) < PRIORITIES.indexOf(previous.priority) ? next : previous;
   return { ...preferred, evidence };
@@ -978,7 +1149,7 @@ function checkedCandidate(candidate: ReviewCandidate, context: PrepareContext): 
  */
 function preparedProposal(
   candidate: ReviewCandidate & { evidence: ReviewEvidence[] },
-  prepared: readonly PreparedProposal[], context: PrepareContext,
+  prepared: ReadonlyMap<string, PreparedProposal>, context: PrepareContext, identify: (id: string) => void,
 ): PreparedProposal | undefined {
   const { change: draft } = candidate;
   const { decisions } = context;
@@ -997,6 +1168,7 @@ function preparedProposal(
     if (draft.operation !== "harness") throw new Error("an observer hook or companion change is a harness change, asked first as its intent");
     if (draft.stage === "removal") {
       const removal = hookRemoval(candidate.target, context);
+      identify(`removal:${removal.fingerprint}`);
       checkCurrentFingerprint(candidate, removal.fingerprint);
       if (isDeclined(removal.fingerprint)) return undefined;
       const { priority, gist, remedy, evidence } = candidate;
@@ -1007,6 +1179,7 @@ function preparedProposal(
     const missing = isCode ? undefined : INTENT_LINES.find(([field]) => typeof draft[field] !== "string" || !draft[field].trim());
     if (missing) throw new Error(`a harness intent needs its ${missing[1].toLowerCase()}`);
     const fingerprint = proposalIdentity(candidate, decisions);
+    identify(`${isCode ? "code" : "proposal"}:${fingerprint}`);
     if (isDeclined(fingerprint)) return undefined;
     if (isCode) return { candidateId: `code:${fingerprint}`, fingerprint, ...base, ...codeStage(candidate.target, fingerprint, draft, context) };
     return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, change: { operation: "harness", stage: "intent" }, preview: intentPreview(candidate.target, fingerprint, draft, context) };
@@ -1014,9 +1187,10 @@ function preparedProposal(
   if (draft.operation === "harness") throw new Error("a harness change needs a harness target: the project or global hooks directory, or the companion extension");
   if (draft.operation === "direct-edit") {
     if (isPinKind(candidate.kind)) throw new Error("an upstream or plugin skill takes amendment rules, not a direct edit");
-    if (typeof draft.preview !== "string" || !draft.preview.trim()) throw new Error("a direct edit needs its exact preview");
     const fingerprint = proposalIdentity(candidate, decisions);
+    identify(`proposal:${fingerprint}`);
     if (isDeclined(fingerprint)) return undefined;
+    if (typeof draft.preview !== "string" || !draft.preview.trim()) throw new Error("a direct edit needs its exact preview");
     return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, change: { operation: "direct-edit" }, preview: draft.preview };
   }
   if (candidate.kind === "project") throw new Error("a project proposal is a direct edit");
@@ -1024,6 +1198,7 @@ function preparedProposal(
   const { dirs, referencesDir } = context;
   /** `prepare` validates and reads the change's target only once the identity is known not to be declined. */
   const proposal = (identityClass: string, fingerprint: string, prepare: () => ProtectedChange): PreparedProposal | undefined => {
+    identify(`${identityClass}:${fingerprint}`);
     if (isDeclined(fingerprint)) return undefined;
     const change = prepare();
     const preview = renderPreview(skill, kind, change);
@@ -1053,9 +1228,9 @@ function preparedProposal(
       }));
     }
     case "rule": {
-      if (typeof draft.pattern !== "string" || !draft.pattern.trim()) throw new Error("a rule change needs its `pattern`; an on-read fix is an on-read append");
       const fingerprint = proposalIdentity(candidate, decisions);
       return reconciled(proposal("proposal", fingerprint, () => {
+        if (typeof draft.pattern !== "string" || !draft.pattern.trim()) throw new Error("a rule change needs its `pattern`; an on-read fix is an on-read append");
         const { operation: _, ...rule } = draft;
         const fix = fixRule({ skill, kind, gist: candidate.gist, rule }, fingerprint, dirs, context.provenance);
         return {
@@ -1067,14 +1242,16 @@ function preparedProposal(
     case "stale-update":
     case "stale-delete": {
       const rule = readObserverRule(dirs, draft.rule);
-      if (rule.amends !== skill) throw new Error("stale rule does not amend the candidate skill");
-      checkCurrentFingerprint(candidate, rule.fingerprint);
       return proposal("stale", rule.fingerprint, () => {
+        if (rule.amends !== skill) throw new Error("stale rule does not amend the candidate skill");
+        checkCurrentFingerprint(candidate, rule.fingerprint);
         if (!isPinned(rule)) throw new Error(`\`${rule.name}\` is a barrier rule for a local or managed skill, so it never goes stale`);
         if (draft.operation === "stale-delete") {
           return { operation: "stale-delete", ...ruleTarget(rule), ...optional("references", releasedReferences(dirs, referencesDir, rule)) };
         }
         const body = typeof draft.body === "string" ? draft.body.trim() : "";
+        const installed = context.provenance.byName(skill);
+        if (!isPinKind(installed.kind) || installed.kind !== kind) throw new Error(`\`${skill}\` is no longer installed as a ${kind} skill, so this amendment cannot be updated`);
         if (!body) throw new Error("a stale Update needs the new `body`");
         if (draft.references !== undefined) {
           if (!isOnReadAmendment(rule)) throw new Error("`references` come only with a new body for the skill's on-read amendment");
@@ -1110,8 +1287,8 @@ function preparedProposal(
     case "compaction": {
       const current = skillAmendment(dirs.amendmentsDir, skill);
       const fingerprint = compactionFingerprint(skill, current?.body ?? "");
-      checkCurrentFingerprint(candidate, fingerprint);
       return proposal("compaction", fingerprint, () => {
+        checkCurrentFingerprint(candidate, fingerprint);
         const installed = context.provenance.byName(skill);
         if (!isPinKind(installed.kind) || installed.kind !== kind) throw new Error(`\`${skill}\` is not an upstream or plugin skill, so it has no on-read amendment to compact`);
         const body = typeof draft.body === "string" ? draft.body.trim() : "";
@@ -1119,14 +1296,20 @@ function preparedProposal(
         if (!Array.isArray(draft.includes) || draft.includes.some((addition) => typeof addition !== "string" || !addition.trim())) {
           throw new Error("a compaction's `includes` lists the on-read appends of this Prepare it covers, by gist or fingerprint");
         }
+        const appends = [...prepared.values()].filter((entry) => entry.skill === skill && "change" in entry && entry.change.operation === "on-read-append");
+        const includes = [...new Set(draft.includes.map((addition) => includedAddition(skill, addition, appends)))];
+        const omitted = appends.filter(({ fingerprint }) => !includes.includes(fingerprint));
+        if (omitted.length > 0) throw new Error(`the compaction leaves out eligible on-read fixes: ${omitted.map(({ gist }) => JSON.stringify(gist)).join(", ")}`);
         if (!Array.isArray(draft.references)) throw new Error("a compaction needs its complete set of `references`, empty for none");
         checkReferenceFiles(draft.references);
         checkPointers(referencesDir, skill, body, draft.references);
+        const references = referenceChange(referencesDir, skill, draft.references);
+        if (!current && includes.length === 0) throw new Error(`\`${skill}\` has no on-read amendment or prepared additions to compact`);
         return {
           operation: "compaction", ...optional("rule", current && ruleIdentity(current)),
           target: snapshot(current?.path ?? rulePath(dirs.amendmentsDir, skillAmendmentName(skill))),
-          includes: [...new Set(draft.includes.map((addition) => includedAddition(skill, addition, prepared)))],
-          body, references: referenceChange(referencesDir, skill, draft.references),
+          includes,
+          body, references,
         };
       });
     }
@@ -1140,8 +1323,7 @@ function preparedProposal(
  */
 function includedAddition(skill: string, addition: string, prepared: readonly PreparedProposal[]): string {
   const named = proposalFingerprint(skill, addition);
-  const matches = prepared.filter((proposal) => proposal.skill === skill && "change" in proposal && proposal.change.operation === "on-read-append" &&
-    (proposal.fingerprint === addition || proposalFingerprint(skill, proposal.gist) === named));
+  const matches = prepared.filter((proposal) => proposal.fingerprint === addition || proposalFingerprint(skill, proposal.gist) === named);
   const [match] = matches;
   if (!match || matches.length > 1) {
     throw new Error(`the compaction of \`${skill}\` includes ${JSON.stringify(addition)}, which names ${match ? "more than one" : "no"} on-read append of this Prepare`);
@@ -1413,15 +1595,22 @@ export function preparedEntry(evidence: SessionToolEvidence, reference: Prepared
   if (call.name !== REVIEW_TOOL_NAME || call.args.action !== "prepare") throw new Error(`${label}: that call is not an observer_review Prepare`);
   if (result.isError !== false) throw new Error(`${label}: that Prepare did not succeed`);
   const details: unknown = result.details;
-  const saved = details && typeof details === "object" && "eligible" in details && Array.isArray(details.eligible) ? details.eligible : [];
-  // This tool wrote these entries; the content hash below is what checks they are unchanged.
-  const matches = (saved as PreparedEntry[]).filter((entry) => entry?.reference?.candidateId === reference.candidateId);
-  const [entry] = matches;
-  if (!entry?.proposal || matches.length > 1) throw new Error(`${label}: that Prepare holds no single proposal with that ID`);
-  const hash = contentHash(entry.proposal);
-  if (entry.proposal.candidateId !== reference.candidateId || entry.reference.reviewToolCallId !== reference.reviewToolCallId || entry.reference.contentHash !== hash) {
-    throw new Error(`${label}: the saved proposal no longer matches its content hash`);
+  if (!details || typeof details !== "object" || !("eligible" in details) || !Array.isArray(details.eligible)) {
+    throw new CommonReviewError(`review \`${reference.reviewToolCallId}\`: the saved Prepare receipt has no eligible list`);
   }
+  const seen = new Set<string>();
+  let entry: PreparedEntry | undefined;
+  for (const saved of details.eligible as PreparedEntry[]) {
+    const ref = saved?.reference;
+    if (!isProposalRef(ref) || !saved.proposal || saved.proposal.candidateId !== ref.candidateId
+      || ref.reviewToolCallId !== reference.reviewToolCallId || ref.contentHash !== contentHash(saved.proposal) || seen.has(ref.candidateId)) {
+      throw new CommonReviewError(`review \`${reference.reviewToolCallId}\`: a saved proposal no longer matches its content hash or has a duplicate identity`);
+    }
+    seen.add(ref.candidateId);
+    if (ref.candidateId === reference.candidateId) entry = saved;
+  }
+  if (!entry) throw new Error(`${label}: that Prepare holds no single proposal with that ID`);
+  const hash = entry.reference.contentHash;
   if (reference.contentHash !== hash) throw new Error(`${label}: content hash does not match the prepared proposal`);
   return entry;
 }

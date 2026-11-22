@@ -67,9 +67,9 @@ export function evidenceReport({ digest, ledger, stale, observations, catalog }:
   };
 }
 
-/** No signals, loaded skills, stale amendments, applied fixes or pending observations: nothing `/observe` could review. */
+/** Nothing to estimate for an initial pass and no remedy outcomes to report. */
 export function isEmptyEvidenceReport(report: EvidenceReport): boolean {
-  return Object.values(report.signals).every((count) => count === 0) &&
+  return report.payload === undefined && Object.values(report.signals).every((count) => count === 0) &&
     report.skills.length === 0 && report.stale.length === 0 && report.outcomes.length === 0 && report.observations === 0;
 }
 
@@ -89,7 +89,7 @@ export function renderEvidenceReport(report: EvidenceReport): string {
     "Remedy outcomes:",
     ...(report.outcomes.length > 0 ? report.outcomes.map(({ fingerprint, status, target }) => `- ${fingerprint}: ${status} (${target})`) : ["- none"]),
     `Stale amendments: ${list(report.stale.map(({ rule, skill }) => `${rule} (${skill})`))}`,
-    ...(report.payload ? [`Payload estimate for /observe now: ${describePayloadEstimate(report.payload)}`] : []),
+    ...(report.payload ? [`Initial /observe payload estimate (hidden message only): ${describePayloadEstimate(report.payload)}`] : []),
     `Later proposals: ${report.later}`,
     `Pending observations: ${report.observations}`,
     `Skill catalog observations: ${describeCatalogSummary(report.catalog)}`,

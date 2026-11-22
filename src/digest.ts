@@ -92,6 +92,8 @@ export interface SessionDigest {
   /** Oldest first; a counted signal sits where it last occurred. */
   signals: SkillSignal[];
   skills: LoadedSkill[];
+  /** At least one completed reply followed an actual user prompt outside an observation pass. */
+  primaryWork?: boolean;
   toolExercises?: ToolExercise[];
   /** Reads requested, including failed and unresolved requests; never proof of loading. */
   attemptedSkills?: SkillProvenance[];
@@ -335,8 +337,8 @@ interface Turn {
   /** Skills loaded so far in this turn, by name. */
   skills: string[];
   calls: ToolCallRecord[];
-  /** An observation pass: its calls are no manual workflow and its tool errors no skill signal. */
-  observing: boolean;
+  kind: "ambient" | "user" | "observer";
+  observerBookkeeping?: true;
 }
 
 /** Subagent statuses: `completed` when all agree, else a count per status. */
@@ -378,6 +380,8 @@ function isUserPrompt(message: AgentMessage): boolean {
 /** The `customType` of the message `/observe` sends to start an observation pass. */
 export const OBSERVATION_MESSAGE_TYPE = "skill-observer";
 
+const OBSERVER_BOOKKEEPING_TOOLS: Record<string, true> = { observe: true, observer_review: true, observer_check: true, observer_resolve: true };
+
 export function buildDigest(
   entries: readonly SessionEntry[],
   env: DigestEnvironment,
@@ -400,7 +404,8 @@ export function buildDigest(
     signals.delete(key);
     signals.set(key, { ...signal, count, ...(occurrenceIds.length ? { occurrenceIds } : {}) } as SkillSignal);
   };
-  let turn: Turn = { skills: [], calls: [], observing: false };
+  let turn: Turn = { skills: [], calls: [], kind: "ambient" };
+  let primaryWork = false;
 
   const loadSkill = (skill: SkillProvenance | undefined, route: SkillLoadRoute): LoadedSkill | undefined => {
     if (!skill) return undefined;
@@ -418,11 +423,11 @@ export function buildDigest(
       loaded.amendmentsDelivered = [...(loaded.amendmentsDelivered ?? []), rule];
     }
   };
-  const startTurn = (observing = false) => {
-    if (!turn.observing && turn.skills.length === 0 && turn.calls.length >= MIN_WORKFLOW_CALLS) {
+  const startTurn = (kind: Turn["kind"] = "ambient") => {
+    if (turn.kind !== "observer" && turn.skills.length === 0 && turn.calls.length >= MIN_WORKFLOW_CALLS) {
       add({ kind: "workflow", correction: false, entryId: turn.calls[0]?.id, calls: outline(turn.calls) });
     }
-    turn = { skills: [], calls: [], observing };
+    turn = { skills: [], calls: [], kind };
   };
 
   // Assistant text the user saw last, kept to show what a correction answers.
@@ -454,17 +459,25 @@ export function buildDigest(
       continue;
     }
     if (entry.type === "custom_message" && entry.customType === OBSERVATION_MESSAGE_TYPE) {
-      startTurn(true);
+      startTurn("observer");
+      continue;
+    }
+    if (entry.type === "reset_boundary") {
+      startTurn();
       continue;
     }
     if (entry.type === "custom_message" && entry.customType === AMENDMENT_REMINDER_TYPE) {
       // The reminder names its skills and rules itself, so a rule deleted since still shows as delivered.
-      for (const { rule, skill } of remindedAmendments(entry.content ?? "")) deliverAmendment(rule, skill, "slash-command");
+      if (turn.kind !== "observer") {
+        for (const { rule, skill } of remindedAmendments(entry.content ?? "")) deliverAmendment(rule, skill, "slash-command");
+      }
       continue;
     }
     const delivery = amendmentDelivery(entry);
     if (delivery) {
-      for (const rule of delivery.rules) deliverAmendment(rule, delivery.skill, "read");
+      if (turn.kind !== "observer") {
+        for (const rule of delivery.rules) deliverAmendment(rule, delivery.skill, "read");
+      }
       continue;
     }
     if (entry.type === "custom_message" && entry.customType === "async-result") {
@@ -498,8 +511,8 @@ export function buildDigest(
     const message = entry.type === "message" ? entry.message : undefined;
     if (!message) continue;
     if (isUserPrompt(message)) {
-      startTurn();
-    } else if (message.role === "user" && message.steering && message.attribution !== "agent") {
+      startTurn("user");
+    } else if (message.role === "user" && message.steering && !message.synthetic && message.attribution !== "agent") {
       correct({
         kind: "steering",
         correction: true,
@@ -508,9 +521,19 @@ export function buildDigest(
       });
     } else if (message.role === "assistant" && Array.isArray(message.content)) {
       const prose = textOf(message.content);
-      if (prose.trim()) lastProse = prose;
+      const hasProse = prose.trim().length > 0;
+      if (hasProse) lastProse = prose;
+      if (!primaryWork && turn.kind === "user" && (!turn.observerBookkeeping || turn.calls.length > 0) && hasProse &&
+          (message.stopReason === undefined || message.stopReason === "stop") &&
+          !message.content.some((block) => block.type === "toolCall")) {
+        primaryWork = true;
+      }
       for (const block of message.content) {
         if (block.type !== "toolCall") continue;
+        if (block.name && Object.hasOwn(OBSERVER_BOOKKEEPING_TOOLS, block.name)) {
+          turn.observerBookkeeping = true;
+          continue;
+        }
         const call: ToolCallRecord = {
           id: block.id ?? entry.id,
           name: block.name ?? "unknown",
@@ -528,18 +551,19 @@ export function buildDigest(
         if (block.id) calls.set(block.id, call);
         if (block.name === "ask" && block.id) {
           askCalls.set(block.id, block.arguments ?? {});
-        } else if (block.name === "read" && typeof block.arguments?.path === "string") {
+        } else if (turn.kind !== "observer" && block.name === "read" && typeof block.arguments?.path === "string") {
           call.skill = skillReadBy(block.arguments.path, env.provenance);
           if (call.skill) attemptedSkills.set(call.skill.kind === "unknown" ? call.skill.name : call.skill.path, call.skill);
         }
       }
     } else if (message.role === "toolResult") {
+      if (message.toolName && Object.hasOwn(OBSERVER_BOOKKEEPING_TOOLS, message.toolName)) continue;
       const call = calls.get(message.toolCallId ?? "");
       if (call) call.status = message.isError ? "error" : "ok";
       if (call?.skill && !message.isError) loadSkill(call.skill, "read");
       // A background job or service has not finished, so its result proves nothing yet.
       const unfinished = message.details?.async !== undefined || message.details?.service !== undefined;
-      if (call && !turn.observing && entry.id && !unfinished) {
+      if (call && turn.kind !== "observer" && entry.id && !unfinished) {
         toolExercises.push({ entryId: entry.id, tool: call.name, args: call.exerciseArgs ?? "", failed: Boolean(message.isError),
           ...(message.isError ? { error: headAndTail(textOf(message.content), ERROR_CHARS) } : {}),
           deliveredRules: [...skills.values()].flatMap((skill) => skill.amendmentsDelivered ?? []),
@@ -549,7 +573,7 @@ export function buildDigest(
       const cancelledAsk =
         message.toolName === "ask" && Object.keys(message.details ?? {}).length === 0;
       if (message.isError) {
-        if (cancelledAsk || turn.observing) continue;
+        if (cancelledAsk || turn.kind === "observer") continue;
         add({
           kind: "tool-error",
           correction: false,
@@ -566,7 +590,7 @@ export function buildDigest(
           ? message.content
           : message.content?.find((block) => block.type === "text")?.text ?? "";
         for (const signal of askSignals(entry.id, askCall, message.details, firstText)) {
-          if (!turn.observing || signal.kind === "ask-custom-input") correct(signal);
+          if (turn.kind !== "observer" || signal.kind === "ask-custom-input") correct(signal);
         }
       } else if (
         message.toolName === "manage_skill" &&
@@ -591,6 +615,7 @@ export function buildDigest(
     signals: [...signals.values()],
     skills: [...skills.values()],
     attemptedSkills: [...attemptedSkills.values()],
+    ...(primaryWork && { primaryWork }),
     toolExercises,
     createdSkills: [...createdSkills],
   };
@@ -598,7 +623,7 @@ export function buildDigest(
 
 /** True when the digest gives an observation pass nothing to work from. */
 export function isEmptyDigest(digest: SessionDigest): boolean {
-  return digest.signals.length === 0 && digest.skills.length === 0;
+  return !digest.primaryWork && digest.signals.length === 0 && digest.skills.length === 0;
 }
 
 /** How often each rule broke as a rule violation in the digest, by rule name. */

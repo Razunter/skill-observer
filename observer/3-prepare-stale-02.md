@@ -1,0 +1,1 @@
+- `stale-update` with the `rule` name, new `body` and, when they change, the complete `references`; `stale-delete` with the `rule` name. Send both for an installed upstream or plugin skill, or Delete alone if the amendment no longer has such a skill to pin to.

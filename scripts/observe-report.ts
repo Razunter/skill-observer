@@ -10,7 +10,7 @@
  */
 import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { CommandHandler, ExtensionAPI, ExtensionContext, Schema, SessionEntry } from "../src/omp.js";
 import { observerStorePath, readObserverStore } from "../src/observer-store.js";
 import { ompAgentDir } from "../src/provenance.js";
@@ -26,7 +26,8 @@ const byId = new Map(rows.filter((row) => row.id).map((row) => [row.id!, row]));
 const branch: SessionEntry[] = [];
 for (let entry = leafId ? byId.get(leafId) : rows.at(-1); entry; entry = entry.parentId ? byId.get(entry.parentId) : undefined) branch.unshift(entry);
 if (branch.length === 0) throw new Error(`no entry ${leafId} in ${sessionFile}`);
-const cwd = rows.find((row) => row.type === "session")?.cwd ?? process.cwd();
+const header = rows.find((row) => row.type === "session");
+const cwd = header?.cwd ?? process.cwd();
 
 const liveAgentDir = ompAgentDir();
 const agentDir = mkdtempSync(join(tmpdir(), "observe-report-"));
@@ -63,7 +64,10 @@ try {
   } as unknown as ExtensionAPI;
   const ctx = {
     hasUI: true, agent: { kind: "main" }, cwd,
-    sessionManager: { getBranch: () => branch, getEntries: () => rows, getSessionId: () => "observe-report" },
+    sessionManager: {
+      getBranch: () => branch, getEntries: () => rows,
+      getSessionId: () => header?.id ?? "observe-report", getSessionFile: () => resolve(sessionFile),
+    },
     modelRegistry: { getAvailable: () => [] },
     ui: { setStatus: () => {}, notify: (message: string) => console.log(message) },
   } as unknown as ExtensionContext;

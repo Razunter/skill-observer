@@ -1,1 +1,3 @@
 Done when every proposal has an exact preview, supporting evidence and target-specific verification, every skill-text repair rests on an inspection of its skill and every new skill on a search, skill/guidance drafts pass the writing tests, every barrier has passed replay (or is set aside as Later), every stale amendment has a verdict, and every compaction holds all prior instructions within its existing size/reference contract.
+
+For outcomes that need recording but no Ask (such as a stale Keep or a barrier set aside without replay), call `observer_review` with `action: "record"` before Resolve. On a restored branch this also recovers Apply guidance when the saved Ask has an applicable answer; it grants no approval.
