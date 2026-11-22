@@ -254,7 +254,12 @@ interface PrepareContext extends ReceiptContext {
 }
 
 /** The model uses installed host judge helpers between Prepare and Select; this tool never calls a provider. */
-export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catalogGap: (branch: readonly SessionEntry[]) => string | undefined): void {
+export function registerReviewTool(
+  pi: ExtensionAPI,
+  files: ObserverFiles,
+  catalogGap: (branch: readonly SessionEntry[]) => string | undefined,
+  activateStageTool?: (action: "draft" | "record") => Promise<void>,
+): void {
   const z = pi.zod;
   const referenceFiles = z.array(z.object({ name: z.string(), body: z.string() }));
   const projectTarget = z.object({ scope: z.enum(["project"]), root: z.string(), path: z.string(), mechanism: z.string() });
@@ -263,57 +268,57 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
     check: z.string().describe("Exact foreground check after writing, in the target root."),
   };
   const change = z.union([
-    z.object({ operation: z.enum(["direct-edit"]), preview: z.string().describe("The exact skill edit or new skill.") }),
+    z.object({ operation: z.enum(["direct-edit"]), preview: z.string().describe("Exact skill edit or new skill.") }),
     z.object({ operation: z.enum(["project-edit"]), ...projectEdit }),
     z.object({ operation: z.enum(["project-edits"]), edits: z.array(z.object({ target: projectTarget, ...projectEdit })) })
-      .describe("One fix in multiple named checkouts. Put all targets here; omit the outer target."),
+      .describe("One fix across named checkouts; omit outer `target`."),
     z.object({ operation: z.enum(["profile-edit"]), text: z.string().describe("Complete replacement text."), check: z.union([
       z.object({ kind: z.enum(["content"]), contains: z.string().describe("Decisive passage present after the edit."), excludes: z.string().optional(),
         installedCopy: z.object({ skill: z.string(), why: z.string().describe("Why controls, amendment and owned source do not fit.") }).optional() }),
       z.object({ kind: z.enum(["pattern"]), replayToolCallId: z.string().describe("Passing observer_check on the exact ruleText.") }),
       z.object({ kind: z.enum(["skill-control"]), skill: z.string(), mode: z.enum(["manual-only", "disable"]) }),
     ]) }),
-    z.object({ operation: z.enum(["on-read-append"]), section: z.string().describe("The section appended to the skill's on-read amendment: a `## ` heading line and its text.") }),
+    z.object({ operation: z.enum(["on-read-append"]), section: z.string().describe("Append one `## ` heading and its text.") }),
     z.object({ operation: z.enum(["rule"]), name: z.string(), body: z.string(), pattern: z.string(), ...sampleSchemas(z) })
       .describe("A pattern amendment (upstream/plugin) or barrier rule (local/managed), as checked by observer_check."),
     z.object({ operation: z.enum(["stale-update"]), rule: z.string(), body: z.string(), references: referenceFiles.optional() }),
     z.object({ operation: z.enum(["stale-delete"]), rule: z.string() }),
     z.object({ operation: z.enum(["withdrawal"]), body: z.string().optional(), references: referenceFiles.optional() })
-      .describe("Takes back the applied fix named by the candidate `fingerprint`; for a fix inside the on-read amendment, `body` is its whole new body, empty to delete it."),
+      .describe("Withdraw the applied fix named by `fingerprint`; for an on-read fix, give the full remaining `body` (empty deletes)."),
     z.object({ operation: z.enum(["compaction"]), includes: z.array(z.string()), body: z.string(), references: referenceFiles })
-      .describe("`includes`: the on-read appends of this Prepare it covers, by gist or fingerprint; `references`: the complete set."),
+      .describe("`includes`: covered on-read appends from this Prepare, by gist or fingerprint. `references`: complete set."),
     z.object({
       operation: z.enum(["harness"]), stage: z.enum(["checked"]),
       files: z.array(z.object({ path: z.string(), text: z.string().optional() }))
-        .describe("Every exact file, relative to the executable's root; omit text only to remove the file."),
-      checkToolCallId: z.string().describe("Successful foreground Bash check of these exact changes in scratch, from this pass."),
+        .describe("All exact files, relative to executable root; omit `text` only for removal."),
+      checkToolCallId: z.string().describe("Same-pass successful foreground Bash check of these exact changes in scratch."),
       lowerRungs: z.string().describe("Why a simpler remedy cannot fix this mechanism."),
     }).describe("Checked executable code. One exact native Apply authorizes publication, not activation."),
   ]);
-  const formatting = " Inline `code` and up to two **bold** phrases render in the form.";
+  const formatting = " Inline `code`; at most two **bold** phrases.";
   const draft = {
-    gist: z.string().describe("One sentence leading with what changes; inline `code` renders in the form."),
+    gist: z.string().describe("One sentence starting with what changes. Inline `code` renders."),
     priority: z.enum(PRIORITIES),
-    remedy: z.string().describe(`How the change fixes the finding and how its effect will show; the form already names the target and kind.${formatting}`),
+    remedy: z.string().describe(`How this fixes the finding and how to verify it.${formatting}`),
     change,
     evidence: z.array(z.object({ quote: z.string(), count: z.number(), source: z.string().optional(), occurrenceIds: z.array(z.string()).optional() })).optional(),
     fingerprint: z.string().optional(),
     reconciles: z.object({
-      approval: z.object(approvalShape(z)).describe("The user's approval of the original proposal, exactly as observer_resolve would cite it."),
-      changedTarget: z.string().optional().describe("Only when the target amendment or rule file changed since the approved Prepare read it, and then required: how it changed."),
-      reason: z.string().describe("Why this revision of the approved section or rule: what the user's note asked for, the target's change, or both."),
-      preserved: z.string().describe("Why the revision keeps the approved intent and the target's unrelated content."),
-    }).optional().describe("On-read append or rule only: revises an approved proposal, in the same pass, by the note the user attached to its Apply (read from the Ask; a section, or a rule's body, pattern and samples, not its name), for a target that changed after its Prepare, or both. The main agent's reconciliation, not the user's approval: a change that would drop or rewrite the target's new content, or delete a target, needs a new proposal and Ask."),
+      approval: z.object(approvalShape(z)).describe("Exact original approval as cited to observer_resolve."),
+      changedTarget: z.string().optional().describe("Required only after target drift: what changed since approved Prepare."),
+      reason: z.string().describe("What the Apply note requests, why target drift needs revision, or both."),
+      preserved: z.string().describe("How the revision preserves approved intent and unrelated content."),
+    }).optional().describe("Same-pass on-read append or rule only: revise the section or rule body, pattern and samples, never the rule name. Use the Apply note from Ask, post-Prepare target drift, or both. This is the agent's revision, not user approval. Dropping or rewriting new target content, or deleting a target, needs a new proposal and Ask."),
     diagnosis: z.object({
-      inspection: z.string().describe("The ID of this pass's observer_review inspect call of the candidate's skill, whose receipt the citations name; for a new skill, of its new-skill search."),
-      explanation: z.string().describe(`Why the inspected guidance does not already address the finding (missing, unclear or ignored), with the check that could have shown otherwise and its result; for a new skill, why each search match does not fit.${formatting}`),
-      delta: z.string().describe(`One sentence: what a future agent will do differently.${formatting}`),
+      inspection: z.string().describe("Same-pass observer_review call ID: Inspect this skill or search for this new skill."),
+      explanation: z.string().describe(`Why guidance is missing, unclear or ignored. Give the check that could disprove this and its result. For a new skill, why each search match does not fit.${formatting}`),
+      delta: z.string().describe(`One sentence on changed future agent behavior.${formatting}`),
       citations: z.array(z.object({
-        source: z.string().describe("A source `path` the inspection receipt lists."),
-        lines: z.object({ from: z.number(), to: z.number() }).optional().describe("1-based inclusive lines of that source as inspected."),
-        section: z.string().optional().describe("A `## ` heading of that source as inspected."),
-      })).optional().describe("Required for a repair, omitted for a new skill: the inspected guidance the explanation rests on, each by `lines`, `section` or both."),
-    }).optional().describe("The candidate diagnosis: required for a new skill, a direct edit of a local or managed skill, an on-read append and a rule; omitted for a project or harness remedy, stale answers, withdrawals and compactions."),
+        source: z.string().describe("Exact `path` from the inspection receipt."),
+        lines: z.object({ from: z.number(), to: z.number() }).optional().describe("1-based inclusive lines in the inspected source."),
+        section: z.string().optional().describe("Inspected `## ` heading."),
+      })).optional().describe("Required for repairs, omitted for new skills. Ground the explanation with `lines`, `section` or both per source."),
+    }).optional().describe("Required for new skills, local/managed direct edits, on-read appends and rules. Omit for project/harness remedies, stale answers, withdrawals and compactions."),
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
@@ -364,7 +369,9 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
             throw new Error("only the main agent in a current observation pass can request that procedure");
           }
           const stage = params.action === "record" && hasReviewedPublication(guidance.evidence, guidance.passStart) ? "publish" : params.action;
-          return { content: [{ type: "text", text: instructionText(stage, DRAFT_RECORD_GATES) }], details, isError: false };
+          const text = instructionText(stage, DRAFT_RECORD_GATES);
+          if (activateStageTool) await activateStageTool(params.action);
+          return { content: [{ type: "text", text }], details, isError: false };
         }
         if (!ctx.hasUI || ctx.agent?.kind === "sub" || guidance.passStart === undefined) {
           throw new Error("no observation pass is current for this main agent");

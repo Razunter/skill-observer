@@ -60,7 +60,7 @@ import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
 import { checkHarnessPublication, checkProfilePublication, checkProjectPublication, checkProjectState, checkSkillEditPublication, type HarnessFileFailure, observedProjectPublication, type ProjectEdit, type SkillEditPublication } from "./project-publication.js";
 import { checkExecutableState, type ExecutableEdit } from "./executable-publication.js";
-import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, approvedProfile, approvedProject, findProjectApproval, laterNote, latestPrepared, observationPassStart, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
+import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, approvedProfile, approvedProject, findProjectApproval, laterNote, latestPrepared, observationPassStart, preparedInPass, type ProposalAnswerRef, requireSkillDecline, TargetChangedError } from "./proposal-approval.js";
 import { loadInstructionStage, type ToolResultCondition, whatToDoNow } from "./payload.js";
 import { projectRootScope } from "./project-scope.js";
 import { isProposalRef, overflowDeferral, preparedProjectEntries, type PreparedProposal, type PreparedProposalRef, proposalRefSchema } from "./review.js";
@@ -194,6 +194,9 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
   if (answer.fingerprint !== undefined && answer.fingerprint !== fingerprint) throw new Error("project fingerprint does not match its scoped identity");
   let reoffer = answer.reoffer;
   const passStart = observationPassStart(branch);
+  if (outcome === "declined" && approved === undefined && passStart === undefined) {
+    throw new Error("a project Decline needs a current native Decline; no observation pass is current on this branch");
+  }
   if (passStart !== undefined && approved === undefined) {
     const evidence = sessionToolEvidence(branch);
     const prepared = preparedProjectEntries(evidence, passStart).find(({ proposal }) => proposal.change.operation === "project-edit" &&
@@ -201,7 +204,8 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
     approved = prepared && findProjectApproval(prepared.reference, evidence, branch, passStart, choice);
     if (!approved) {
       const deferred = outcome === "later" && prepared && overflowDeferral(prepared.reference, evidence);
-      if (!deferred) throw new Error("record a native project answer or an eligible overflow; rejected drafts and report items are not ledger decisions");
+      if (!deferred) throw new Error(outcome === "declined" ? "a project Decline needs a current native Decline for this exact prepared project change"
+        : "record a native project answer or an eligible overflow; rejected drafts and report items are not ledger decisions");
       reoffer = reoffer && reoffer !== deferred ? `${deferred} ${reoffer}` : deferred;
     }
   }
@@ -410,7 +414,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
               .describe("Applied local, managed or new skill direct edit only, and required for one: the `observerToolCallId` of the successful call that made the approved edit after the user's Apply, the `edit` or `write` of a local skill's SKILL.md, or the `manage_skill` `update` of a managed skill or `create` of a new one. This tool writes no skill."),
             proposal: proposalRefSchema(z)
               .optional()
-              .describe("Any other answer to a prepared on-read fix, rule or direct edit (Later, Decline, deferred by Select), or a Decline of a withdrawal: its `reference` from the pass's latest Prepare holding it, exactly as Prepare returned it. Skill, kind, gist, fingerprint and evidence are the prepared proposal's; a Later without `reoffer` takes the note the user attached to Later."),
+              .describe("Later, a native Decline, or a deferral by Select: the `reference` of the latest prepared on-read fix, rule or direct edit, exactly as Prepare returned it. A withdrawal's native Decline also cites its `proposal`. Resolve checks Decline on the unchanged native Ask form. Skill, kind, gist, fingerprint and evidence are the prepared proposal's; a Later without `reoffer` takes the note the user attached to Later."),
             evidence: z
               .array(
                 z.object({
@@ -439,7 +443,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             fingerprint: z.string().optional(),
             evidence: z.array(z.object({ quote: z.string(), count: z.number(), occurrenceIds: z.array(z.string()).optional() })).optional(),
             reoffer: z.string().optional().describe(REOFFER_DESCRIPTION),
-            approval: z.object(approvalShape(z)).optional().describe("Native Ask receipt; required for Apply or a non-current checkout."),
+            approval: z.object(approvalShape(z)).optional().describe("Native Ask receipt. Required for Apply or a non-current checkout. Decline requires a current native answer to the exact reviewed project change."),
             publication: z.object({
               writeToolCallId: z.string(),
               checkToolCallIds: z.array(z.string()),
@@ -516,6 +520,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const ledger = files.storeFile();
       const records: LedgerRecord[] = [];
       const outsideAmendments: PreparedRecord[] = [];
+      const skillDeclines = new Map<ValidatedAnswer, CitingAnswer>();
       const failures: string[] = [];
       const external = new Map<LedgerRecord, readonly string[]>();
       const refusedPublications = new Map<LedgerRecord, string>();
@@ -628,6 +633,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           }
           const checked: ValidatedAnswer = change?.operation === "withdrawal" ? { answer, fingerprint, withdrawal: change }
             : { answer, fingerprint, fix: change && fixRule({ ...answer, rule: fixDraft(change) }, fingerprint, dirs, provenance) };
+          if (answer.outcome === "declined") skillDeclines.set(checked, sent);
           return [checked];
         } catch (error) {
           targetChanged ||= error instanceof TargetChangedError;
@@ -714,13 +720,13 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             const eligible = new Set<ValidatedAnswer>();
             for (const entry of approved.answers) {
               const { answer, fingerprint, fix, directEdit } = entry;
-              if (directEdit) {
-                try {
-                  approvedDirectEdit(answer.approval, branch);
-                } catch (error) {
-                  refuseAnswer(entry, (error as Error).message);
-                  continue;
-                }
+              const decline = skillDeclines.get(entry);
+              try {
+                if (directEdit) approvedDirectEdit(answer.approval, branch);
+                if (decline) citedAnswer(decline, branch);
+              } catch (error) {
+                refuseAnswer(entry, (error as Error).message);
+                continue;
               }
               const historical = latest.get(fingerprint);
               if (answer.outcome === "declined" && historical && sameOwner({ fingerprint, skill: answer.skill }, historical)
@@ -982,6 +988,7 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
     if (![skill, kind, gist].every((value) => typeof value === "string" && value.trim())) {
       throw new Error("an answer citing no prepared proposal needs its `skill`, `kind` and `gist`");
     }
+    if (answer.outcome === "declined") throw new Error("a skill Decline needs its prepared proposal reference and a current native Decline");
     return { ...rest, skill: skill!, kind: kind!, gist: gist! };
   }
   if (!isProposalRef(cited)) throw new Error("a cited proposal is its `reference`, exactly as Prepare returned it");
@@ -1000,6 +1007,7 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
   const quoted = proposal.evidence.length > 0 ? proposal.evidence.map(({ source: _, ...item }) => item) : answer.evidence;
   const deferral = reference !== undefined && answer.outcome !== "applied" ? overflowDeferral(reference, evidence) : undefined;
   if (deferral && answer.outcome !== "later") throw new Error("a proposal deferred past the Ask cap was not answered; record it as Later, not Decline");
+  if (reference !== undefined && answer.outcome === "declined") requireSkillDecline(reference, evidence, branch);
   const reoffer = deferral
     ? (answer.reoffer && answer.reoffer !== deferral ? `${deferral} ${answer.reoffer}` : deferral)
     : (reference !== undefined && answer.outcome === "later" && answer.reoffer === undefined ? laterNote(reference, evidence) : undefined);

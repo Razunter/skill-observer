@@ -103,6 +103,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
   }
   registerAmendmentDelivery(pi, amendmentsDir);
   const catalogGap = registerCatalogCapture(pi, isObservable);
+  let pendingPassToolUpdate: Promise<void> | undefined;
   pi.on("tool_call", (event, ctx) => {
     try {
       const nativeAsk = event.toolName === "ask" && event.parentToolCallId === undefined;
@@ -130,7 +131,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
     }
   });
 
-  pi.on("tool_result", (event, ctx) => {
+  pi.on("tool_result", async (event, ctx) => {
     const isReceiptTool = ["write", "edit", "bash", "manage_skill", "ask", REVIEW_TOOL_NAME, CHECK_TOOL_NAME].includes(event.toolName);
     const branch = ctx.sessionManager.getBranch();
     recordHookResult(pi, event, branch);
@@ -139,9 +140,13 @@ export default function skillObserver(pi: ExtensionAPI): void {
     if (passStart === undefined) return;
     const details = event.toolName === "ask" ? event.details as AskDetails | undefined : undefined;
     const guidance: { type: "text"; text: string }[] = [];
-    if (Array.isArray(details?.answers) && details.timedOut !== true) {
-      const evidence = sessionToolEvidence(branch);
-      const selected = evidence.isNativeCall(event.toolCallId, "ask") && reviewSelectionForForm(evidence, passStart, event.input?.html);
+    const html = event.input?.html;
+    if (Array.isArray(details?.answers) && details.timedOut !== true && typeof html === "string") {
+      // The native request is on the branch before its result is saved.
+      const askPosition = branch.findLastIndex((entry, position) => position > passStart && entry.message?.role === "assistant"
+        && Array.isArray(entry.message.content) && entry.message.content.some((call) =>
+          call.type === "toolCall" && call.name === "ask" && call.id === event.toolCallId && call.arguments?.html === html));
+      const selected = askPosition !== -1 && reviewSelectionForForm(sessionToolEvidence(branch), passStart, html, askPosition);
       if (selected) {
         let stage: "publish" | "record" | undefined;
         for (const choice of details.answers) {
@@ -155,7 +160,9 @@ export default function skillObserver(pi: ExtensionAPI): void {
         }
         if (stage !== undefined) {
           try {
-            guidance.push({ type: "text", text: instructionText(stage, DRAFT_RECORD_GATES) });
+            const text = instructionText(stage, DRAFT_RECORD_GATES);
+            await activatePassTools([RESOLVE_TOOL_NAME]);
+            guidance.push({ type: "text", text });
           } catch (error) {
             guidance.push({ type: "text", text: `Publication and recording stopped: ${(error as Error).message}` });
           }
@@ -179,22 +186,36 @@ export default function skillObserver(pi: ExtensionAPI): void {
   // Active tools live only in this process, so a restored or switched branch still inside a pass needs them back to resolve its saved approvals.
   const restorePass = async (event: unknown, ctx: ExtensionContext) => {
     refreshHint(event, ctx);
-    if (isObservable(ctx) && observationPassStart(ctx.sessionManager.getBranch()) !== undefined) await activatePassTools();
+    if (isObservable(ctx) && observationPassStart(ctx.sessionManager.getBranch()) !== undefined) {
+      await activatePassTools([RESOLVE_TOOL_NAME, CHECK_TOOL_NAME, REVIEW_TOOL_NAME]);
+    }
   };
   pi.on("session_start", restorePass);
   pi.on("session_switch", restorePass);
   pi.on("session_branch", restorePass);
   pi.on("session_tree", restorePass);
 
-  async function activatePassTools(): Promise<void> {
-    const activeTools = pi.getActiveTools();
-    const passTools = [RESOLVE_TOOL_NAME, CHECK_TOOL_NAME, REVIEW_TOOL_NAME].filter((name) => !activeTools.includes(name));
-    if (passTools.length > 0) await pi.setActiveTools([...activeTools, ...passTools]);
+  async function activatePassTools(tools: readonly string[], discovery = false): Promise<void> {
+    const update = () => {
+      const activeTools = pi.getActiveTools();
+      const retained = discovery ? activeTools.filter((name) => name !== CHECK_TOOL_NAME && name !== RESOLVE_TOOL_NAME) : activeTools;
+      const missing = tools.filter((name) => !retained.includes(name));
+      if (retained.length !== activeTools.length || missing.length > 0) return pi.setActiveTools([...retained, ...missing]);
+    };
+    // The host queues replacements, not the active-tool reads that feed them.
+    const activation = pendingPassToolUpdate ? pendingPassToolUpdate.then(update, update) : update();
+    if (!activation) return;
+    const pending = activation.finally(() => {
+      if (pendingPassToolUpdate === pending) pendingPassToolUpdate = undefined;
+    });
+    pendingPassToolUpdate = pending;
+    return pending;
   }
 
   registerResolveTool(pi, { storeFile, rulesDir: userRulesDir, amendmentsDir, referencesDir });
   registerCheckTool(pi);
-  registerReviewTool(pi, { storeFile, rulesDir: userRulesDir, amendmentsDir, referencesDir }, catalogGap);
+  registerReviewTool(pi, { storeFile, rulesDir: userRulesDir, amendmentsDir, referencesDir }, catalogGap,
+    (action) => activatePassTools([action === "draft" ? CHECK_TOOL_NAME : RESOLVE_TOOL_NAME]));
 
   pi.registerTool<{ text: string }, undefined>({
     name: "observe",
@@ -251,7 +272,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
         return;
       }
       if (payload.retroUnavailable) ctx.ui.notify("Retro reference unavailable; evidence-backed discovery can continue.", "warning");
-      await activatePassTools();
+      await activatePassTools([REVIEW_TOOL_NAME], true);
       pi.sendMessage(
         {
           customType: OBSERVATION_MESSAGE_TYPE, content: payload.content, display: false, attribution: "user",

@@ -86,9 +86,9 @@ function fixture() {
   const run = (params: unknown) => call("observer_resolve", params);
   /**
    * Prepares and selects `candidates`, then saves an Ask of the form Select
-   * returned, answered by choosing `select` in each fieldset (Apply, or a stale
-   * amendment's Update or Delete), which is the only synthetic part. Returns
-   * each selected proposal's approval, in selection order.
+   * returned, answered by choosing `select` in each fieldset. The choice is
+   * the only synthetic part. Returns each selected proposal's approval in
+   * selection order.
    */
   const approve = async (candidates: unknown[], select = "Apply") => {
     const grounded = await groundRepairs(candidates, (skill) => call("observer_review", { action: "inspect", skill }));
@@ -187,6 +187,16 @@ async function approveHookRemoval(f: ReturnType<typeof fixture>, path: string, c
 }
 const toolCall = (id: string, name: string, args: Record<string, unknown>): SessionEntry =>
   ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } });
+
+async function declinedFixes(f: ReturnType<typeof fixture>, skill: string, gists: string[]) {
+  const approvals = await f.approve(gists.map((gist) => ({
+    kind: "upstream", skill, gist, priority: "evidence", remedy: "Fix",
+    change: { operation: "on-read-append", section: `## ${gist}\n\nFix ${gist}.` },
+  })), "Decline");
+  expect(approvals).toHaveLength(gists.length);
+  return approvals.map(({ proposal }) => ({ proposal, outcome: "declined" }));
+}
+
 it("refuses Resolve on an unmigrated profile even when its legacy proposal ledger is empty", async () => {
   const f = fixture();
   writeFileSync(join(f.roots.cwd, "..", "ledger.jsonl"), "");
@@ -204,24 +214,38 @@ it("does not initialize a fresh store for an empty or refused Resolve", async ()
   expect(refused.details.records).toEqual([]);
   expect(existsSync(f.files.storeFile())).toBe(false);
 });
-it.each(["later", "declined"])("binds an existing fingerprint to its skill for %s while accepting a reworded gist", async outcome => {
+it("binds an existing fingerprint to its skill for Later while accepting a reworded gist", async () => {
   const f = fixture(); await f.add("first");
   const original = readLedger(f.files.storeFile())[0]!;
-  const bad = await f.run({ outcomes: [{ skill: "domain-modeling", kind: "upstream", gist: "reworded", fingerprint: original.fingerprint, outcome }] });
+  const bad = await f.run({ outcomes: [{ skill: "domain-modeling", kind: "upstream", gist: "reworded", fingerprint: original.fingerprint, outcome: "later" }] });
   expect(bad.details.failures).toHaveLength(1);
   expect(readLedger(f.files.storeFile())).toHaveLength(1);
   const good = await f.run({ outcomes: [{ skill: "tdd", kind: "upstream", gist: "reworded", fingerprint: original.fingerprint, outcome: "later" }] });
   expect(good.details.failures).toEqual([]);
   expect(readLedger(f.files.storeFile()).at(-1)?.gist).toBe("reworded");
 });
+it("refuses a native Decline when another skill has claimed its fingerprint", async () => {
+  const f = fixture();
+  const [decline] = await declinedFixes(f, "tdd", ["first"]);
+  const fingerprint = proposalFingerprint("tdd", "first");
+  const other = { skill: "domain-modeling", kind: "upstream", gist: "Other", fingerprint, outcome: "later",
+    timestamp: new Date().toISOString(), sessionId: "other-session" } as const;
+  writeObserverStore(f.files.storeFile(), new Date(), (db) => putLedgerRecords(db, [other]));
+  const result = await f.run({ outcomes: [decline] });
+  expect(result.details.failures).toEqual([expect.stringContaining("belongs to another skill")]);
+  expect(result.details.records).toEqual([]);
+  expect(readLedger(f.files.storeFile())).toEqual([other]);
+});
 it("binds a new fingerprint to the first skill claiming it in one batch", async () => {
   const f = fixture();
+  const [first] = await declinedFixes(f, "tdd", ["first"]);
+  const fingerprint = proposalFingerprint("tdd", "first");
   const result = await f.run({ outcomes: [
-    { skill: "tdd", kind: "upstream", gist: "first", fingerprint: "shared", outcome: "declined" },
-    { skill: "domain-modeling", kind: "upstream", gist: "second", fingerprint: "shared", outcome: "later" },
+    first,
+    { skill: "domain-modeling", kind: "upstream", gist: "second", fingerprint, outcome: "later" },
   ] });
   expect(result.details.failures).toHaveLength(1);
-  expect(readLedger(f.files.storeFile())).toMatchObject([{ fingerprint: "shared", skill: "tdd", outcome: "declined" }]);
+  expect(readLedger(f.files.storeFile())).toMatchObject([{ fingerprint, skill: "tdd", outcome: "declined" }]);
 });
 it("lets a later skill claim a fingerprint whose first claimant failed validation", async () => {
   const f = fixture();
@@ -272,6 +296,8 @@ it("rechecks affected decisions after replay without refusing independent answer
   const project = await publishProjectEdit(f);
   const directFingerprint = proposalFingerprint(direct.outcome.skill, direct.outcome.gist);
   const scopedFingerprint = projectFingerprint(project.outcome.target);
+  const declines = await declinedFixes(f, "tdd", ["Keep applied", "Independent"]);
+  const appliedFingerprint = proposalFingerprint("tdd", "Keep applied");
   vi.stubEnv("PATH", "");
   const pending = f.run({ outcomes: [
     ...outcomes,
@@ -279,15 +305,15 @@ it("rechecks affected decisions after replay without refusing independent answer
     { kind: "harness", outcome: "applied", approval: removal, publication },
     { skill: "ce-commit-jj", kind: "local", gist: "Commit with jj", outcome: "applied", approval: barrier },
     { skill: "tdd", kind: "upstream", gist: "Wrong owner", fingerprint: "claimed", outcome: "later" },
-    { skill: "tdd", kind: "upstream", gist: "Keep applied", fingerprint: "applied", outcome: "declined" },
+    declines[0],
     { skill: "tdd", kind: "upstream", gist: "Reuse fresh evidence", fingerprint: "evidence", outcome: "later" },
-    { skill: "tdd", kind: "upstream", gist: "Independent", outcome: "declined" },
+    declines[1],
   ] });
   // A separate process must be able to commit while Resolve is waiting on replay.
   const concurrent = [
     other("dependent", { outcome: "applied", rule: `/previous/location/${basename(first.rule!)}` }),
     other("claimed", { skill: "domain-modeling" }),
-    other("applied", { outcome: "applied" }),
+    other(appliedFingerprint, { outcome: "applied" }),
     other("evidence", { evidence: newEvidence }),
     lateHook,
     other(directFingerprint, { evidence: oldEvidence }),
@@ -328,7 +354,7 @@ it("rechecks affected decisions after replay without refusing independent answer
   }
   expect(final.find(({ fingerprint }) => fingerprint === outsideHook.fingerprint)).toMatchObject({ outcome: "applied" });
   expect(final.slice(-9)).toMatchObject([
-    { fingerprint: "claimed", skill: "domain-modeling" }, { fingerprint: "applied", outcome: "applied" },
+    { fingerprint: "claimed", skill: "domain-modeling" }, { fingerprint: appliedFingerprint, outcome: "applied" },
     { fingerprint: directFingerprint }, { fingerprint: scopedFingerprint },
     { fingerprint: existingHook.fingerprint, outcome: "withdrawn" }, { fingerprint: lateHook.fingerprint, outcome: "withdrawn" },
     { gist: "Commit with jj", outcome: "later" }, { fingerprint: "evidence", evidence: newEvidence },
@@ -511,8 +537,10 @@ async function withReadLock<T>(file: string, action: () => Promise<T>): Promise<
 it("rolls back a busy batch, preserving both publications and independent answers", async () => {
   const f = fixture();
   const file = f.files.storeFile();
-  const independent = (gist: string) => f.run({ outcomes: [{ skill: "domain-modeling", kind: "upstream", gist, outcome: "declined" }] });
-  await independent("before");
+  writeObserverStore(file, new Date(), (db) => putLedgerRecords(db, [{
+    skill: "domain-modeling", kind: "upstream", gist: "before", fingerprint: proposalFingerprint("domain-modeling", "before"),
+    outcome: "declined", timestamp: new Date().toISOString(), sessionId: "historical-session",
+  }]));
   const result = await withReadLock(file, () => addAll(f, ["first", "second"]));
   expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")?.body).toMatch(/## first[\s\S]*## second/);
   expect(result.isError).toBe(true);
@@ -520,7 +548,7 @@ it("rolls back a busy batch, preserving both publications and independent answer
   expect(result.details.recording).toEqual({ rows: ["unrecorded", "unrecorded"], error: expect.stringMatching(/locked|busy/i) });
   expect(readLedger(file).map((record) => record.gist)).toEqual(["before"]);
   expect(existsSync(`${file}-journal`)).toBe(false);
-  expect((await independent("after")).details.recording.rows).toEqual(["recorded"]);
+  expect((await f.run({ outcomes: await declinedFixes(f, "domain-modeling", ["after"]) })).details.recording.rows).toEqual(["recorded"]);
   expect(readLedger(file).map((record) => record.gist)).toEqual(["before", "after"]);
   const text = result.content[0]!.text;
   expect(text).toMatch(/Unrecorded publication[\s\S]*applied `tdd`/);
@@ -637,7 +665,7 @@ it("prunes expired pending observations and shown markers on a ledger-only write
   recordObservation(file, cwd, "Old pending observation", old);
   expect(pending(old)?.map(({ text }) => text)).toEqual(["Old pending observation", "Fresh observation"]);
   expect(pending(new Date())?.map(({ text }) => text)).toEqual(["Fresh observation"]);
-  const result = await f.run({ outcomes: [{ skill: "tdd", kind: "upstream", gist: "No need", outcome: "declined" }] });
+  const result = await f.run({ outcomes: await declinedFixes(f, "tdd", ["No need"]) });
   expect(result.details.recording.rows).toEqual(["recorded"]);
   expect(pending(old)?.map(({ text }) => text)).toEqual(["Fresh observation"]);
   recordObservation(file, cwd, "Old shown observation", old);
@@ -649,7 +677,8 @@ it("keeps a rolled-back compaction's failure and reference files when the ledger
   replaceReferenceFiles(f.files.referencesDir(), "tdd", [{ name: "old.md", body: "Original bytes" }]);
   const [approval] = await f.approve([f.compaction(`Read ${join(f.files.referencesDir(), "tdd", "new.md")}`, [{ name: "new.md", body: "Replacement" }])]);
   vi.spyOn(amendments, "rewriteRuleBody").mockImplementation(() => { throw new Error("injected body failure"); });
-  const result = await withReadLock(f.files.storeFile(), () => f.run({ outcomes: [{ skill: "domain-modeling", kind: "upstream", gist: "Unrelated", outcome: "declined" }], compactions: [{ skill: "tdd", outcome: "applied", approval }] }));
+  const declined = await declinedFixes(f, "domain-modeling", ["Unrelated"]);
+  const result = await withReadLock(f.files.storeFile(), () => f.run({ outcomes: declined, compactions: [{ skill: "tdd", outcome: "applied", approval }] }));
   expect(result.details.failures.join(" ")).toContain("injected body failure");
   expect(readdirSync(join(f.files.referencesDir(), "tdd"))).toEqual(["old.md"]);
   expect(result.details.publications).toEqual([]);
@@ -683,11 +712,12 @@ it("lists a Later replay deferral and a Decline apart from the unrecorded public
     { kind: "local", skill: "ce-commit-jj", gist: "Commit with jj", priority: "evidence", remedy: "Fix", change: { operation: "rule", name: "jj-not-git", body: "Use jj.",
       pattern: "\\bgit commit\\b", scope: "tool:bash", matches: [{ command: "git commit -m x" }], spares: [{ command: "jj commit -m x" }] } },
   ]);
+  const [declined] = await declinedFixes(f, "domain-modeling", ["Unrelated"]);
   vi.stubEnv("PATH", "");
   const result = await withReadLock(f.files.storeFile(), () => f.run({ outcomes: [
     { skill: "tdd", kind: "upstream", gist: "first", outcome: "applied", approval: append },
     { skill: "ce-commit-jj", kind: "local", gist: "Commit with jj", outcome: "applied", approval: barrier },
-    { skill: "domain-modeling", kind: "upstream", gist: "Unrelated", outcome: "declined" },
+    declined,
   ] }));
   expect(result.details.records.map((record) => record.outcome)).toEqual(["applied", "later", "declined"]);
   expect(result.details.deferred).toEqual([expect.stringContaining("omp")]);

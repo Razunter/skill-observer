@@ -33,7 +33,7 @@ import { isDeepStrictEqual } from "node:util";
 import { frontmatterField } from "./amendments.js";
 import { OBSERVATION_MESSAGE_TYPE } from "./digest.js";
 import type { AgentMessage, AskDetails, AskOptionNote, Schema, SchemaBuilder, SessionEntry } from "./omp.js";
-import { isProposalRef, type PreparedChange, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, preparedEntry, preparedProjectEntries, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, snapshot } from "./review.js";
+import { isProposalRef, type PreparedChange, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, preparedEntry, preparedProjectEntries, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, reviewSelectionForForm, snapshot } from "./review.js";
 import { hasUnlistedReferenceEntries, readReferenceFiles } from "./references.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 
@@ -315,7 +315,7 @@ function approvedOwner(ref: Partial<ProposalAnswerRef> | undefined, branch: read
   if (choice === APPLY && note !== undefined && !/^(?:please )?verify(?: only)?[.!]?$/i.test(note)) {
     throw new Error("the Apply has a note that may change the approved work; prepare and ask again");
   }
-  checkLatestAnswer(approval, evidence, answeredAt);
+  checkLatestAnswer(approval, evidence, answeredAt, choice === "Decline" && proposal.kind === "project" ? choice : APPLY);
   const files = new Set(ownerFiles(change));
   const preparedAt = evidence.completedCall(approval.proposal.reviewToolCallId).result.position;
   const askAt = evidence.completedCall(approval.askToolCallId).call.position;
@@ -347,21 +347,41 @@ export function findProjectApproval(reference: PreparedProposalRef, evidence: Se
 
 export function findOwnerApproval(reference: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[], passStart: number,
     choice: "Apply" | "Later" | "Decline" = APPLY) {
+  const approval = findAnswerRef(reference, evidence, passStart);
+  if (!approval) return;
+  try {
+    return approvedOwner(approval, branch, evidence, choice);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Finds a receipt for a skill Decline without asking the model for the Select and Ask IDs. */
+export function requireSkillDecline(reference: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[]): void {
+  const passStart = observationPassStart(branch);
+  const approval = passStart === undefined ? undefined : findAnswerRef(reference, evidence, passStart);
+  const required = "a skill Decline needs a current native Decline";
+  if (!approval) throw new Error(`${required} on the unchanged Select form for this exact prepared proposal`);
+  try {
+    const { answeredAt } = approvedProposal(approval, evidence, branch, () => new Map([["Decline", true]]));
+    checkLatestAnswer(approval, evidence, answeredAt, "Decline");
+  } catch (error) {
+    throw new Error(`${required}: ${(error as Error).message}`);
+  }
+}
+
+function findAnswerRef(reference: PreparedProposalRef, evidence: SessionToolEvidence, passStart: number): ProposalAnswerRef | undefined {
   const selections = evidence.completedCalls(REVIEW_TOOL_NAME).flatMap(({ call, result }) => {
     if (call.position <= passStart || call.args.action !== "select" || result.isError !== false) return [];
     const selected = (result.details as { selected?: PreparedEntry[] } | undefined)?.selected;
-    if (!selected?.some((entry) => isDeepStrictEqual(entry?.reference, reference))) return [];
+    if (!Array.isArray(selected) || !selected.some((entry) => isDeepStrictEqual(entry?.reference, reference))) return [];
     return [{ id: call.id, position: result.position, html: renderAskHtml(selected.map(({ proposal }) => proposal)) }];
   });
   const ask = evidence.completedCalls("ask").findLast(({ call }) =>
     selections.some((selected) => selected.position < call.position && selected.html === call.args.html));
   if (!ask) return;
-  const selectionToolCallId = selections.findLast((selected) => selected.position < ask.call.position && selected.html === ask.call.args.html)?.id;
-  try {
-    return approvedOwner({ proposal: reference, selectionToolCallId, askToolCallId: ask.call.id }, branch, evidence, choice);
-  } catch {
-    return undefined;
-  }
+  const selection = selections.findLast((selected) => selected.position < ask.call.position && selected.html === ask.call.args.html);
+  if (selection) return { proposal: reference, selectionToolCallId: selection.id, askToolCallId: ask.call.id };
 }
 
 /**
@@ -386,15 +406,25 @@ export function approvedDirectEdit(ref: Partial<ProposalAnswerRef> | undefined, 
 }
 
 /** Throws when a later Prepare or Ask of this pass holds the approved proposal again, which voids the answer saved at `answeredAt`. */
-function checkLatestAnswer(approval: ProposalAnswerRef, evidence: SessionToolEvidence, answeredAt: number): void {
+function checkLatestAnswer(approval: ProposalAnswerRef, evidence: SessionToolEvidence, answeredAt: number, choice: "Apply" | "Decline" = APPLY): void {
   const { candidateId, reviewToolCallId } = approval.proposal;
   const isReprepared = latestPrepared(candidateId, evidence)?.reviewToolCallId !== reviewToolCallId;
-  const form = evidence.completedCall(approval.askToolCallId).call.args.html;
+  const { call: ask } = evidence.completedCall(approval.askToolCallId);
+  const form = ask.args.html;
+  const afterPrepare = choice === "Decline" ? evidence.completedCall(reviewToolCallId).result.position : undefined;
+  if (afterPrepare !== undefined) {
+    const selected = reviewSelectionForForm(evidence, afterPrepare, form, ask.position);
+    if (!selected?.some(({ reference }) => isDeepStrictEqual(reference, approval.proposal))) {
+      throw new Error("the Ask's latest matching Select did not select this exact prepared proposal");
+    }
+  }
   const isReasked = evidence.completedCalls("ask").some(({ call, result }) =>
     result.position > answeredAt && call.origin === "native" &&
-    (call.args.html === form || result.details?.answers?.some((answer) => answer?.name === candidateId)));
+    (call.args.html === form || result.details?.answers?.some((answer) => answer?.name === candidateId) ||
+      (afterPrepare !== undefined && reviewSelectionForForm(evidence, afterPrepare, call.args.html, call.position)
+        ?.some(({ reference }) => reference.candidateId === candidateId))));
   if (isReprepared || isReasked) {
-    throw new Error("this Apply is superseded: a later Prepare or Ask of this pass holds the same proposal again; cite the user's latest answer, which must be an Apply");
+    throw new Error(`this ${choice} is superseded: a later Prepare or Ask of this pass holds the same proposal again; cite the user's latest answer, which must be ${choice === APPLY ? "an" : "a"} ${choice}`);
   }
 }
 

@@ -28,7 +28,7 @@ In the interactive OMP session, enter:
 /observe
 ```
 
-With no signals, skills, or stale amendments in a fresh session, it reports `No skill signals in this session: nothing to observe.` and starts no model turn. This confirms the command loaded. A quiet session has no status hint.
+In a fresh session with no work or pending evidence, `/observe` reports `Nothing to observe` and starts no model turn. This confirms the command loaded. A quiet session has no status hint.
 
 After working with a skill and correcting the agent, run `/observe` again. You can add your own focus or feedback:
 
@@ -64,7 +64,7 @@ extensions:
 
 Use your checkout path and preserve existing entries. OMP settings layers replace extension arrays rather than append to them. A project can instead list the extension in `.omp/config.yml`.
 
-Restart OMP after adding the path. You can then launch from your project without `-e`. OMP's working directory defines project-fix scope; loading the extension does not change it.
+Restart OMP after adding the path. You can then launch from your project without `-e`. The OMP working directory is the default checkout for project fixes. The user can name other relevant checkouts in the pass. Loading the extension does not change the working directory.
 
 ### Enable or disable in OMP
 
@@ -91,7 +91,7 @@ Restart OMP to load source edits. `observer.md` is read on each `/observe`, so e
 
 These skills are installed separately, not downloaded or bundled by skill-observer:
 
-- [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, provides retrospective guidance for session-backed project-environment findings. Without it, a pass whose session has a workflow outline or tool error warns and continues ordinary observation.
+- [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, supplies optional discovery categories. A pass can find project improvements from completed work without a tool error. If the reference is unavailable, the pass can continue with session evidence.
 - [`correct`](https://github.com/cursor/plugins/blob/main/harness/pstack/claude-code/skills/correct/SKILL.md), from Lauren Tan's pstack, can be offered as `/skill:correct` after at least two distinct occurrences of the same mistake class. Only you may invoke it. Observer approval does not invoke it or authorize its repairs or commits.
 - [`writing-for-agents`](https://github.com/mattpocock/skills), from Matt Pocock's skills, is the drafting reference for agent-facing guidance. If it is unavailable, the pass discloses that and uses its inline drafting checks.
 

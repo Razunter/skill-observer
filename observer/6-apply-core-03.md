@@ -5,7 +5,7 @@ Keep the `observerToolCallId` of the call that made each skill edit: step 5 reco
 
 Successful `ask`, `observer_review`, `observer_check`, `edit`, `write`, `manage_skill` and `bash` outputs during this pass include `{"observerToolCallId":"<actual opaque host ID>"}`. Use it in the receipt, not a snapshot tag, command or session-entry ID. The ID itself proves nothing; Resolve checks scope, results and ordering.
 
-Nested `eval` calls use hook-observed normal tool receipts, not eval output. Call `ask` directly: a nested Ask approves nothing. For a project edit keep scratch files outside the reviewed checkout. A nullable foreground Bash service name is allowed; a named service is not a check.
+Nested `eval` calls use hook-observed normal tool receipts, not eval output. Call `ask` directly: a nested Ask supplies no decision. For a project edit keep scratch files outside the reviewed checkout. A nullable foreground Bash service name is allowed; a named service is not a check.
 
 `observer_resolve` writes every rule that passes its replay check and carries out stale answers, in step 5.
 

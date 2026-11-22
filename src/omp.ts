@@ -368,7 +368,7 @@ export interface ExtensionAPI {
   ): void;
   on(
     event: "tool_result",
-    handler: (event: ToolResultEvent, ctx: ExtensionContext) => ToolResultEventResult | undefined,
+    handler: (event: ToolResultEvent, ctx: ExtensionContext) => ToolResultEventResult | undefined | Promise<ToolResultEventResult | undefined>,
   ): void;
   on(
     event: "tool_call",

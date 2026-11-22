@@ -540,22 +540,64 @@ describe("/observe", () => {
     expect(content).toMatch(/`implement-spec`: managed/);
   });
 
-  it("keeps observer tools inactive until a pass starts, then adds them", async () => {
-    const host = loadExtension();
+  it("starts discovery with Review as the only new active tool", async () => {
+    const sentWithTools: string[][] = [];
+    const host = loadExtension({ onSend: () => { sentWithTools.push([...host.activeTools()].sort()); } });
     host.setBranch([...fx.plainUserMessage, ...fx.steeringUserMessage]);
     expect(host.activeTools()).toEqual(["read", "ask", "observe"]);
     await host.runCommand("observe");
-    expect(host.activeTools()).toEqual(["read", "ask", "observe", "observer_resolve", "observer_check", "observer_review"]);
+    expect(sentWithTools).toEqual([["ask", "observe", "observer_review", "read"]]);
+    expect([...host.activeTools()].sort()).toEqual(sentWithTools[0]);
+  });
+
+  it("activates Check after Draft, activates Resolve after Record without an Ask, and resets both for the next pass", async () => {
+    const host = loadExtension();
+    await host.runCommand("observe", "Review the seams guidance.");
+    await host.commitMessage(host.sent[0]!.message);
+
+    const draft = await host.callTool("observer_review", { action: "draft" });
+    expect(draft.isError).toBe(false);
+    expect([...host.activeTools()].sort()).toEqual(["ask", "observe", "observer_check", "observer_review", "read"]);
+
+    const record = await host.callTool("observer_review", { action: "record" });
+    expect(record.isError).toBe(false);
+    expect(resultText(record)).toContain("## 5. Record");
+    expect([...host.activeTools()].sort()).toEqual(["ask", "observe", "observer_check", "observer_resolve", "observer_review", "read"]);
+
+    await host.runCommand("observe", "Review a second finding.");
+    expect(host.sent).toHaveLength(2);
+    expect([...host.activeTools()].sort()).toEqual(["ask", "observe", "observer_review", "read"]);
   });
 
   it.each([
-    ["a restored branch still inside a pass", [], true],
-    ["a branch whose pass a later prompt ended", fx.plainUserMessage, false],
-  ] as const)("re-adds observer tools on session start for %s", async (_label, after, active) => {
+    ["the current pass", undefined],
+    ["a pass ended by a later prompt", "no observation pass is current"],
+    ["a pass superseded by a new /observe", "earlier observation pass"],
+  ] as const)("restores tool availability and enforces approval on a branch with %s", async (_label, refusal) => {
     const host = loadExtension();
-    host.setBranch([...fx.plainUserMessage, { type: "custom_message", customType: "skill-observer", content: "Observation pass" }, ...after]);
-    await host.emit("session_start");
-    expect(host.activeTools().includes("observer_resolve")).toBe(active);
+    const outcomes = await approveOnRead(host, [{ gist: "Name the seam before the first test.", section: SEAMS }]);
+    if (refusal === "no observation pass is current") await host.commitPrompt("Resume ordinary work.");
+    if (refusal === "earlier observation pass") {
+      await host.runCommand("observe", "Review a new finding.");
+      await host.commitMessage(host.sent[0]!.message);
+    }
+
+    const restored = loadExtension({ skillHome: host.skillHome });
+    restored.setBranch(host.getBranch());
+    await restored.emit("session_start");
+    expect([...restored.activeTools()].sort()).toEqual(refusal === "no observation pass is current"
+      ? ["ask", "observe", "read"]
+      : ["ask", "observe", "observer_check", "observer_resolve", "observer_review", "read"]);
+    const before = observerBytes(restored);
+    const resolved = await resolve(restored, outcomes);
+    if (refusal) {
+      expect(resolved.isError).toBe(true);
+      expect(failures(resolved)).toEqual([expect.stringContaining(refusal)]);
+      expect(observerBytes(restored)).toEqual(before);
+    } else {
+      expect(failures(resolved)).toEqual([]);
+      expect(readFileSync(join(restored.amendmentsDir, "tdd-amendment.md"), "utf8")).toContain(SEAMS);
+    }
   });
 
   it("runs a pass for a session whose only signal is a loaded skill", async () => {
@@ -748,7 +790,7 @@ describe("retrospective availability", () => {
     const warned = host.noticeEvents.some((notice) => notice.type === "warning" && /retro.*unavailable/i.test(notice.message));
     expect(warned).toBe(projectGate);
     expect(String(host.sent[0]?.message.content).includes("## Retrospective reference")).toBe(projectGate);
-    expect(host.activeTools()).toContain("observer_resolve");
+    expect(host.activeTools()).toContain("observer_review");
   });
 
   it.each(retroBranches)("with %s, points to optional categories without inlining the standalone workflow", async (_label, branch, projectGate) => {
@@ -1183,17 +1225,10 @@ describe("observer_review selection", () => {
     const root = host.skillHome.roots.cwd;
     const other = join(host.skillHome.home, "other-project");
     mkdirSync(other);
-    const project = { kind: "project", target: { scope: "project", root: other, path: "checks.json", mechanism: "Wire check" }, gist: "Wire check" };
-    host.setCwd(other);
-    const foreignDecline = await resolve(host, [{ ...project, outcome: "declined" }]);
-    expect(foreignDecline.isError, resultText(foreignDecline)).toBe(false);
-    host.setCwd(root);
-    const skillDecline = await resolve(host, [outcome("tdd", "upstream", "Declined mechanism", "declined")]);
-    expect(skillDecline.isError, resultText(skillDecline)).toBe(false);
-    expect(ledgerRecords(host.ledgerFile)).toMatchObject([
-      { gist: project.gist, target: project.target, outcome: "declined" },
-      { gist: "Declined mechanism", outcome: "declined" },
-    ]);
+    const project = { kind: "project", target: { scope: "project", root: other, path: "checks.json", mechanism: "Wire check" }, gist: "Wire check" } as const;
+    seedLedger(host.ledgerFile, [{ ...project, fingerprint: projectFingerprint(project.target),
+      outcome: "declined", timestamp: new Date().toISOString(), sessionId: "historical-session" }]);
+    seedDeclinedSkill(host, "tdd", "upstream", "Declined mechanism");
     startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [
       candidate("Declined mechanism"),
@@ -1215,11 +1250,9 @@ describe("observer_review selection", () => {
     const proposal = reviewEntries(result)[1]!.reference;
     const selection = await host.callTool("observer_review", { action: "select", proposals: [proposal] });
     expect(selection.isError, resultText(selection)).toBeFalsy();
-    const selectionToolCallId = lastCallId(host);
-    const askToolCallId = askUser(host, selection, () => "Decline");
+    askUser(host, selection, () => "Decline");
     const declined = await resolve(host, [{
       ...project, target: { ...project.target, root }, outcome: "declined",
-      approval: { proposal, selectionToolCallId, askToolCallId },
     }]);
     expect(declined.isError, resultText(declined)).toBe(false);
     const suppressed = await host.callTool("observer_review", { action: "prepare", candidates: [
@@ -2383,6 +2416,18 @@ function seedLedger(file: string, records: readonly LedgerRecord[]): void {
   writeObserverStore(file, new Date(), (db) => putLedgerRecords(db, records));
 }
 
+function seedDeclinedSkill(host: ReturnType<typeof loadExtension>, skill: string, kind: SkillLedgerRecord["kind"], gist: string): void {
+  seedLedger(host.ledgerFile, [{ fingerprint: proposalFingerprint(skill, gist), skill, kind, gist, outcome: "declined",
+    timestamp: new Date().toISOString(), sessionId: "historical-session" }]);
+}
+
+function seedCompactionDecision(host: ReturnType<typeof loadExtension>, skill: string, outcome: "declined" | "later"): void {
+  const { body } = readRule(join(host.amendmentsDir, `${skill}-amendment.md`));
+  seedLedger(host.ledgerFile, [{ fingerprint: amendments.compactionFingerprint(skill, body), skill, kind: "upstream",
+    gist: `Compact the on-read amendment of \`${skill}\`.`, outcome, compaction: true,
+    timestamp: new Date().toISOString(), sessionId: "historical-session" }]);
+}
+
 /** The file names in the rules and amendments directories; none before a rule is written. */
 function rulesWritten(host: { rulesDir: string; amendmentsDir: string }): string[] {
   return [host.rulesDir, host.amendmentsDir].flatMap((dir) => (existsSync(dir) ? readdirSync(dir) : []));
@@ -2438,11 +2483,16 @@ async function readSkill(host: ReturnType<typeof loadExtension>, path: string, o
 describe("observer_resolve", () => {
   it("records an accepted batch and reports the ledger it wrote", async () => {
     const host = loadExtension();
+    const { entry } = await approveCandidates(host, [
+      onReadCandidate({ gist: "Name the seam.", section: "## Seams\n\nName the seam." }),
+      onReadCandidate({ skill: "domain-modeling", gist: "Name each concept.", section: "## Concepts\n\nName each concept." }),
+      onReadCandidate({ gist: "Run a specific check.", section: "## Checks\n\nRun a specific check." }),
+    ], ({ gist }) => gist === "Run a specific check." ? "Later" : "Decline");
     const result = await host.callTool("observer_resolve", {
       outcomes: [
-        outcome("ce-commit-jj", "local", "Ask one question at a time.", "declined"),
-        outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later"),
-        outcome("deploy-notes", "new", "Draft release notes from the jj log.", "declined"),
+        { proposal: entry("Name the seam.").reference, outcome: "declined" },
+        { proposal: entry("Run a specific check.").reference, outcome: "later" },
+        { proposal: entry("Name each concept.").reference, outcome: "declined" },
       ],
     });
 
@@ -2458,9 +2508,9 @@ describe("observer_resolve", () => {
         sessionId: "fixture-session",
       });
     expect(ledgerRecords(host.ledgerFile)).toEqual([
-      record("ce-commit-jj", "local", "declined"),
-      record("implement-spec", "managed", "later"),
-      record("deploy-notes", "new", "declined"),
+      record("tdd", "upstream", "declined"),
+      record("tdd", "upstream", "later"),
+      record("domain-modeling", "upstream", "declined"),
     ]);
   });
 
@@ -2516,10 +2566,14 @@ describe("observer_resolve", () => {
       { quote: "run only the failing test, not the whole suite", count: 3 },
       { quote: "`ts-no-tiny-functions` fired", count: 1 },
     ];
+    const gist = "Ask one question at a time.";
+    const { entry } = await approveCandidates(host, [onReadCandidate({
+      skill: "grill-with-docs", gist, section: "## Questions\n\nAsk one question at a time.",
+    })], () => "Decline");
     const result = await host.callTool("observer_resolve", {
       outcomes: [
         { ...outcome("tdd", "upstream", "Run the one failing test first.", "later"), evidence },
-        outcome("grill-with-docs", "upstream", "Ask one question at a time.", "declined"),
+        { proposal: entry(gist).reference, outcome: "declined" },
       ],
     });
 
@@ -2541,12 +2595,16 @@ describe("observer_resolve", () => {
       ],
     });
     const [tdd, grill] = ledgerRecords(host.ledgerFile);
-    await host.callTool("observer_resolve", {
-      outcomes: [
-        { ...outcome("tdd", "upstream", "Run the one failing test first.", "declined"), fingerprint: tdd?.fingerprint },
-        { ...outcome("grill-with-docs", "upstream", "Ask one question at a time.", "declined"), fingerprint: grill?.fingerprint, evidence: fresh },
-      ],
-    });
+    const tddGist = "Run the one failing test first.";
+    const grillGist = "Ask one question at a time.";
+    const { entry } = await approveCandidates(host, [
+      onReadCandidate({ gist: tddGist, section: RED, fingerprint: tdd!.fingerprint }),
+      onReadCandidate({ skill: "grill-with-docs", gist: grillGist, section: "## Questions\n\nAsk one question at a time.", fingerprint: grill!.fingerprint }),
+    ], () => "Decline");
+    expect(failures(await resolve(host, [
+      { proposal: entry(tddGist).reference, outcome: "declined" },
+      { proposal: entry(grillGist).reference, outcome: "declined", evidence: fresh },
+    ]))).toEqual([]);
 
     const [tddAgain, grillAgain] = ledgerRecords(host.ledgerFile);
     expect(tddAgain).toMatchObject({ outcome: "declined", evidence: earlier });
@@ -2973,8 +3031,9 @@ describe("exact profile publication", () => {
     mkdirSync(join(root, "rules"), { recursive: true });
     const original = "\\.only\\b";
     writeFileSync(join(root, path), rule(original));
-    await resolve(host, [{ kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path, mechanism: "Prevent focused tests" },
-      gist: "Keep the full test suite in scope", outcome: "declined" }]);
+    const target = { scope: "project", root: host.skillHome.roots.cwd, path, mechanism: "Prevent focused tests" } as const;
+    seedLedger(host.ledgerFile, [{ kind: "project", target, fingerprint: projectFingerprint(target),
+      gist: "Keep the full test suite in scope", outcome: "declined", timestamp: new Date().toISOString(), sessionId: "historical-session" }]);
     await host.runCommand("observe", "Review the focused-test rule false positive.");
     await host.commitMessage(host.sent.at(-1)!.message);
     const draft = draftFor(host, path, rule(pattern), { kind: "pattern", replayToolCallId: "missing" });
@@ -3080,7 +3139,7 @@ describe("exact profile publication", () => {
 });
 
 describe("project proposal decisions", () => {
-  const projectAnswer = (root: string, path = "package.json", answer = "declined") => ({
+  const projectAnswer = (root: string, path = "package.json", answer = "later") => ({
     kind: "project", target: { scope: "project", root, path, mechanism: "Wire the existing typecheck." },
     gist: "Wire the existing typecheck.", outcome: answer,
   });
@@ -3116,9 +3175,11 @@ describe("project proposal decisions", () => {
     symlinkSync(join(root, "checks"), join(root, "alias-checks"));
     host.setCwd(root);
     const evidence = [{ quote: "the existing check is not wired", count: 2 }];
-    await host.callTool("observer_resolve", { outcomes: [{ ...projectAnswer(root, "checks/new.json", "later"), evidence }] });
+    const asked = projectAnswer(root, "checks/new.json", "declined");
+    const { approval } = await approveCandidates(host, [{ ...asked, priority: "evidence", remedy: asked.gist, evidence,
+      change: { operation: "project-edit", text: "{}\n", check: "bun test" } }], () => "Decline");
     host.setCwd(alias);
-    const result = await host.callTool("observer_resolve", { outcomes: [projectAnswer(alias, "alias-checks/new.json")] });
+    const result = await resolve(host, [{ ...projectAnswer(alias, "alias-checks/new.json", "declined"), approval: approval(asked.gist) }]);
     expect(result.isError).toBeFalsy();
     expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({
       target: { scope: "project", root, path: "checks/new.json", mechanism: "Wire the existing typecheck." },
@@ -3745,12 +3806,8 @@ describe("/observe with answers from earlier passes", () => {
     const host = loadExtension();
     seedApplied(host, "implement-spec", "managed", "Run the typecheck before each commit.");
     seedApplied(host, "worktree-add", "managed", "Name the workspace after the ticket.");
-    await host.callTool("observer_resolve", {
-      outcomes: [
-        outcome("implement-spec", "managed", "Read the spec before the tickets.", "declined"),
-        outcome("grill-with-docs", "upstream", "Ask one question at a time.", "later"),
-      ],
-    });
+    seedDeclinedSkill(host, "implement-spec", "managed", "Read the spec before the tickets.");
+    await resolve(host, [outcome("grill-with-docs", "upstream", "Ask one question at a time.", "later")]);
     await addOnReadFix(host, "tdd", "Take seams from the ticket.", "## Seams\n\nTake seams from the ticket.");
     await addOnReadFix(host, "tdd", "A red is an assertion diff.", "## Red\n\nA red is an assertion diff, not a crash.");
     await addOnReadFix(host, "domain-modeling", "Define each term first.", "## Glossary\n\nDefine each term in the glossary first.");
@@ -4003,12 +4060,8 @@ describe("/observe with answers from earlier passes", () => {
   it("lists deferred proposals to re-offer, and leaves out declined ones and applied ones for skills this session didn't load", async () => {
     const host = loadExtension();
     seedApplied(host, "grill-with-docs", "local", "Ask one question at a time.");
-    await host.callTool("observer_resolve", {
-      outcomes: [
-        outcome("deploy-notes", "new", "Draft release notes from the jj log.", "declined"),
-        outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later"),
-      ],
-    });
+    seedDeclinedSkill(host, "deploy-notes", "new", "Draft release notes from the jj log.");
+    await resolve(host, [outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later")]);
 
     const content = await observe(host);
     const deferred = ledgerRecords(host.ledgerFile).find((record) => record.outcome === "later");
@@ -4020,12 +4073,8 @@ describe("/observe with answers from earlier passes", () => {
 
   it("describes each proposal by its latest answer", async () => {
     const host = loadExtension();
-    await host.callTool("observer_resolve", {
-      outcomes: [
-        outcome("tdd", "upstream", "Name the seam before the first test.", "declined"),
-        outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later"),
-      ],
-    });
+    seedDeclinedSkill(host, "tdd", "upstream", "Name the seam before the first test.");
+    await resolve(host, [outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later")]);
     await host.callTool("observer_resolve", {
       outcomes: [outcome("tdd", "upstream", "Name the seam before the first test.", "later")],
     });
@@ -4038,18 +4087,15 @@ describe("/observe with answers from earlier passes", () => {
 
   it("replaces a deferred proposal answered under its ledger fingerprint, even with a reworded gist", async () => {
     const host = loadExtension();
-    await host.callTool("observer_resolve", {
-      outcomes: [outcome("implement-spec", "managed", "Run the typecheck before each commit.", "later")],
-    });
+    const oldGist = "Run the typecheck before each commit.";
+    await resolve(host, [outcome("tdd", "upstream", oldGist, "later")]);
     const [deferred] = ledgerRecords(host.ledgerFile);
-    await host.callTool("observer_resolve", {
-      outcomes: [
-        {
-          ...outcome("implement-spec", "managed", "Typecheck before committing.", "declined"),
-          fingerprint: deferred?.fingerprint,
-        },
-      ],
-    });
+    const gist = "Typecheck before committing.";
+    const { entry } = await approveCandidates(host, [onReadCandidate({
+      gist, section: "## Typecheck\n\nTypecheck before committing.", fingerprint: deferred!.fingerprint,
+    })], () => "Decline");
+    expect(failures(await resolve(host, [{ proposal: entry(gist).reference, outcome: "declined" }]))).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toMatchObject([{ fingerprint: deferred!.fingerprint, gist, outcome: "declined" }]);
 
     const content = await observe(host);
     expect(ledgerList(content, "Later")).not.toContain("typecheck");
@@ -4172,12 +4218,18 @@ describe("observer_resolve with upstream fixes", () => {
     const file = join(host.amendmentsDir, "tdd-amendment.md");
     const first = readFileSync(file, "utf8");
 
-    const [red, oneBehaviour] = await approveOnRead(host, [
-      { gist: "A red is an assertion diff.", section: RED },
-      { gist: "Test one behaviour per test.", section: ONE_BEHAVIOUR },
-    ]);
+    const declined = "Mock only at the seam.";
+    const { entry, approval } = await approveCandidates(host, [
+      onReadCandidate({ gist: "A red is an assertion diff.", section: RED }),
+      onReadCandidate({ gist: declined, section: "## Mocks\n\nMock only at the seam." }),
+      onReadCandidate({ gist: "Test one behaviour per test.", section: ONE_BEHAVIOUR }),
+    ], ({ gist }) => gist === declined ? "Decline" : "Apply");
     const result = await host.callTool("observer_resolve", {
-      outcomes: [red, outcome("tdd", "upstream", "Mock only at the seam.", "declined"), oneBehaviour],
+      outcomes: [
+        { outcome: "applied", approval: approval("A red is an assertion diff.") },
+        { outcome: "declined", proposal: entry(declined).reference },
+        { outcome: "applied", approval: approval("Test one behaviour per test.") },
+      ],
     });
 
     expect(result.isError).toBeFalsy();
@@ -4286,20 +4338,25 @@ describe("observer_resolve with upstream fixes", () => {
 
   it.each(["rulesDir", "amendmentsDir"] as const)("leaves a file it didn't write under the amendment's name in the %s untouched and reports it", async (dir) => {
     const host = loadExtension();
-    const [fix] = await approveOnRead(host, [{ gist: "Name the seam before the first test.", section: SEAMS }]);
+    const gist = "Name the seam before the first test.";
+    const declined = "Define names before building.";
+    const { entry, approval } = await approveCandidates(host, [
+      onReadCandidate({ gist, section: SEAMS }),
+      onReadCandidate({ skill: "domain-modeling", gist: declined, section: "## Names\n\nDefine names before building." }),
+    ], (proposal) => proposal.gist === declined ? "Decline" : "Apply");
     const foreign = join(host[dir], "tdd-amendment.md");
     mkdirSync(host[dir], { recursive: true });
     writeFileSync(foreign, "---\ncondition: \"x\"\n---\n\nThe user's own rule.\n");
 
     const result = await host.callTool("observer_resolve", {
-      outcomes: [fix, outcome("ce-commit-jj", "local", "Ask one question at a time.", "declined")],
+      outcomes: [{ outcome: "applied", approval: approval(gist) }, { outcome: "declined", proposal: entry(declined).reference }],
     });
 
     expect(readFileSync(foreign, "utf8")).toBe("---\ncondition: \"x\"\n---\n\nThe user's own rule.\n");
     expect(rulesWritten(host)).toEqual(["tdd-amendment.md"]);
     expect(result.isError).toBe(true);
     expect(resultText(result)).toContain(foreign);
-    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ skill: "ce-commit-jj" })]);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ skill: "domain-modeling", outcome: "declined" })]);
   });
 
   it("prepares no pattern amendment under the name of another skill's on-read amendment", async () => {
@@ -4682,7 +4739,7 @@ describe("compacting on-read amendments", () => {
     const result = await host.callTool("observer_resolve", {
       outcomes: [
         { ...outcome("tdd", "upstream", "A red is an assertion diff.", "applied"), approval: approval("A red is an assertion diff.") },
-        { ...outcome("tdd", "upstream", declined, "declined"), fingerprint: entry(declined).proposal.fingerprint },
+        { outcome: "declined", proposal: entry(declined).reference },
       ],
       compactions: [{ skill: "tdd", outcome: "applied", approval: approval(compactionGist("tdd")) }],
     });
@@ -4914,7 +4971,7 @@ describe("compacting on-read amendments", () => {
     const MARK = "over the compaction limit";
     expect(ruleLine(await observe(host, tddLoaded), "tdd-amendment")).toContain(MARK);
 
-    await host.callTool("observer_resolve", { outcomes: [], compactions: [{ skill: "tdd", outcome: "declined" }] });
+    seedCompactionDecision(host, "tdd", "declined");
     expect(ruleLine(await observe(host, tddLoaded), "tdd-amendment")).not.toContain(MARK);
 
     await addOnReadFix(host, "tdd", "A red is an assertion diff.", RED);
@@ -4927,7 +4984,8 @@ describe("compacting on-read amendments", () => {
       await addOnReadFix(host, skill, `First fix of ${skill}.`, section("First", 100));
     }
     await compact(host);
-    await host.callTool("observer_resolve", { outcomes: [], compactions: [{ skill: "domain-modeling", outcome: "declined" }, { skill: "grill-with-docs", outcome: "later" }] });
+    seedCompactionDecision(host, "domain-modeling", "declined");
+    seedCompactionDecision(host, "grill-with-docs", "later");
     expect(ledgerRecords(host.ledgerFile).filter((record) => record.compaction)).toHaveLength(3);
 
     const content = await observe(host, [...tddLoaded, ...fx.physicalSkillRead, ...fx.steeringUserMessage]);
@@ -6125,7 +6183,80 @@ describe("answers citing their prepared proposal", () => {
       answered("Second", "declined"),
       answered("Sixth", "later", `${deferredReason} Selected past the cap; offer it next pass.`),
     ]);
+    const next = await host.callTool("observer_review", { action: "prepare", candidates: [
+      onReadCandidate({ gist: "First", section: "## First\n\nTry this first." }),
+      onReadCandidate({ gist: "Second", section: "## Second\n\nChange the text." }),
+      onReadCandidate({ skill: "domain-modeling", gist: "Second", section: "## Second\n\nDocument the other skill." }),
+    ] });
+    expect(reviewEntries(next).map(({ proposal }) => [proposal.skill, proposal.gist])).toEqual([
+      ["tdd", "First"], ["domain-modeling", "Second"],
+    ]);
   });
+
+  it("refuses a bare ordinary skill or project Decline without a current pass", async () => {
+    const host = loadExtension();
+    const result = await resolve(host, [
+      outcome("tdd", "upstream", "Name the seam.", "declined"),
+      { kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path: "checks.json", mechanism: "Wire check" },
+        gist: "Wire check", outcome: "declined" },
+    ]);
+    expect(result.isError).toBe(true);
+    expect(failures(result)).toEqual([
+      expect.stringContaining("a skill Decline needs its prepared proposal reference"),
+      expect.stringContaining("a project Decline needs a current native Decline"),
+    ]);
+    expect(result.details).toMatchObject({ records: [] });
+    expect(existsSync(host.ledgerFile)).toBe(false);
+  });
+
+  it.each(["missing", "altered form", "timeout", "nested", "free text", "unanswered", "Later"] as const)(
+    "does not suppress skill or project proposals on a %s Ask",
+    async (variant) => {
+      const host = loadExtension();
+      const skill = onReadCandidate({ gist: "Name the seam.", section: "## Seams\n\nName the seam first." });
+      const project = {
+        kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path: "checks.json", mechanism: "Wire check" },
+        gist: "Wire check", priority: "evidence", remedy: "Wire the existing check",
+        change: { operation: "project-edit", text: "{}\n", check: "bun test" },
+      };
+      const candidates = [skill, project];
+      const selection = await prepareAndSelect(host, candidates);
+      expect(selection.isError, resultText(selection)).toBeFalsy();
+      const selected = reviewEntries(selection, "selected");
+      expect(selected).toHaveLength(2);
+      if (variant !== "missing") {
+        const option = variant === "free text" ? "Other: Decline" : variant === "unanswered" ? "" : variant === "Later" ? "Later" : "Decline";
+        const id = askUser(host, selection, () => option);
+        const [call, result] = host.getBranch().slice(-2);
+        const [request] = call!.message!.content as Array<{ arguments: ToolArguments }>;
+        const details = result!.message!.details as AskDetails;
+        if (variant === "altered form") request!.arguments.html = `${request!.arguments.html} `;
+        if (variant === "timeout") details.timedOut = true;
+        if (variant === "nested") {
+          host.setBranch([...host.getBranch().slice(0, -2),
+            { type: "custom", id: "nested-ask-call", customType: "skill-observer-tool-call",
+              data: { toolCallId: id, toolName: "ask", input: request!.arguments } },
+            { type: "custom", id: "nested-ask-result", customType: "skill-observer-tool-result",
+              data: { toolCallId: id, toolName: "ask", input: request!.arguments, isError: false, details, content: [] } },
+          ]);
+        }
+      }
+
+      const result = await resolve(host, [
+        { proposal: selected.find(({ proposal }) => proposal.gist === skill.gist)!.reference, outcome: "declined" },
+        { kind: "project", target: project.target, gist: project.gist, outcome: "declined" },
+      ]);
+      expect(result.isError).toBe(true);
+      expect(failures(result)).toEqual([
+        expect.stringContaining("a skill Decline needs a current native Decline"),
+        expect.stringContaining("a project Decline needs a current native Decline"),
+      ]);
+      expect(result.details).toMatchObject({ records: [] });
+      expect(existsSync(host.ledgerFile)).toBe(false);
+      const next = await host.callTool("observer_review", { action: "prepare", candidates });
+      expect(reviewEntries(next).map(({ proposal }) => proposal.gist)).toEqual([skill.gist, project.gist]);
+    },
+  );
 
   it("carries out a pass from the references its text results give alone: a noted Apply revised, an Apply, a Later and a deferred proposal", async () => {
     const host = loadExtension();
@@ -6175,8 +6306,10 @@ describe("answers citing their prepared proposal", () => {
       onReadCandidate({ gist: "Name the seam.", section: SEAMS, fingerprint: uncited?.fingerprint }),
     ] });
     const [withEvidence, without] = reviewEntries(prepared).map(({ reference }) => reference);
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [withEvidence, without] });
+    askUser(host, selection, () => "Decline");
 
-    await resolve(host, [{ outcome: "declined", proposal: withEvidence }, { outcome: "declined", proposal: without }]);
+    expect(failures(await resolve(host, [{ outcome: "declined", proposal: withEvidence }, { outcome: "declined", proposal: without }]))).toEqual([]);
 
     expect(ledgerRecords(host.ledgerFile)).toEqual([
       expect.objectContaining({ fingerprint: cited?.fingerprint, outcome: "declined", evidence: [{ quote: "the whole suite again", count: 2 }] }),
@@ -6261,8 +6394,13 @@ describe("answers citing their prepared proposal", () => {
 
     const result = await resolve(host, [answer]);
 
-    expect(result.isError).toBeFalsy();
-    expect(resultText(result)).toContain("stays in force");
+    if (how === "cited") {
+      expect(result.isError).toBeFalsy();
+      expect(resultText(result)).toContain("stays in force");
+    } else {
+      expect(result.isError).toBe(true);
+      expect(failures(result)).toEqual([expect.stringContaining("needs its prepared proposal reference")]);
+    }
     expect(observerBytes(host)).toEqual(before);
   });
 
@@ -6293,6 +6431,8 @@ describe("answers citing their prepared proposal", () => {
     ]);
 
     expect(failures(await resolve(host, [{ outcome: "declined", proposal: reference("First") }]))).toEqual([expect.stringContaining(latest.reviewToolCallId)]);
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [latest] });
+    askUser(host, selection, () => "Decline");
     expect(failures(await resolve(host, [{ outcome: "declined", proposal: latest }]))).toEqual([]);
   });
 
@@ -7040,11 +7180,17 @@ describe("evidence-gated instructions", () => {
     expect(payload).toContain("## 1. Find candidates");
     expect(payload).not.toMatch(/^## \d+\. (Draft|Ask|Apply|Record|Summarise)/m);
     expect(payload).toContain('`action: "draft"`');
-    expect(payload).toContain("finish now with the findings or why you found none");
     expect(host.sent).toHaveLength(1);
   });
 
-  it("delivers Draft, Select, Ask, Apply and Record as the registered pass reaches them", async () => {
+  it.each([
+    ["Apply", "publish"],
+    ["Later", "record"],
+    ["Decline", "record"],
+    ["altered form", undefined],
+    ["timed-out Ask", undefined],
+    ["nested Ask", undefined],
+  ] as const)("exposes Resolve only for an eligible native Ask handoff: %s", async (scenario, stage) => {
     const host = loadExtension();
     host.setBranch(base);
     await host.runCommand("observe");
@@ -7061,16 +7207,38 @@ describe("evidence-gated instructions", () => {
     const { askHtml, guidance } = JSON.parse(resultText(selection));
     expect(guidance).toContain("## 3. Ask");
     expect(guidance).not.toContain("## 4. Apply");
-    expect(await host.toolCall("ask", { html: askHtml }, "native-question")).toBeUndefined();
-    const askToolCallId = askUser(host, selection);
+    const askToolCallId = "native-question";
+    const input = { html: scenario === "altered form" ? `${askHtml}\n` : askHtml };
+    const parent = scenario === "nested Ask" ? "eval-wrapper" : undefined;
+    expect(await host.toolCall("ask", input, askToolCallId, parent)).toBeUndefined();
+    expect(host.activeTools()).not.toContain("observer_resolve");
+    if (!parent) {
+      host.getBranch().push({
+        type: "message", id: `call-${askToolCallId}`, message: { role: "assistant",
+          content: [{ type: "toolCall", id: askToolCallId, name: "ask", arguments: input }] },
+      });
+    }
+    const { reference, proposal } = reviewEntries(selection, "selected")[0]!;
+    const chosen = stage === "record" ? scenario : "Apply";
+    const details: AskDetails = {
+      answers: [{ name: proposal.candidateId, question: "Apply this change?", answer: chosen }],
+      ...(scenario === "timed-out Ask" && { timedOut: true }),
+    };
+    const content = [{ type: "text", text: `User answers:\n${JSON.stringify({ [proposal.candidateId]: `${proposal.candidateId}=${chosen}` })}` }];
     const answer = await host.toolResult({
-      toolName: "ask", toolCallId: askToolCallId, input: { html: askHtml }, content: [{ type: "text", text: "User answers" }],
-      details: host.getBranch().at(-1)?.message?.details, isError: false,
+      toolName: "ask", toolCallId: askToolCallId, input, content, details, isError: false,
     });
     const text = answer.content.map(({ text }) => text).join("\n");
-    expect(text).toContain("## 4. Apply");
-    expect(text).toContain("## 5. Record");
-    const { reference } = reviewEntries(prepared)[0]!;
+    expect(text.includes("## 4. Apply")).toBe(stage === "publish");
+    expect(text.includes("## 5. Record")).toBe(stage !== undefined);
+    expect([...host.activeTools()].sort()).toEqual(stage === undefined
+      ? ["ask", "observe", "observer_check", "observer_review", "read"]
+      : ["ask", "observe", "observer_check", "observer_resolve", "observer_review", "read"]);
+    if (stage !== "publish") return;
+    host.getBranch().push({
+      type: "message", id: `result-${askToolCallId}`, message: { role: "toolResult",
+        toolName: "ask", toolCallId: askToolCallId, content: answer.content, details, isError: false },
+    });
     const resolved = await resolve(host, [{ outcome: "applied", approval: { proposal: reference, selectionToolCallId, askToolCallId } }]);
     expect(failures(resolved)).toEqual([]);
     expect(readFileSync(join(host.amendmentsDir, "tdd-amendment.md"), "utf8")).toContain(SEAMS);
@@ -7312,13 +7480,14 @@ describe("re-offer conditions on Later entries", () => {
 
   it("records a Declined answer without its `reoffer`", async () => {
     const host = loadExtension();
-    const result = await resolve(host, [
-      { ...outcome("implement-spec", "managed", "Run the typecheck before each commit.", "declined"), reoffer },
-      { ...outcome("grill-with-docs", "upstream", "Ask one question at a time.", "declined"), reoffer },
-    ]);
+    const gist = "Ask one question at a time.";
+    const { entry } = await approveCandidates(host, [onReadCandidate({
+      skill: "grill-with-docs", gist, section: "## Questions\n\nAsk one question at a time.",
+    })], () => "Decline");
+    const result = await resolve(host, [{ proposal: entry(gist).reference, outcome: "declined", reoffer }]);
     expect(failures(result)).toEqual([]);
     const records = ledgerRecords(host.ledgerFile);
-    expect(records.map((record) => record.outcome)).toEqual(["declined", "declined"]);
+    expect(records.map((record) => record.outcome)).toEqual(["declined"]);
     for (const record of records) expect(record).not.toHaveProperty("reoffer");
   });
 
@@ -7948,7 +8117,7 @@ describe("observations", () => {
       await reader.release();
     }
     expect(observationLines(second, 1)).toHaveLength(1);
-    expect(second.activeTools()).toContain("observer_resolve");
+    expect(second.activeTools()).toContain("observer_review");
     expect(second.noticeEvents).toEqual([
       { message: expect.stringMatching(/^Observations not marked as shown: .*locked/i), type: "warning" },
       { message: expect.stringMatching(/^Observation pass started: /), type: "info" },
@@ -8692,7 +8861,7 @@ describe("observer_review inspect and grounded repairs", () => {
     const host = loadExtension();
     installGuide(host);
     for (const [skill, kind] of [[GUIDE, "local"], [GUIDE, "managed"], ["ce-code-review", "local"], ["ce-code-review", "managed"]] as const) {
-      for (const outcome of ["applied", "declined", "later"] as const) {
+      for (const outcome of ["applied", "later"] as const) {
         const label = `${skill} as ${kind}, ${outcome}`;
         const recorded = await resolve(host, [{ skill, kind, gist: "Name the request in the description.", outcome }]);
         expect(recorded.isError, label).toBe(true);
@@ -8700,9 +8869,9 @@ describe("observer_review inspect and grounded repairs", () => {
       }
     }
     expect(ledgerRecords(host.ledgerFile)).toEqual([]);
-    const declined = await resolve(host, [{ skill: GUIDE, kind: "upstream", gist: "Name the request in the description.", outcome: "declined" }]);
-    expect(failures(declined)).toEqual([]);
-    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ skill: GUIDE, kind: "upstream", outcome: "declined" })]);
+    const later = await resolve(host, [{ skill: GUIDE, kind: "upstream", gist: "Name the request in the description.", outcome: "later" }]);
+    expect(failures(later)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ skill: GUIDE, kind: "upstream", outcome: "later" })]);
   });
 
   /** Records a successful `name` call on the branch, as OMP saves it, and returns its ID. */
@@ -9019,6 +9188,8 @@ describe("approval compatibility under the evidence gate", () => {
     const [reoffered] = reviewEntries(await prepare(host, [draft]));
     expect(reoffered!.proposal.fingerprint).toBe(first!.proposal.fingerprint);
 
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [reoffered!.reference] });
+    askUser(host, selection, () => "Decline");
     expect(failures(await resolve(host, [{ outcome: "declined", proposal: reoffered!.reference }]))).toEqual([]);
     startPass(host);
     const afterDecline = await prepare(host, [draft]);

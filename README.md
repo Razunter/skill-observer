@@ -1,10 +1,10 @@
 # skill-observer
 
-An [OMP](https://github.com/can1357/oh-my-pi) extension for adjusting upstream skills without editing their installed files.
+An [OMP](https://github.com/can1357/oh-my-pi) extension that reviews session evidence for improvements to your project, skills, and OMP setup.
 
-Your adjustments live in separate **amendments** that survive skill updates. The extension delivers them when you invoke `/skill:<name>` or the agent reads the skill's `SKILL.md`.
+Adjust upstream skill guidance with separate **amendments** that survive skill updates. The extension delivers them when you invoke `/skill:<name>` or the agent reads the skill's `SKILL.md`.
 
-Run `/observe` to review session corrections and proposed fixes. After an upstream skill changes, the next `/observe` checks whether its amendments still apply. It can also propose local skill improvements and project checks. Every skill-text fix must cite an inspection of the skill's current guidance, and every new skill must cite a search of existing ones. To diagnose a skill the agent may have missed, the extension records in the session which skills the system prompt listed at each prompt. As a last resort, it writes a hook or changes one companion extension after two approvals, and it reports problems in other extensions instead of editing them.
+Run `/observe` after ordinary work, even if no skill loaded and no tool failed. The pass can propose a regression test, a configuration fix, or a change to guidance. It checks existing skill guidance before proposing a repair and searches for existing skills before proposing a new one. When an upstream skill changes, the next pass checks whether its amendments still fit.
 
 **Status:** vibe-coded experiment.
 
@@ -23,13 +23,13 @@ Upgrading a profile with existing observer state? [Migrate its JSONL files](docs
 
 ## Use it
 
-After working with a skill and correcting the agent, enter:
+After completing a task or correcting the agent, enter:
 
 ```text
 /observe
 ```
 
-The model reviews session evidence and previews proposed changes with **Apply**, **Later**, or **Decline** choices. With nothing to review in a fresh session, the command reports that and starts no model turn.
+The pass starts with discovery. It loads drafting, approval, and publication instructions only when needed. The form shows up to five proposals with **Apply**, **Later**, or **Decline**. The summary explains findings and alternatives that did not reach the form. A fresh session with nothing to review starts no model turn.
 
 You can add feedback or a focus:
 
@@ -37,7 +37,7 @@ You can add feedback or a focus:
 /observe Focus on the upstream skills I corrected in this session.
 ```
 
-A note starts a review without other signals, but the pass can finish without proposals if evidence does not support a change. Observation runs only on request, never automatically at session exit.
+A note starts a pass without other signals, but the evidence still has to support a proposal. `/observe` runs only on request. To include a second checkout in the same review, add `Include project root: /absolute/canonical/root` or name a worktree with `Include worktree: <branch>` in your note. See [target scope](docs/observation.md#project-and-profile-targets).
 
 To see what the extension knows about the current branch without starting a review, enter:
 
@@ -45,9 +45,9 @@ To see what the extension knows about the current branch without starting a revi
 /observe-report
 ```
 
-It lists signal counts, loaded skills, remedy outcomes of applied fixes, stale amendments, pending observations, skill catalog observations, the next `/observe` pass's estimated size, and the Later count. It calls no model and writes nothing.
+It lists signal counts, loaded skills, remedy outcomes, stale amendments, pending observations, the skill catalog summary, and the Later count. Its size estimate covers only the next pass's hidden starting message, not model usage or the full pass. It calls no model and writes nothing.
 
-While it works, the agent can record an **observation** with its `observe` tool when a skill, a rule or the project setup gets something wrong. Observations survive across sessions and are shared by all worktrees of their repository. The next `/observe` lists and clears the pending recording. A repeat within 30 days of being shown names the date it was last shown. An observation no pass shows expires 30 days after it was last recorded. See [observations](docs/observation.md#observations).
+While it works, the agent can record an **observation** with its `observe` tool when a skill, a rule, or the project setup causes a problem. Observations survive across sessions and are shared by worktrees of the same repository. The next `/observe` lists pending observations and marks those revisions as shown. A repeat within 30 days names the date it was last shown. An observation expires if no pass shows it within 30 days of its last recording. See [observations](docs/observation.md#observations).
 
 ### Optional remote skills
 
@@ -59,14 +59,16 @@ Install these skills separately. Ordinary observation works without them. See [o
 ## Defaults and limits
 
 - **Interactive review:** `/observe` requires a main session with UI. Amendment delivery also runs in subagents and headless sessions, but requires the extension to stay loaded.
-- **Different targets:** upstream and plugin skill files stay untouched. Approved local or managed skill changes can edit those skills directly, and approved project fixes use normal editing tools.
+- **Exact approval:** one native **Apply** covers only the reviewed changes at the named destinations. Project edits can span explicitly scoped checkouts. Profile edits stay in the active OMP profile. Hooks and owned extension source need a passing scratch check before the form. Apply grants no new permissions and does not restart OMP, commit, or deploy.
+  If a necessary check or owner tool is unavailable, the pass reports the blocker instead of asking you to approve.
+- **Installed skills:** prefer configuration, amendments, or an owned source checkout over editing an installed copy. A direct edit to an installed upstream or plugin skill is an opt-in last resort for a copy inside the active profile. Updates can overwrite it.
 - **Instruction delivery, not guaranteed compliance:** amendments add guidance to the model's context. Pattern rules are checked against their supplied samples, not proven correct for every possible output.
 - **Existing state:** the extension does not import old proposal or observation files on load. Use the [one-time migration](docs/setup.md#migrate-existing-observer-state). Loading may still [migrate legacy amendment files](docs/amendments.md).
 
 ## Documentation
 
 - [Setup](docs/setup.md) covers first use, persistent loading, optional skills, and state locations.
-- [Observation workflow](docs/observation.md) explains signals, proposals, project scope, report items, observer hooks and the session digest.
+- [Observation workflow](docs/observation.md) explains discovery, proposal review, scoped publication, and what verification can show.
 - [Amendments and replay](docs/amendments.md) covers storage, delivery, upstream updates, reference files, and pattern checks.
 - [Development and tool contracts](docs/development.md) covers proposal approval, the ledger, module responsibilities, and development checks.
 - [Changelog](CHANGELOG.md) records package changes.

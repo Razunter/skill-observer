@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- One project proposal can cover the same fix in multiple checkouts that you explicitly include. Apply covers each named file and its exact change. The pass checks and reports each destination separately.
+- The pass can review changes to active-profile guidance, existing hand-written rules, and supported skill settings. The preview states what the check establishes, which sessions are affected, and when OMP will load the change.
+- Owned OMP extension source can receive a checked change. One Apply covers the exact files, observed scratch result, and check that runs after publication. Hooks use the same exact review. An intent approval no longer authorizes drafting or publication.
+
 ### Changed
 
 - The `/observe` review form leads each proposal with a one-line headline: the action and target in the legend (such as `Add on-read fix · tdd (upstream)` or `Rewrite barrier rule`), the gist in bold, the question as a heading, then the options. Details follow below as labelled paragraphs (Problem, Effect, Remedy, Evidence, Grounds or Searched), then the change preview under its own heading. The line saying a noted answer is asked again now sits after the options, in italics. Cited guidance is grouped by file, shown by its last two path segments with `L34`, `L34–44` and `§ Section` places, without the inspection ID.
@@ -10,6 +16,8 @@
 - The status line reads `skill-observer: N skill correction(s) → /observe` (and likewise for workflows without a skill and pending observations).
 - The pass summary reports dismissed signals as one line, counted and grouped by reason, instead of listing them.
 - Proposal decisions and observations now share a profile-local SQLite database. Resolve records each accepted batch in one transaction. Reports do not write or consume state. A new recording within 30 days of being shown carries its prior shown date. Existing profiles must [run the migration](docs/setup.md#migrate-existing-observer-state) before using the upgraded extension. The script leaves the original JSONL files unchanged.
+- `/observe` can start after an ordinary completed reply with no skill load or tool error. The starting message carries discovery guidance and evidence; later stages supply the instructions they need. Historical rule and proposal details are available through a targeted lookup. `/observe-report` estimates the starting message only.
+- Prepare keeps eligible proposals when independent drafts fail. The summary distinguishes rejected drafts, evidence gaps, report items, and overflow from answers you gave. Skipped retro suggestions are leads, not Declines.
 
 ### Fixed
 

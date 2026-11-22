@@ -1,6 +1,6 @@
 # Observation
 
-How `/observe` uses session evidence to review skills and project-environment fixes. For installation, see [Setup](setup.md). For rule storage and delivery, see [Amendments](amendments.md). For the extension overview, see the [README](../README.md).
+How `/observe` uses session evidence to review changes to your project, skills, and OMP setup. For installation, see [Setup](setup.md). For rule storage and delivery, see [Amendments](amendments.md).
 
 ## Hints
 
@@ -11,6 +11,8 @@ After each turn, the extension rebuilds the session digest from the current bran
 - an `ask` answer with custom input (`Other: ...`), or one that differs from the option the form preselected (`checked`). Results saved before OMP 18.18 are still read in their old shape.
 
 A workflow outline is a turn with no skill loaded and at least 3 tool calls. A cancelled `ask` and skill loads do not turn the hint on. Tool errors are not themselves correction-class signals, but a turn containing errors can still qualify as a workflow outline. Subagent sessions and sessions without UI get no hint.
+
+The hint is a prompt to review, not a requirement. You can run `/observe` after work that produced no hint.
 
 ## `/observe`
 
@@ -26,19 +28,27 @@ A `SKILL.md` read from anywhere else counts as an installed skill when it holds 
 
 A skill's line also names its on-read amendments delivered in this session, as in `` `tdd`: upstream; read by the model; amendments delivered: `tdd-amendment` ``. These come from the session's `skill-observer-amendment-delivery` entries after skill reads and from `/skill:` reminders. Both name their rules, so an amendment deleted later in the session still shows as delivered. Deliveries add no signal: a skill read alone never turns the hint on. They let the pass see that a correction on the same point happened despite the amendment.
 
-Text after the command, as in `/observe tdd should run the one failing test first`, goes into the pass as a **User note** ahead of the digest: feedback the digest can't show, or a steer such as a skill to focus on. The model weighs each change it names like a correction-class signal. A note starts a pass even in a session without signals.
+Text after the command, as in `/observe tdd should run the one failing test first`, becomes a **User note**. Use it to supply feedback, point to a lead, or focus the pass. The note starts a pass on its own, but a lead still needs evidence before it supports a proposal.
 
-With no note, no signals, no loaded skills, no stale amendments and no pending observations, `/observe` says so and starts no turn. Otherwise it sends one hidden message, the [observation payload](#observation-payload), that starts a normal turn.
+A completed ordinary reply to your work request counts as primary work. It can start a pass even if no skill loaded and no tool ran. Startup messages, harness notices, and observer bookkeeping alone do not count. With no primary work, signals, loaded skills, stale amendments, pending observations, or User note, `/observe` reports that there is nothing to review and starts no model turn.
 
-The model asks about at most 5 proposals, stale amendments it would update or delete, and compactions in one main `ask`. The extension renders that Ask as one form, which `observer_review` Select returns and the model passes on unchanged: one fieldset per proposal with its target and gist, remedy, evidence and preview, and the choices Apply / Later / Decline, or Keep / Update / Delete for a stale amendment. Nothing is preselected. Stale amendments come first, then User note points, then correction-class signals and repeats, then compactions. Each proposal fixes one mechanism; a candidate bundling two independent fixes becomes two questions.
+The digest is an index, not the limit of the review. The agent starts with the active branch and checks the current checkout. If something decisive is clipped or compacted, it looks up the saved request, reply, call, or result. It can search narrowly for a named or same-project lead when the branch lacks the source. It should name any missing evidence rather than infer what happened. A skipped or unanswered suggestion from an earlier retrospective is a lead, not proof of a problem or a Decline.
 
-An option can carry a note, which you add with `n` on its row. A note on **Apply** is an approval note: it approves the proposal as the model revises it by that note. The revision is written without a second question, and `observer_resolve`'s result shows the note, the model's reason for the revision and the text written. When the note only asks for a check, or only acknowledges, the model writes the approved text unchanged and gives what it checked as its reason; when the check shows the change should not be written, the model defers the proposal as Later with your note as its re-offer condition. A note on **Later** becomes that deferral's re-offer condition, in your words, even when the model sends none. A note on **Decline** is not recorded. A note on a stale amendment's **Update** or **Delete**, a withdrawal or a compaction approves nothing: the pass prepares the changed proposal and asks again, and the form says so on those questions. A note on **Apply** that asks for something unrelated to its proposal defers that proposal as Later and becomes a question of its own; on **Later** or **Decline** the answer stands, and a request in the note for another change becomes a question of its own. Custom input (`Other: ...`) still approves nothing. See [Proposal approval](development.md#proposal-approval).
+## Review and approval
+
+Prepare gives each eligible draft a reference and lists rejected drafts separately with reasons. A bad draft does not invalidate an unrelated one. A shared pass or receipt failure leaves no usable batch. Dependent changes, such as a compaction and the fixes it covers, must still agree before they can reach the form.
+
+Select uses the eligible references to build one native `ask` form with at most five questions. Stale amendments come first, then User note proposals, evidence-backed proposals, and compactions. Each question shows the remedy, evidence, target, and preview. Ordinary options are **Apply**, **Later**, and **Decline**. Stale amendments show **Keep** and the available **Update** or **Delete** options. Withdrawals and hook removals show **Apply** and **Decline**. Nothing is preselected.
+
+Proposals beyond the cap are deferred, not declined. The summary distinguishes findings, viable alternatives, rejected drafts, deferred proposals, report items, and missing evidence. Only an actual Decline suppresses that same scoped remedy. A timeout, cancellation, or omitted answer approves nothing.
+
+Add a note to an option with `n` on its row. A note on **Later** becomes the re-offer condition. A note on **Apply** can refine eligible small text changes without a second question, such as an on-read append or a rule revision that keeps the same target and intent. A note never adds a destination. A changed project or profile edit needs fresh review. A note that changes executable code needs a new check and Apply. Noted stale updates or deletions, withdrawals, and compactions also need a new Ask. Free text in the **Other** row is not approval.
 
 Each question shows its evidence: digest signal ids with their `(×N)` counts and a short exact quote, or `User note`, a Later entry's fingerprint or a stale amendment's rule. A barrier rule is asked about only after its pattern passes the replay check (see [Replay](amendments.md#replay)). Its preview shows the rule, scope and samples. The form shows a preview as wrapped text and marks indentation, repeated and trailing spaces `·` and tabs `→`; what is written is the prepared text.
 
-The model applies approved edits to local skills directly and to managed or new skills through `manage_skill`. It then records every answer with `observer_resolve`, which also writes every rule: amendment rules for upstream skills and barrier rules for local and managed ones. An applied skill edit is recorded only with the call that made it after your Apply; when that call failed or never happened, the edit is not recorded as applied. `observer_resolve` and `observer_check` join the model's tools at the session's first `/observe`. [`observer.md`](../observer.md) is read on every run, so it is a local proposal target too.
+Apply authorizes only the selected proposal in the exact native form for the current pass. The agent publishes through the target's normal owner tools, such as `edit` or `manage_skill`, and calls `observer_resolve` to validate receipts and record the outcome. Resolve writes observer-owned amendment and barrier rules itself. Text typed outside the form and a tool result that merely says a write succeeded are not approval.
 
-If an answer in the main batch retracts an applied fix, the pass prepares and selects its withdrawal, then asks about it in a separate follow-up `ask` in the same pass. **Decline** on a withdrawal keeps the fix: `observer_resolve` records nothing for it and says the fix stays in force. An answer cites its proposal by the reference of the pass's latest Prepare holding it; an older reference is refused with the latest one named. See [Proposal approval](development.md#proposal-approval) and [Ledger](development.md#ledger) for the approval and recording rules.
+A retraction of an applied fix can get a separate withdrawal question in the same pass. **Decline** on that question keeps the fix in force. If you restore an interrupted pass, the agent can recover the applicable instructions and use a saved approval only while its branch, proposal, form, and target are still valid. A new ordinary prompt, `/skill:` start, or `/clear` ends the pass. A newer preparation or form can supersede the old approval.
 
 ## Grounded repairs
 
@@ -46,7 +56,7 @@ A skill-text repair must show what the skill already says before it reaches a qu
 
 **Inspection.** `action: "inspect"` with a `skill` reads that installed skill's current guidance: its `SKILL.md`, every observer rule amending it with its status (a stale pin is still in force) and the reference files of its on-read amendment named in `references`, each numbered by line with its SHA-256 and `## ` sections. The folder's other reference files are listed by fingerprint only and cannot be cited. A missing, unreadable or malformed required source fails the inspection; a failed inspection grounds nothing. Reading the skill now says nothing about whether it guided the earlier work.
 
-**The evidence gate.** A direct edit of a local or managed skill, an on-read fix, and a pattern amendment or barrier rule each carry a `diagnosis`:
+**The evidence gate.** A direct edit of a local or managed skill, an exceptional installed-copy edit, an on-read fix, and a pattern amendment or barrier rule each carry a `diagnosis`:
 
 - `inspection`: the call ID of this pass's inspection of that skill;
 - `explanation`: why the inspected guidance does not already cover the finding, with the check that could disprove that and the check's result;
@@ -55,7 +65,7 @@ A skill-text repair must show what the skill already says before it reaches a qu
 
 Prepare refuses a repair whose diagnosis is missing or incomplete, whose receipt is forged, failed, from an earlier pass or from another branch, names another skill, or cites a source or location the inspection does not hold. It also refuses one whose skill file, rules or reference files changed, appeared or disappeared since the inspection. Select checks freshness again right before rendering the form. Each refusal says what to inspect again; nothing repairs a citation silently. The diagnosis is part of the prepared proposal, so its content hash covers it, and the form shows the explanation, delta and citations once beside the preview. The checks are structural: they do not prove the explanation is right.
 
-Project and harness remedies, stale answers, withdrawals and compactions keep their own contracts and take no diagnosis. After the form is rendered, the existing approval and target-freshness rules apply unchanged: a later change to other inspected guidance adds no expiry. An approval saved before the gate existed keeps its contract, but a proposal prepared without a diagnosis and not yet approved cannot reach a new form: inspect and prepare it again.
+Other project, profile, and executable remedies have their own target and check requirements. Stale answers, withdrawals, and compactions have separate checks. After the form is rendered, an unrelated change to inspected guidance does not by itself expire an approval. An already saved approval from before the skill diagnosis requirement keeps its contract. A skill repair without a diagnosis cannot reach a new form.
 
 **New-skill search.** `action: "inspect"` with the proposed name in `skill` and the workflow's words in `terms` searches, case-insensitively, the names and descriptions of the skills directory, managed skills, enabled plugins, skills created this session and, when readable, the prompt's skill catalog. It fails when a skill of that name exists, or when one of the first four sources exists but cannot be read; a source that is not installed counts as searched and empty. The result lists each source's coverage and the matches. A new-skill proposal cites the search as its `diagnosis.inspection` and explains why each match does not fit, with no `citations`. Prepare and Select refuse it once a skill of that name exists or any searched source or skill file changed. A fitting match becomes an ordinary repair of that skill, with its own inspection.
 
@@ -67,7 +77,7 @@ Observations and the proposal ledger share `<agent dir>/skill-observer/observer.
 
 An observation is pending until a pass shows it or 30 days pass after it was last recorded. Recording the same text before then, ignoring case, punctuation and spacing, raises its count and refreshes its expiry. After a pass shows it, a new recording starts at count one. For 30 days the next pass labels that recording with the prior shown date. The label does not say the user reviewed it or a fix failed. A successful tool call gives the pending count. Only the user starts a pass.
 
-`/observe` lists the project's pending observations in the payload's **observations** section. It starts a pass even when they are its only evidence. After sending the payload, it marks the exact revisions it listed as shown. A newer recording stays pending, including one made while `/observe` assembles the payload. If acknowledgement fails, the pass continues and shows an error. The pass checks each observation against the session and the checkout, turns it into a proposal when a proposal kind fits, and otherwise reports it as a [report item](#report-items). Pending observations do not turn on the `project` gate. `/observe-report` only reads them.
+`/observe` lists pending observations with their counts and last-recorded dates. They can start a pass on their own. After sending the payload, the extension marks the listed revisions as shown. A newer recording stays pending, including one made during payload assembly. If acknowledgement fails, the pass continues and shows an error. The agent checks each observation against the session and checkout before treating it as a finding. `/observe-report` only reads observations.
 
 ## Skill catalog observations
 
@@ -90,155 +100,83 @@ The payload carries only a short **catalog** section: how many observations the 
 
 ## Observation payload
 
-The message that starts a pass holds these sections, in this order, leaving out any without text:
+The hidden starting message carries discovery instructions and the evidence needed to find improvements. It includes the session digest and a saved branch locator when available. It adds the User note, pending observations, catalog summary, Later entries, remedy outcomes, rules in force, and stale amendments where applicable. An ordinary completed reply, a workflow outline, or a tool error also adds optional retrospective guidance and project scope information.
 
-- **instructions**: the parts of [`observer.md`](../observer.md) the session's evidence can reach, then the path of `observer.md` and the skills, managed-skills, user rules, on-read amendments and reference files directories, then the project hooks, global hooks and companion extension directories (see [Observer hooks and the companion extension](#observer-hooks-and-the-companion-extension));
-- **note**: the User note;
-- **digest**: the [session digest](#digest);
-- **observations**: the project's [pending observations](#observations), one line each with its count and the date it was last recorded;
-- **catalog**: the [skill catalog observations](#skill-catalog-observations) summary, when the branch has an observation or a known capture gap;
-- **ledger**: the proposal ledger's Later entries, each with its re-offer condition (`Re-offer when: …`) when its record has one;
-- **outcomes**: the remedy outcomes of applied fixes. Only project-environment fixes and fixes for a skill the digest loaded are listed. One closing line counts the rest, whose skills were not loaded in this session;
-- **rules-in-force**: the [rules in force](#rules-in-force);
-- **project**: Project scope and the Recurring mistake workflow, under the `project` gate;
-- **retro**: the Retrospective reference, under the `project` gate;
-- **stale**: the stale amendments, when there are any.
+The extension reads [`observer.md`](../observer.md) at each stage. An approved edit can affect the next pass. The starting message does not carry the whole procedure:
 
-`observer.md` is parsed on every run, so an approved edit applies to the next pass. Gate markers, `<!-- when: <gate> -->` and `<!-- end -->` on their own lines, wrap paragraphs and list items only some passes need. The rest is always on. `/observe` decides each gate from evidence it already has; no instruction asks the model to read more of them on demand:
+1. After discovery, the agent requests drafting guidance only if it has proposals or outcomes to record.
+2. Prepare returns selection guidance for eligible proposals. Select returns the exact form and instructions for using it.
+3. The native `ask` result carries publication or recording guidance for the choices made. The agent can request applicable guidance on restore, but the instructions do not recreate an expired approval.
 
-| Gate | On when | Covers |
-|---|---|---|
-| `stale` | an amendment is stale | finding, drafting, asking about and recording stale amendments |
-| `compaction` | a loaded upstream or plugin skill has an on-read amendment | compaction candidates, drafts, questions and records |
-| `project` | the digest has a workflow outline or a tool error | the retrospective branch, project remedies, project files and project outcomes; the project and retro sections |
-| `withdrawal` | a fix is in force for a loaded skill, or there is a User note | withdrawal candidates and questions, and retracted fixes |
-| `ranking` | the host has an explicit, available `judge` role assignment | advisory ranking and Select's `rankings`; without it the pass calls Select without rankings |
-| `note` | there is a User note | how to weigh the User note |
-| `observations` | the project has a pending observation | checking observations; those no proposal kind fits become report items |
-| `catalog` | the branch has a skill catalog observation or a known capture gap | catalog lookup and diagnosing a suspected missed trigger |
-| `tool-result` | never in the payload | what to do after a changed target, ledger recording failure or failed cleanup, with custom input and with an approval note; see below |
+If required instructions cannot be loaded, the affected stage stops and reports why. Tool results can carry specific guidance for an approval note, a changed target, or a recording or cleanup failure. [Rules in force](#rules-in-force) keep current facts in the starting message. The agent requests older supporting detail only when it matters to a finding.
 
-Under the `project` gate, the Retrospective reference includes the installed `retro` skill's text inline, without its frontmatter. A preceding line says which parts apply: its candidate categories do; its own steps and Files section describe a standalone retrospective and do not. Without `retro`, the section says the reference is unavailable and the UI warns. Without the gate, neither the section nor the warning appears.
-
-The `tool-result` paragraphs reach the model in the tool result that reports their condition, under a closing `## What to do now` heading. An `observer_resolve` result carries one paragraph per reported condition, regardless of how many answers hit it: an answer not recorded because its rule, amendment or reference files changed since Prepare or reconciliation, a ledger recording failure, or a failed cleanup.
-
-During a pass, an `ask` result carries the custom-input paragraph when an answer starts with `Other: `, the form's free-text row, and the approval-note paragraph when a chosen option has a note that is not blank. Any other result carries none. When `observer.md` cannot supply a paragraph, the result keeps everything it reports and ends with a one-line note naming the error instead.
-
-A malformed gate marker in `observer.md` stops `/observe` with an error notice; no pass starts. CRLF line ends parse the same as LF.
-
-The pass-start notice estimates the payload's size by section, as in `Observation pass started: 1 signal(s), 1 loaded skill(s), 0 stale amendment(s); payload ≈ 5848 tokens (instructions 5702, digest 110, ledger 9, rules-in-force 27; chars/4 estimate).` Each section counts ⌈characters / 4⌉, so the figure is an estimate, not the model's token count. Only the sections the message holds are listed.
+The pass-start notice estimates the starting message by section. It divides each section's UTF-16 length by four and rounds up before summing. The estimate excludes separators between sections, context outside that message, later tool results, and subsequent turns. It is not a provider token count.
 
 ## Evidence report
 
-`/observe-report` prints a model-free evidence report of the current branch in one notice: what `/observe` would work from, without starting a pass. It has the same gate as `/observe` (a main session with UI; elsewhere it prints nothing). It rebuilds everything from the current branch on each run, so a session switch or branch change shows in the next report. It calls no model, activates no tool and writes nothing. In order, it shows:
+`/observe-report` prints the current branch's evidence without starting a pass. Like `/observe`, it works in a main session with UI. It calls no model, activates no tool, writes nothing, and marks no observations shown.
 
 1. **Signals** by kind, as distinct occurrences, and how many older signals the digest cap would drop from the pass;
 2. **Skills loaded**, each with its provenance kind, load route (`read`, `slash-command`) and the on-read amendments delivered for it; skills a read requested that never loaded; managed skills created;
-3. **Remedy outcomes**, one line per applied fix in force for this project, as `fingerprint: status (skill or project target path)`, delivered first, then exercised-clean, recurrence and inconclusive. The report lists every one, including those the payload only counts;
+3. **Remedy outcomes**, one line per applied fix in force, with its fingerprint, status, and skill or target. The report lists every one, including those the payload only counts;
 4. **Stale amendments**, by rule name and skill;
-5. the **payload estimate** of the pass `/observe` would start now, from the same assembly and gates (without a User note);
+5. the **initial payload estimate**, if `/observe` would start now without a User note. It measures the hidden starting message only;
 6. the number of **Later** proposals for this project;
 7. the number of **pending observations** for this project, without their text. Reporting them marks none shown;
 8. the **skill catalog observations** on the branch: their count, what the latest listed, and known gaps. They alone do not make the report non-empty.
 
-The report names tools, signal kinds, skills, rule names and project target paths only: no tool arguments, error text, evidence file paths, session IDs or observation text. A branch with no signals, loaded skills, stale amendments, applied fixes or pending observations reports `No skill evidence on this branch.` and no estimate.
+The report omits tool arguments, error text, evidence file paths, session IDs, and observation text. A report with no starting payload, signals, loaded skills, stale amendments, remedy outcomes, or pending observations says `No skill evidence on this branch.` Catalog observations alone do not start a pass or make the report nonempty.
 
 ## Optional references
 
-The extension can use separately installed remote skills. The same pass reviews session-backed project-environment findings, even when a skill was loaded. When the digest has a workflow outline or a tool error, the pass carries the installed [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md), from Matt Pocock's skills, inline as its retrospective reference rather than launching a separate retrospective (see [Observation payload](#observation-payload)). If that reference is unavailable then, the UI warns and ordinary observation remains usable. Quiet lifecycle events still only refresh the hint; they initiate no retrospective scan or model call.
+For ordinary completed work, a workflow outline, or a tool error, the pass points to the installed [`retro`](https://github.com/mattpocock/skills/blob/main/skills/engineering/retro/SKILL.md) by Matt Pocock. The agent can read its candidate categories if useful. The extension does not inline the skill or run its standalone workflow. If the reference is unavailable, the pass continues with session evidence and the remedy categories it already has.
 
-When [`correct`](https://github.com/cursor/plugins/blob/main/harness/pstack/claude-code/skills/correct/SKILL.md), from Lauren Tan's pstack, is installed, a pass whose digest has a workflow outline or a tool error names it as reference. With at least two distinct occurrences of the same agent mistake class, the pass may offer `/skill:correct` as a separate next action citing their occurrence IDs. This skill favors architecture changes, types and enforceable checks, then tests, with docs last. Only the user may invoke it. Apply/Later/Decline grant no remediation or commit. Without `correct`, the pass says so and offers nothing.
+In the same cases, the pass can use [`correct`](https://github.com/cursor/plugins/blob/main/harness/pstack/claude-code/skills/correct/SKILL.md) by Lauren Tan as a reference when installed. With at least two distinct occurrences of the same mistake class, it can offer `/skill:correct` as a separate next action. Only you can invoke it. No observer answer authorizes that skill to run or commit.
 
 ## Remedy selection
 
-Remedy selection starts with the relevant existing project checks and their wiring: repair an unwired or broken check before proposing another one. Mechanical mistakes favor deterministic checks, missing information favors navigation/reference fixes, and judgment problems favor review guidance. Project-specific repairs stay under the canonical OMP working directory; reusable global skill guidance still needs to generalize. An outside path named in a note does not broaden project scope or grant access.
+Choose the least costly remedy that addresses the evidenced mechanism. Repair an existing broken or unwired check before adding another. Use a regression test when the application now behaves correctly but the old failure would still pass the suite. Fix missing information with navigation or documentation, and judgment problems with guidance. Prefer a configuration repair, rule, or amendment to new executable OMP code when it would solve the same problem.
 
-Findings about the same scoped mechanism merge their observer, retrospective and note evidence into one review question; a direct project repair takes precedence over a duplicate skill reminder for the same failure. Missing primary session evidence is disclosed rather than reconstructed as fact. The main review batch retains the five-question cap and Apply/Later/Decline choices. A retraction in an answer can require the separate withdrawal follow-up described in [`/observe`](#observe).
+Merge evidence for the same scoped mechanism. Prefer a direct fix to a duplicate reminder, but keep material alternatives visible. A tool's supplier label does not establish the cause of a failure. Inspect owner documentation or source only when the evidence points there.
 
-For an approved project check repair, the model publishes the exact reviewed diff with normal tools and exercises the known mistake plus a legitimate counterpart using temporary inputs. Expected rejection is asserted by a successful verification command; temporary inputs are restored. Only then can actual write/check tool-call IDs and the current target SHA-256 support an applied project record. A failed or unknown write/check remains deferred and is reported truthfully.
+## Project and profile targets
 
-## Remedy ladder
+The current checkout is in scope by default. To add another checkout, put `Include project root: /absolute/canonical/root` on its own line in your current instruction or User note. To add a worktree of the current repository by branch name, use `Include worktree: <branch>`. A path in a transcript, tool result, or scout report is not permission to inspect or edit another repository. Scope does not grant filesystem access.
 
-The pass ranks remedies by cost, cheapest first, not by who owns the failing component:
+A project proposal can cover one mechanism in multiple explicitly scoped checkouts. The form names every destination and shows the before and after text and the check for each file. The changes can differ by checkout. One Apply covers that set, not a subset chosen later or a substitute path. The agent checks each target's identity and before-state before publishing. If a destination changes, it reports what has already happened and asks again before publishing to revised scope.
 
-1. A configuration or wiring repair, a text or skill edit, an amendment, a barrier rule, a pattern amendment or a project check: the remedies above and in [Amendments](amendments.md).
-2. An [observer hook](#observer-hooks-and-the-companion-extension): one hook file in the project's hooks directory or in your global hooks directory.
-3. The [companion extension](#observer-hooks-and-the-companion-extension): the one user-level extension the pass may edit, for a remedy that needs a registered tool, several modules or a dependency.
+Project files use the reviewed owner write or removal and a meaningful foreground check in the target checkout. A deterministic check should exercise the observed mistake and a legitimate counterpart using temporary inputs. For a documentation change, a check that inspects the changed guidance or follows the new pointer can be enough. A generic success or status check is not evidence. The agent reports each destination separately, including untouched files, writes that could not be verified, and verified publications. One failure does not erase another destination's verified result. Apply does not roll back or repeat a write.
 
-Rungs 2 and 3 are last resorts. When the needed capability exists but is off or misconfigured, the pass proposes the configuration repair. A tool that rightly rejected a misuse stays unchanged; the misuse gets the cheapest fitting remedy on the agent's side. The pass reads an owner's documentation or source only for components the evidence touches.
+Profile edits stay in the active OMP agent directory. Supported targets include root guidance such as `AGENTS.md`, Markdown in the profile's guidance directories, existing hand-written rules, and the skill controls below. The preview shows the exact replacement, the profile-wide impact, and when OMP will load it:
+
+- For guidance, the check identifies a decisive passage the edit introduces or removes.
+- For an existing hand-written rule, the edit preserves user ownership. A pattern change needs a replay of the exact draft against the observed mistake and a legitimate counterpart.
+- For a skill setting, `skills.manualSkills` keeps manual invocation available and `disabledExtensions: ["skill:<name>"]` disables the skill. The edit uses the active `config.yml` or `config.yaml` and preserves unrelated settings. Project settings can override profile arrays.
+
+Prefer a suitable setting, an amendment, or a change to owned source over editing an installed skill. If none fits and the installed upstream or plugin skill file is inside the active profile, use `/observe allow-installed-copy <skill>` to permit the pass to propose that exact edit. The edit still needs a current-guidance inspection and Apply. An update can overwrite it.
 
 ## Report items
 
-A report item is a finding the pass tells you about in its summary instead of asking about it. Three kinds of finding become report items:
-
-- an evidenced finding no proposal kind fits, a checked observation included;
-- a capability no rung can provide. The item names the event or tool it would need, who would own its state, the benefit and the risks;
-- a fix in the behavioural code of any extension other than the companion extension, wherever that code lives, even under the project root. Configuration and check wiring of such an extension stay ordinary proposals.
-
-Each item gives the supplier or owner, what was requested and what resulted, the expected behaviour with its source or "undocumented", the cause status (confirmed, suspected or unknown), a scenario that would show the fix with its legitimate counterpart, and a next action. A part the evidence does not settle reads "unknown". A failed tool call is not presented as a confirmed extension defect.
-
-Report items are not asked about, not stored in the ledger and not offered again. You act on the summary. The rule against editing another extension's code is an instruction, not a check: Prepare cannot tell extension code from other project files by path.
+A report item is a finding in the pass summary that does not get an Apply question. The pass uses this route when no proposal fits, an owner tool or destination is unavailable or denied, or a necessary publication check cannot run safely. The item gives the owner, request and result, expected behavior and its source, what is known about the cause, a useful check, and a next action. Missing information stays unknown. A failed tool call alone is not a confirmed defect. Report items are not decisions and do not go in the proposal ledger.
 
 An extension that accepts lead references can investigate a specific note or a pending observation shown in the pass. It handles its own review and makes any resulting changes. Observer's form and proposal ledger do not record those decisions. If the extension is unavailable or the finding remains unresolved, the pass keeps it as a report item.
 
-## Observer hooks and the companion extension
+## Checked OMP hooks and extension source
 
-An **observer hook** is a hook file a pass wrote after your approval. The **companion extension** is the one user-level extension a pass may edit. Both live in fixed directories, which the payload's directory line names:
+When a simpler remedy does not fit, the pass can propose a checked change to a project hook, a global hook, or owned OMP extension source. Project hooks are in `.omp/hooks/pre/` in the active project. Global hooks are in `hooks/pre/` under the active agent directory. Extension targets include owned packages in scoped checkouts and native extension directories in the active profile. The existing companion directory is also supported; a new companion needs a package manifest that declares its OMP entry files. Source outside scope, installed plugin copies, and dependency stores are not eligible extension targets.
 
-| Target | Directory |
-|---|---|
-| Project hook | `<project>/.omp/hooks/pre/` |
-| Global hook | `<agent dir>/hooks/pre/` |
-| Companion extension | `<agent dir>/extensions/skill-observer-companion/` |
+The agent drafts in a private temporary directory outside the target. It uses ordinary permissions to run the supported foreground check before the form. The preview shows the exact files and changes, the command and observed result, the sessions affected, and when OMP will load the code. One **Apply** authorizes publication of that checked change. The agent reruns the reviewed command after writing the files. It cannot use an approval for an earlier intent or publish code that differs from what you reviewed. A note that changes the code requires a new checked preview and Apply.
 
-`<project>` is the real path of OMP's working directory. `<agent dir>` is `~/.omp/agent` unless `PI_CODING_AGENT_DIR` or a profile names another. OMP discovers hooks only in a `pre` or `post` subfolder, and observer hooks go in `pre`.
+The supported checks are:
 
-A hook is one self-contained file. It may register event handlers and commands and keep state. A project hook fixes a mistake specific to this project. A global hook must generalise the way global skill guidance must. A new hook's file is named `skill-observer-<fingerprint>.ts`, so a project hook and a global hook never share a name. OMP loads only the first hook file of a given name. A pass may also change or remove any hook file in the two hooks directories, ones you wrote by hand included.
+- **Hooks.** The bundled [`check-hook.ts`](../scripts/check-hook.ts) replays the observed mistake and a legitimate counterpart against a stand-in host. It checks whether the hook blocks a call, adds context, or leaves an event untouched. A removal uses its `--absent` mode. These checks do not prove how the hook will behave in a running session.
+- **Extensions.** `bun --no-env-file test` must observe at least one passing test against a scratch copy that matches the reviewed result. The pass cannot accept an arbitrary substitute command, a symlinked input tree, or a tree beyond the check's inspection limits. A passing test does not establish that the extension loads in a real OMP session.
 
-The companion extension is for a remedy that needs a registered tool, several modules or a dependency, or that rewrites a call or its result. The first approved change creates it. Its `package.json` declares its entry files under `omp.extensions`, because OMP loads nothing else in that directory. Every change keeps a test file there, and `bun test` in the directory is its check.
+A successful check is not a sandbox. Hook and extension code runs with the runner's existing permissions. Apply does not load the code, restart OMP, commit, or deploy. The change takes effect when OMP next loads the code. If a faulty hook stops the agent from using its tools, remove or restore the reviewed hook file outside OMP, then restart OMP.
 
-### Two approvals
+## Publication and recording
 
-A new or changed hook and every companion change take two approvals:
-
-1. **Intent.** The form shows the target, the event, the predicate, the action, the mistake sample, the legitimate sample, the scope, and why each cheaper remedy does not fit. It is one question of the main batch. Apply authorises drafting only.
-2. **Code.** A subagent drafts the code and a samples file in a temporary directory, never in the target, and runs the check. Without a subagent tool, the main agent drafts the same way. The form shows each file's exact text, the check command and its unedited output. This question gets its own Select and Ask, apart from every other question.
-
-Nothing is written before the code Apply. An Apply with a note, at either stage, approves nothing: the main agent revises the description or the code by your note, reruns the check for code, and asks again. Only your latest answer at a stage counts: a later Prepare or Ask of the same proposal supersedes an earlier Apply. A hook's check command names the hook by its path in the hooks directory, so the command the form shows is the one rerun on the written file. After the code Apply, the main agent writes each file with the `write` tool and reruns that command in the foreground, with the target's directory as working directory. `observer_resolve` records the change as applied only when the session holds those write calls after your Apply, runs of the approved command after them, and each file holds its approved text. It never writes these files itself.
-
-The ledger gets one record per hook or companion identity, at the end of the pass. It is `applied` when the code was approved and published, `declined` when either stage was declined, and `later` when either stage was answered Later, drafting or its check failed, or the code was never asked. A Later comes back as an intent question, and its re-offer condition says a draft existed. A record holds no file text, description or draft. A project hook's records show only in its project; global hook and companion records show in every project. Remedy outcomes count exercises after a record's timestamp, as for a project fix.
-
-A project proposal whose file lies in either hooks directory or the companion directory, followed through symlinks, is refused, so no hook or companion file is written with one approval.
-
-### Removal
-
-Removing a hook takes one approval. The form shows the file as it stands, with Apply and Decline. On Apply the agent deletes the file with its own tools. `observer_resolve` records the removal only once the file is gone and its path still resolves to the same file inside the hooks directory. When the ledger holds an applied record of the hook, the removal is recorded as its withdrawal. The companion extension is not removed this way.
-
-### The check
-
-[`scripts/check-hook.ts`](../scripts/check-hook.ts) ships in the package:
-
-```sh
-bun --no-env-file scripts/check-hook.ts <hook-file> <samples-file>
-```
-
-It loads the hook's default-exported factory against a stand-in host with no UI, feeds the samples' events in file order and prints one `PASS` or `FAIL` line per sample, then a verdict. It exits 0 only when every sample got its expected outcome: `blocked`, `context` (added context only) or `untouched`. A hook that changes a call or its result fails the check, so a hook's action is to block or add context. The samples file is a JSON array that holds at least one `mistake` sample and one `legitimate` sample. A hook that keeps state gets the sequence its state needs; a `tool_call` sample and its `tool_result` share a call ID through `toolCallId`. Run the script without arguments for the full sample format.
-
-The check shows that the hook's predicate separates the samples. It does not show that the hook loads and behaves in a real session.
-
-### Activation
-
-A written, changed or deleted hook or companion file takes effect only after you restart omp. A new session in the same process keeps the hooks and extensions it started with. The code and removal forms say so.
-
-### Risks and manual removal
-
-Hook and companion code runs inside the omp process, with your permissions, without a sandbox, permission model or automatic disable. A `tool_call` handler that throws or times out blocks the call. A faulty observer hook can therefore block the tools a pass needs to remove it. If that happens, delete the file by hand and restart omp:
-
-- a project hook: `<project>/.omp/hooks/pre/skill-observer-<fingerprint>.ts`;
-- a global hook: `<agent dir>/hooks/pre/skill-observer-<fingerprint>.ts`;
-- the companion extension: move or delete `<agent dir>/extensions/skill-observer-companion/`.
-
-A hand-written hook keeps its own file name. The intent and removal forms show its full path.
+The pass distinguishes a proposed check from one it observed. It records a publication only after it validates the applicable approval, owner action, and verification. If a write succeeds but verification fails, the summary reports the write as unverified, not Applied. If a verified write cannot be recorded, the summary calls it an **Unrecorded publication** and names the affected target. If the ledger commit is uncertain, the summary says so. It does not repeat the write to obtain a new receipt.
 
 ## Rules in force
 
@@ -247,17 +185,17 @@ After the [proposal ledger](development.md#ledger), **Rules in force** lists wha
 - an on-read amendment by name, body size in characters, the mark `over the compaction limit of 4000` when offered for compaction, `##` section headings and the absolute paths of its reference files;
 - a pattern amendment or barrier rule by name, scope and how many times it fired as a rule violation in this session (a delivered on-read amendment is no firing).
 
-Under each rule come the fixes in force whose `rule` names it, each with its fingerprint, gist, outcome and date, and quotes. Fixes are not tied to sections: the amendment is delivered as a whole, and its headings help spot duplicates.
+Under each rule come the fixes in force whose `rule` names it. The starting message shows each fix's fingerprint, gist, decision, and date. It does not include all historical quotes. The agent can look up supporting evidence and receipts by exact skill name, rule name, or proposal fingerprint through `observer_review`'s `evidence` action, even for a skill that did not load on the current branch. The lookup does not change past decisions.
 
 A fix is in force while its latest outcome is `applied`, `kept` or `updated` and its rule, when it has one, still exists. Removing a rule file some other way drops its fixes without a ledger write. A stale answer about a skill's on-read amendment, recorded under the amendment's own fingerprint, is no fix, and neither is a compaction. Fixes in force without a `rule` (edits to a local or managed skill) follow the skill's rules as edits to its own files.
 
 Rules that fired in this session come first, most firings first; the rest follow by the summed `evidence` counts of their fixes (0 without evidence), then by their newest fix. Fixes under a rule follow the same evidence-then-newest order. A final list names every hand-written rule in the user rules directory, any `.md` file without the marker, by name and `description`, whether or not a loaded skill relates to it.
 
-The pass dismisses a candidate that a listed rule already covers. A signal repeating a listed fix is a second failure, and the pass proposes a barrier rule for it.
+The pass checks whether an existing rule already covers a finding. If the evidence shows the same skill guidance failed again, it can consider a barrier rule. When a project check would catch the real mechanism, prefer repairing that check.
 
 ## Digest
 
-The digest keeps signals and drops everything else: harness messages (wiki recall, status notices, advisor, reminders and nudges, background-job and IRC deliveries, file mentions, `developer` messages), bookkeeping entries and thinking blocks.
+The digest summarizes signals and loaded skills. It also notes whether the branch has primary work. It omits ambient notices and bookkeeping. The pass can inspect the original branch when the summary is not enough.
 
 - **Corrections** carry the ~200 characters of assistant text just before them. Their own text is cut at 2,000 characters, so a pasted log can't fill the digest.
 - **Tool errors** show the tool, a short argument summary and the error. A long error keeps its start and its end around `…`, within about 300 characters, since a failed command may state why at either end. They name the skills loaded earlier in the same turn, and end with the tool's [supplier label](#supplier-label). Errors inside an observation pass are left out, and its calls get no outline.
