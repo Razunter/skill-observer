@@ -1,32 +1,166 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve as resolvePath } from "node:path";
-import { canonicalPathIn, canonicalProjectTarget, type HarnessFile, type HarnessPublication, type ProjectPublication, type ProjectTarget } from "./ledger.js";
+import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
+import { canonicalMissingPath, canonicalPathIn, type HarnessFile, type HarnessPublication, type ProjectPublication, type ProjectTarget } from "./ledger.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
-import type { SessionEntry } from "./omp.js";
+import type { SessionEntry, ToolArguments, ToolCallEvent } from "./omp.js";
 import { HOOK_CHECK_PATH } from "./payload.js";
-import type { HarnessCheck } from "./review.js";
+import { type HarnessCheck, preparedProjectEntries } from "./review.js";
+import { findProjectApproval, type ProposalAnswerRef } from "./proposal-approval.js";
 
-export function checkProjectPublication(target: ProjectTarget, publication: ProjectPublication | undefined, branch: SessionEntry[]): void {
-  if (!publication || typeof publication.afterHash !== "string" || !/^[a-f0-9]{64}$/.test(publication.afterHash) ||
-      typeof publication.writeToolCallId !== "string" || !Array.isArray(publication.checkToolCallIds) ||
-      publication.checkToolCallIds.length === 0 || publication.checkToolCallIds.some((id) => typeof id !== "string" || !id)) {
-    throw new Error("applied project answers need an observed write, checks and current SHA-256 afterHash");
+export interface ProjectEdit {
+  operation: "project-edit";
+  file: string;
+  directory: string;
+  directoryId: string;
+  fileId: string | null;
+  beforeHash: string | null;
+  afterHash: string | null;
+  text?: string;
+  check: string;
+}
+
+const fileId = ({ dev, ino }: { dev: number; ino: number }) => `${dev}:${ino}`;
+
+function maybeStat(file: string) {
+  try { return lstatSync(file); } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+export function prepareProjectEdit(target: ProjectTarget, text: string | undefined, check: string): { change: ProjectEdit; preview: string } {
+  const words = typeof check === "string" ? plainWords(check) : [];
+  if (!words.length || /^(?:true|false|:|echo|printf|pwd|ls|cat|stat|hash|command|which|type|git|sh|bash|env|exit|sleep)$/.test(basename(words[0]!)) ||
+      words.some((word) => /^(?:--(?:help|version|dry-run|list-tests|skip-tests)(?:=|$)|-[hV]$)/.test(word))) {
+    throw new Error("a project edit needs one meaningful foreground check, not an informational command, a skipped check or a shell sequence");
+  }
+  const file = join(target.root, target.path);
+  if (/[\x00-\x1f\x7f#\]]/.test(file)) throw new Error("the project destination cannot be shown and edited as a plain path");
+  const existing = maybeStat(file);
+  if (existing && (!existing.isFile() || existing.nlink !== 1)) throw new Error("the project target must be a regular file without other links");
+  let directory = dirname(file);
+  while (!existsSync(directory)) directory = dirname(directory);
+  const parent = lstatSync(directory);
+  if (!parent.isDirectory()) throw new Error("the project target needs a plain destination directory");
+  accessSync(directory, constants.W_OK);
+  if (existing && text !== undefined) accessSync(file, constants.W_OK);
+  const bytes = existing && readFileSync(file);
+  const before = bytes?.toString("utf8");
+  if (before === text) throw new Error("the project edit does not change the file");
+  if ((bytes && !bytes.equals(Buffer.from(before!))) ||
+      [before, text].some((body) => body !== undefined && /[\x00-\x08\x0b-\x1f\x7f]/u.test(body))) {
+    throw new Error("a project edit must be UTF-8 text with visible content and LF line endings");
+  }
+  const change: ProjectEdit = {
+    operation: "project-edit", file, directory, directoryId: fileId(parent), fileId: existing && fileId(existing),
+    beforeHash: bytes && sha256(bytes), afterHash: text === undefined ? null : sha256(text), ...(text !== undefined && { text }), check,
+  };
+  return { change, preview: [
+    `${before === undefined ? "Create" : text === undefined ? "Remove" : "Replace"} ${file}`,
+    ...(before === undefined ? [] : ["Before:", JSON.stringify(before)]),
+    ...(text === undefined ? [] : ["After:", JSON.stringify(text)]),
+    `Verify in ${target.root}: ${check}`,
+  ].join("\n") };
+}
+
+export function checkProjectState(change: ProjectEdit, before: boolean): void {
+  const { file, directory, directoryId } = change;
+  if (canonicalMissingPath(file) !== file || fileId(lstatSync(directory)) !== directoryId) {
+    throw new Error(`the destination or parent of \`${file}\` changed; review the target again`);
+  }
+  const current = maybeStat(file);
+  if (current && (!current.isFile() || current.nlink !== 1) ||
+      before && (current && fileId(current)) !== change.fileId ||
+      (current && sha256(readFileSync(file))) !== (before ? change.beforeHash : change.afterHash)) {
+    throw new Error(`\`${file}\` does not hold ${before ? "the reviewed before-state; prepare and ask again" : "the approved result"}`);
+  }
+}
+
+function ownerPaths(name: string, args: ToolArguments, cwd: string): string[] {
+  const absolute = (path: string) => resolvePath(cwd, path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
+  if (name === "write" && typeof args.path === "string" && !/^\w+:\/\//.test(args.path)) return [absolute(writeTargetPath(args.path))];
+  if (name === "edit" && typeof args.input === "string") {
+    return [...args.input.matchAll(/^\[([^#\r\n]+)#[0-9A-Fa-f]{4}\]$/gm)].map(([, path]) => absolute(path!));
+  }
+  return [];
+}
+
+function exactOwnerCall(change: ProjectEdit, name: string | undefined, args: ToolArguments): boolean {
+  if (change.text !== undefined) return name === "write" && args.path === change.file && args.content === change.text;
+  if (name !== "edit" || typeof args.input !== "string") return false;
+  const patch = /^\*\*\* Begin Patch\n\[([^#\r\n]+)#[0-9A-Fa-f]{4}\]\nREM\n\*\*\* End Patch\n?$/.exec(args.input);
+  return patch?.[1] === change.file;
+}
+
+export function projectToolAuthorization(event: ToolCallEvent, cwd: string, branch: readonly SessionEntry[], passStart: number): string | undefined {
+  if (!["write", "edit", "bash"].includes(event.toolName)) return;
+  const paths = ownerPaths(event.toolName, event.input, cwd);
+  if (paths.length === 0 && event.toolName !== "bash") return;
+  const evidence = sessionToolEvidence(branch);
+  const entries = preparedProjectEntries(evidence, passStart);
+  for (const { reference, proposal: { target, change } } of entries) {
+    if (change.operation === "direct-edit") {
+      if (paths.includes(join(target.root, target.path))) throw new Error("a legacy project preview needs fresh Prepare and Apply");
+      continue;
+    }
+    const write = paths.some((file) => file === change.file);
+    const check = event.toolName === "bash" && event.input.command === change.check && event.input.cwd === target.root &&
+      event.input.async !== true && event.input.name == null;
+    if (!write && !check) continue;
+    const approval = findProjectApproval(reference, evidence, branch, passStart);
+    if (!approval) {
+      if (write) throw new Error("the project destination has no current native Apply");
+      continue;
+    }
+    if (write) {
+      if (!exactOwnerCall(change, event.toolName, event.input) || paths.length !== 1) {
+        throw new Error("use the ordinary owner tool for the exact reviewed destination and content");
+      }
+      checkProjectState(change, true);
+    } else {
+      if (!["write", "edit"].some((name) => evidence.completedCalls(name).some(({ observed }) =>
+        observed?.call.authorization === reference.contentHash && observed.call.position > approval.answeredAt && observed.result.isError === false))) continue;
+      checkProjectState(change, false);
+    }
+    return reference.contentHash;
+  }
+  if (paths.length > 0 && entries.some(({ proposal: { change } }) =>
+      change.operation === "project-edit" && change.text !== undefined && event.input.content === change.text)) {
+    throw new Error("the proposed project content cannot be published at a substituted destination");
+  }
+  if (paths.some((file) => entries.some(({ proposal: { target } }) => {
+    const rel = relative(target.root, file);
+    return !!rel && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+  }))) throw new Error("this project destination was not reviewed; keep scratch work outside the destination checkout");
+}
+
+function approvedObservedCall(evidence: SessionToolEvidence, id: string, authorization: string, after: number): CompletedToolCall {
+  const { observed } = evidence.completedCall(id);
+  if (!observed || observed.call.authorization !== authorization || observed.call.position <= after ||
+      observed.result.isError !== false || observed.result.supplier?.source !== "builtin") {
+    throw new Error(`\`${id}\` is not a successful observed owner call authorized after Apply`);
+  }
+  return observed;
+}
+
+export function checkProjectPublication(target: ProjectTarget, change: ProjectEdit, approval: ProposalAnswerRef, answeredAt: number,
+    publication: ProjectPublication | undefined, branch: readonly SessionEntry[]): void {
+  if (!publication || publication.afterHash !== change.afterHash || typeof publication.writeToolCallId !== "string" ||
+      !Array.isArray(publication.checkToolCallIds) || publication.checkToolCallIds.length !== 1) {
+    throw new Error("cite the approved write, its one completed check, and the exact SHA-256 result (null for removal)");
   }
   const evidence = sessionToolEvidence(branch);
-  const write = successfulCall(evidence, publication.writeToolCallId);
-  if (write.call.name !== "write" && write.call.name !== "edit") throw new Error("project publication must use normal write/edit tools");
-  const paths = writtenPaths(write);
-  const targets = paths.map((path) => {
-    const absolute = isAbsolute(path) ? path : resolvePath(target.root, path);
-    return canonicalProjectTarget(target.root, { ...target, path: relative(target.root, absolute) });
-  });
-  if (!targets.some((candidate) => candidate.path === target.path)) throw new Error("observed write does not target this project file");
-  checkForegroundChecks(evidence, publication.checkToolCallIds, write.result.position, target.root);
-  const file = resolvePath(target.root, target.path);
-  if (!statSync(file).isFile() || sha256(readFileSync(file)) !== publication.afterHash) {
-    throw new Error("project target no longer matches the observed publication hash");
+  const id = approval.proposal.contentHash;
+  const write = approvedObservedCall(evidence, publication.writeToolCallId, id, answeredAt);
+  if (!exactOwnerCall(change, write.call.name, write.call.args)) throw new Error("the observed owner call is not the approved change");
+  try {
+    checkProjectState(change, false);
+    const check = approvedObservedCall(evidence, publication.checkToolCallIds[0]!, id, write.result.position);
+    checkForegroundCall(check, write.result.position, target.root, change.check);
+  } catch (error) {
+    throw new Error(`written but unverified: ${(error as Error).message}`);
   }
 }
 
@@ -131,20 +265,21 @@ export function checkHarnessPublication(change: { root: string; files: readonly 
 
 /** Each check is a completed, successful foreground bash call with `root` as working directory, made after branch position `after`, running the `approved` command when one is given. */
 function checkForegroundChecks(evidence: SessionToolEvidence, ids: readonly string[], after: number, root: string, approved?: string): void {
-  for (const id of ids) {
-    const check = successfulCall(evidence, id);
-    const checkArgs = check.call.args;
-    if (check.call.name !== "bash" || check.call.position <= after || typeof checkArgs.cwd !== "string" ||
-        canonical(checkArgs.cwd) !== canonical(root) || typeof checkArgs.command !== "string" || !checkArgs.command.trim() ||
-        checkArgs.async === true || checkArgs.name != null) throw new Error("verification must be a completed foreground check in the target root after its write");
-    if (approved !== undefined && checkArgs.command.trim() !== approved.trim()) throw new Error(`\`${checkArgs.command}\` is not the approved check \`${approved}\`: rerun it exactly`);
-    const details = check.result.details;
-    if (!details || typeof details !== "object" ||
-        !(details.exitCode === 0 || typeof details.wallTimeMs === "number" && Number.isFinite(details.wallTimeMs) && details.wallTimeMs >= 0) ||
-        ("exitCode" in details && details.exitCode !== 0) ||
-        ("timedOut" in details && details.timedOut) || "async" in details || "service" in details ||
-        ("terminalId" in details && !("wallTimeMs" in details))) throw new Error("the check did not complete successfully");
-  }
+  for (const id of ids) checkForegroundCall(successfulCall(evidence, id), after, root, approved);
+}
+
+function checkForegroundCall(check: CompletedToolCall, after: number, root: string, approved?: string): void {
+  const checkArgs = check.call.args;
+  if (check.call.name !== "bash" || check.call.position <= after || typeof checkArgs.cwd !== "string" ||
+      canonical(checkArgs.cwd) !== canonical(root) || typeof checkArgs.command !== "string" || !checkArgs.command.trim() ||
+      checkArgs.async === true || checkArgs.name != null) throw new Error("verification must be a completed foreground check in the target root after its write");
+  if (approved !== undefined && checkArgs.command !== approved) throw new Error(`\`${checkArgs.command}\` is not the approved check \`${approved}\`: rerun it exactly`);
+  const details = check.result.details;
+  if (!details || typeof details !== "object" ||
+      !(details.exitCode === 0 || typeof details.wallTimeMs === "number" && Number.isFinite(details.wallTimeMs) && details.wallTimeMs >= 0) ||
+      ("exitCode" in details && details.exitCode !== 0) ||
+      ("timedOut" in details && details.timedOut) || "async" in details || "service" in details ||
+      ("terminalId" in details && !("wallTimeMs" in details))) throw new Error("the check did not complete successfully");
 }
 
 const sha256 = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");

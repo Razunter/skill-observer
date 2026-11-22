@@ -33,6 +33,7 @@ import { RESOLVE_TOOL_NAME, registerResolveTool } from "./resolve.js";
 import { hasReviewedPublication, registerReviewTool, reviewSelectionForForm, REVIEW_TOOL_NAME } from "./review.js";
 import { evidenceReport, renderEvidenceReport } from "./report.js";
 import { recordHookCall, recordHookResult, sessionToolEvidence } from "./session-tool-evidence.js";
+import { projectToolAuthorization } from "./project-publication.js";
 import { countPendingObservations, markObservationsShown, type Observation, readPendingObservations, recordObservation } from "./observations.js";
 import { ObserverCommitUnknownError, observerStorePath, readObserverStore } from "./observer-store.js";
 import { APPLY, hasApprovalNote, hasCustomInput, observationPassStart, STALE_OPTIONS } from "./proposal-approval.js";
@@ -105,7 +106,8 @@ export default function skillObserver(pi: ExtensionAPI): void {
     try {
       const nativeAsk = event.toolName === "ask" && event.parentToolCallId === undefined;
       const ownerWrite = ["write", "edit", "manage_skill"].includes(event.toolName);
-      if ((nativeAsk || ownerWrite) && isObservable(ctx)) {
+      let authorization: string | undefined;
+      if ((nativeAsk || ownerWrite || event.toolName === "bash") && isObservable(ctx)) {
         const branch = ctx.sessionManager.getBranch();
         const passStart = observationPassStart(branch);
         if (passStart !== undefined && nativeAsk && reviewSelectionForForm(sessionToolEvidence(branch), passStart, event.input.html)) {
@@ -119,8 +121,9 @@ export default function skillObserver(pi: ExtensionAPI): void {
             if (hasReviewedPublication(sessionToolEvidence(branch), passStart, true)) throw error;
           }
         }
+        if (passStart !== undefined) authorization = projectToolAuthorization(event, ctx.cwd, branch, passStart);
       }
-      recordHookCall(pi, event);
+      recordHookCall(pi, event, authorization);
     } catch (error) {
       return { block: true, reason: error instanceof Error ? error.message : String(error) };
     }

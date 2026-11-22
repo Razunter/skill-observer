@@ -77,7 +77,7 @@ export interface ProjectTarget {
 export interface ProjectPublication {
   writeToolCallId: string;
   checkToolCallIds: string[];
-  afterHash: string;
+  afterHash: string | null;
 }
 
 export interface ProjectLedgerRecord extends LedgerEntry {

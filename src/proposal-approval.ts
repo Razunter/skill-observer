@@ -77,7 +77,7 @@ type ApprovedAnswer =
   | { skill: string; outcome: string; approval?: AnswerApproval };
 
 /** The prepared changes an approval lets `observer_resolve` carry out. */
-export type ApprovedChange = Exclude<PreparedChange, { operation: "direct-edit" | "harness" }>;
+export type ApprovedChange = Exclude<PreparedChange, { operation: "direct-edit" | "project-edit" | "harness" }>;
 type HarnessChange = Extract<PreparedChange, { operation: "harness" }>;
 /** The approved changes a reconciliation may revise. */
 type ReconcilableChange = Extract<PreparedChange, { operation: "on-read-append" | "rule" }>;
@@ -304,6 +304,41 @@ export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<P
   return { proposal, change, answeredAt };
 }
 
+export function approvedProject(ref: Partial<ProposalAnswerRef> | undefined, branch: readonly SessionEntry[], evidence = sessionToolEvidence(branch)) {
+  const approval = answerRef(ref);
+  const { proposal, change, answeredAt, note } = approvedProposal(approval, evidence, branch, (prepared) => {
+    const change = "change" in prepared ? prepared.change : undefined;
+    if (prepared.kind !== "project" || change?.operation !== "project-edit") {
+      throw new Error("this Apply does not cover an exact project change; prepare and ask again");
+    }
+    return new Map([[APPLY, change]]);
+  });
+  if (proposal.kind !== "project") throw new Error("the approved proposal is not a project change");
+  if (note !== undefined && !/^(?:please )?verify(?: only)?[.!]?$/i.test(note)) {
+    throw new Error("the Apply has a note that may change the approved work; prepare and ask again");
+  }
+  checkLatestAnswer(approval, evidence, answeredAt);
+  return { proposal, change, answeredAt, approval };
+}
+
+export function findProjectApproval(reference: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[], passStart: number) {
+  const selections = evidence.completedCalls(REVIEW_TOOL_NAME).flatMap(({ call, result }) => {
+    if (call.position <= passStart || call.args.action !== "select" || result.isError !== false) return [];
+    const selected = (result.details as { selected?: PreparedEntry[] } | undefined)?.selected;
+    if (!selected?.some((entry) => isDeepStrictEqual(entry?.reference, reference))) return [];
+    return [{ id: call.id, position: result.position, html: renderAskHtml(selected.map(({ proposal }) => proposal)) }];
+  });
+  const ask = evidence.completedCalls("ask").findLast(({ call }) =>
+    selections.some((selected) => selected.position < call.position && selected.html === call.args.html));
+  if (!ask) return;
+  const selectionToolCallId = selections.findLast((selected) => selected.position < ask.call.position && selected.html === ask.call.args.html)?.id;
+  try {
+    return approvedProject({ proposal: reference, selectionToolCallId, askToolCallId: ask.call.id }, branch, evidence);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The local, managed or new skill direct edit the user answered Apply in this
  * pass, established from the saved Ask answer like any approval, and the
@@ -329,8 +364,10 @@ export function approvedDirectEdit(ref: Partial<ProposalAnswerRef> | undefined, 
 function checkLatestAnswer(approval: ProposalAnswerRef, evidence: SessionToolEvidence, answeredAt: number): void {
   const { candidateId, reviewToolCallId } = approval.proposal;
   const isReprepared = latestPrepared(candidateId, evidence)?.reviewToolCallId !== reviewToolCallId;
-  const isReasked = evidence.completedCalls("ask").some(({ result }) => result.position > answeredAt &&
-    Array.isArray(result.details?.answers) && result.details.answers.some((answer: { name?: unknown } | undefined) => answer?.name === candidateId));
+  const form = evidence.completedCall(approval.askToolCallId).call.args.html;
+  const isReasked = evidence.completedCalls("ask").some(({ call, result }) =>
+    result.position > answeredAt && call.origin === "native" &&
+    (call.args.html === form || result.details?.answers?.some((answer) => answer?.name === candidateId)));
   if (isReprepared || isReasked) {
     throw new Error("this Apply is superseded: a later Prepare or Ask of this pass holds the same proposal again; cite the user's latest answer, which must be an Apply");
   }
@@ -366,7 +403,7 @@ export function preparedInPass(ref: PreparedProposalRef, evidence: SessionToolEv
 function approvingOptions(proposal: PreparedProposal): Map<string, ApprovedChange> {
   if ("alternatives" in proposal) return new Map(proposal.alternatives.map(({ change }) => [STALE_OPTIONS[change.operation], change]));
   const { change } = proposal;
-  if (change.operation === "direct-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself: cite its observed write as `publication`");
+  if (change.operation === "direct-edit" || change.operation === "project-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself: cite its observed write as `publication`");
   if (change.operation === "harness") throw new Error("the approved proposal is a hook or companion change, answered as a `harness` outcome");
   return new Map([[APPLY, change]]);
 }

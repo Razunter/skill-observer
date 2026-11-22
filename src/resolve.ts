@@ -56,7 +56,7 @@ import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
 import { checkHarnessPublication, checkProjectPublication, checkSkillEditPublication, type SkillEditPublication } from "./project-publication.js";
-import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, laterNote, latestPrepared, observationPassStart, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
+import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, approvedProject, laterNote, latestPrepared, observationPassStart, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
 import { loadInstructionStage, type ToolResultCondition, whatToDoNow } from "./payload.js";
 import { isProposalRef, overflowDeferral, type PreparedProposal, type PreparedProposalRef, proposalRefSchema } from "./review.js";
 import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
@@ -96,6 +96,7 @@ interface ProjectAnswer {
   fingerprint?: string;
   evidence?: Evidence[];
   reoffer?: string;
+  approval?: ProposalAnswerRef;
   publication?: ProjectPublication;
   rule?: never;
 }
@@ -167,9 +168,20 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
   if (answer.fingerprint !== undefined && answer.fingerprint !== fingerprint) throw new Error("project fingerprint does not match its scoped identity");
   if (!PROPOSAL_OUTCOMES.includes(answer.outcome) || typeof answer.gist !== "string" || !answer.gist.trim() ||
       answer.rule !== undefined || "skill" in answer) throw new Error("project answers need a gist and Apply/Later/Decline; they are not skill amendments");
-  if (answer.outcome === "applied") checkProjectPublication(target, answer.publication, branch);
+  let evidence = answer.evidence;
+  if (answer.outcome === "applied") {
+    const { proposal, change, approval, answeredAt } = approvedProject(answer.approval, branch);
+    if (proposal.fingerprint !== fingerprint || proposal.target.root !== target.root || proposal.target.path !== target.path ||
+        proposal.target.mechanism !== target.mechanism || proposal.gist !== answer.gist) {
+      throw new Error("the applied answer does not name the project change selected in that Apply");
+    }
+    checkProjectPublication(target, change, approval, answeredAt, answer.publication, branch);
+    evidence = proposal.evidence;
+  } else if (answer.approval !== undefined || answer.publication !== undefined) {
+    throw new Error("only an applied project remedy cites approval and publication");
+  }
   return { kind: "project", target, fingerprint, gist: answer.gist, outcome: answer.outcome,
-    ...(answer.evidence && { evidence: answer.evidence }), ...laterReoffer(answer),
+    ...(evidence?.length && { evidence }), ...laterReoffer(answer),
     ...(answer.outcome === "applied" && { publication: answer.publication }), timestamp, sessionId };
 }
 
@@ -331,11 +343,12 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             fingerprint: z.string().optional(),
             evidence: z.array(z.object({ quote: z.string(), count: z.number(), occurrenceIds: z.array(z.string()).optional() })).optional(),
             reoffer: z.string().optional().describe(REOFFER_DESCRIPTION),
+            approval: z.object(approvalShape(z)).optional().describe("Required for Applied: the exact native approval of this prepared project change."),
             publication: z.object({
               writeToolCallId: z.string(),
               checkToolCallIds: z.array(z.string()),
-              afterHash: z.string(),
-            }).optional().describe("Applied only: actual successful normal write/edit and subsequent foreground bash check IDs from this session branch, and current target SHA-256. Checks use explicit project cwd. This tool does not write project files."),
+              afterHash: z.unknown().describe("SHA-256 of the approved result, or null for removal."),
+            }).optional().describe("Applied only: the authorized owner write and subsequent completed check in the target checkout. Resolve does not write project files."),
           }),
           z.object({
             kind: z.enum(["harness"]),

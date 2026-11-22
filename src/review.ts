@@ -31,7 +31,7 @@ import { DRAFT_RECORD_GATES, type Gate, instructionText } from "./payload.js";
 import {
   createProvenanceResolver, defaultSkillRoots, type InstalledSkillScan, ompAgentDir, type ProvenanceResolver, scanInstalledSkills, skillHash, type SkillProvenance, type SkillRoots, type SourceCoverage,
 } from "./provenance.js";
-import { checkCompanionCommand, checkHookCommand } from "./project-publication.js";
+import { checkCompanionCommand, checkHookCommand, checkProjectState, prepareProjectEdit, type ProjectEdit } from "./project-publication.js";
 import { fixRule } from "./publication.js";
 import { checkPointers, checkReferenceFiles, hasUnlistedReferenceEntries, type ReferenceFile, readReferenceFiles, referenceFolder } from "./references.js";
 import { type PatternDraft, type Sample, sampleSchemas } from "./replay.js";
@@ -45,14 +45,15 @@ const PRIORITIES = ["stale", "note", "evidence", "compaction"] as const;
 const ASK_LIMIT = 5;
 const OVERFLOW_REASON = "Deferred because five other proposals filled the main Ask. Reconsider in the next observation pass if the fix is still applicable.";
 type Priority = (typeof PRIORITIES)[number];
-const OPERATIONS = ["direct-edit", "on-read-append", "rule", "stale-update", "stale-delete", "withdrawal", "compaction", "harness"] as const;
+const OPERATIONS = ["direct-edit", "project-edit", "on-read-append", "rule", "stale-update", "stale-delete", "withdrawal", "compaction", "harness"] as const;
 
 interface ReviewEvidence extends Evidence { source?: string }
 
 /** The exact change a candidate proposes, as the pass drafts it. */
 type ChangeDraft =
-  /** A local or managed skill edit, a new skill or a project repair, published later by the target's normal owner. */
+  /** A local or managed skill edit or a new skill, published by the target's normal owner. */
   | { operation: "direct-edit"; preview: string }
+  | { operation: "project-edit"; text?: string; check: string }
   | { operation: "on-read-append"; section: string }
   | ({ operation: "rule"; body: string } & PatternDraft)
   | { operation: "stale-update"; rule: string; body: string; references?: ReferenceFile[] }
@@ -134,6 +135,7 @@ interface ReferenceChange { folder: string; before: FileSnapshot[]; write: Refer
  */
 export type PreparedChange =
   | { operation: "direct-edit" }
+  | ProjectEdit
   /** Apply of an intent authorises drafting only: nothing is written or recorded as applied from it. */
   | { operation: "harness"; stage: "intent" }
   /** Approve the exact code: `root` is the target root's directory; the pass writes the files with normal tools and the resolver only records them. */
@@ -151,7 +153,7 @@ export type PreparedChange =
   | { operation: "withdrawal"; withdrawn: { fingerprint: string; gist: string }; effect: "rewrite"; rule: RuleIdentity; target: FileSnapshot; body: string; references?: ReferenceChange }
   /** `rule` is absent when this pass's additions create the amendment the compaction rewrites. */
   | { operation: "compaction"; rule?: RuleIdentity; target: FileSnapshot; includes: string[]; body: string; references: ReferenceChange };
-type ProtectedChange = Exclude<PreparedChange, { operation: "direct-edit" | "harness" }>;
+type ProtectedChange = Exclude<PreparedChange, { operation: "direct-edit" | "project-edit" | "harness" }>;
 type StaleChange = Extract<PreparedChange, { operation: "stale-update" | "stale-delete" }>;
 /** A stale amendment's answer that changes the rule, and the preview the Ask form shows under its heading. */
 interface StaleAlternative { change: StaleChange; preview: string }
@@ -260,7 +262,8 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
   const z = pi.zod;
   const referenceFiles = z.array(z.object({ name: z.string(), body: z.string() }));
   const change = z.union([
-    z.object({ operation: z.enum(["direct-edit"]), preview: z.string().describe("The exact diff, new skill or project repair.") }),
+    z.object({ operation: z.enum(["direct-edit"]), preview: z.string().describe("The exact skill edit or new skill.") }),
+    z.object({ operation: z.enum(["project-edit"]), text: z.string().optional().describe("Complete replacement text; omit only to remove an existing file."), check: z.string().describe("The exact meaningful foreground check to run from the target root after the write.") }),
     z.object({ operation: z.enum(["on-read-append"]), section: z.string().describe("The section appended to the skill's on-read amendment: a `## ` heading line and its text.") }),
     z.object({ operation: z.enum(["rule"]), name: z.string(), body: z.string(), pattern: z.string(), ...sampleSchemas(z) })
       .describe("A pattern amendment (upstream/plugin) or barrier rule (local/managed), as checked by observer_check."),
@@ -445,6 +448,13 @@ export function registerReviewTool(pi: ExtensionAPI, files: ObserverFiles, catal
               throw new Error(`proposal \`${reference.candidateId}\`: ${error instanceof Error ? error.message : String(error)}, then prepare it again`);
             }
           }
+          for (const { proposal } of selected) {
+            if (proposal.kind !== "project") continue;
+            if (!("change" in proposal) || proposal.change.operation !== "project-edit") {
+              throw new Error("a legacy project preview needs fresh Prepare before Ask");
+            }
+            checkProjectState(proposal.change, true);
+          }
           if (selected.length > 0) next = instructionText("ask", DRAFT_RECORD_GATES);
           details.selected = selected;
           details.deferred = selection.ordered.slice(ASK_LIMIT);
@@ -499,7 +509,7 @@ export function hasReviewedPublication(evidence: SessionToolEvidence, passStart:
     return selected?.some(({ proposal }) => {
       const answer = result.details?.answers?.find((choice) => choice?.name === proposal.candidateId)?.answer;
       if (ownerToolsOnly) {
-        return answer === APPLY && "change" in proposal && (proposal.change.operation === "direct-edit"
+        return answer === APPLY && "change" in proposal && (["direct-edit", "project-edit"].includes(proposal.change.operation)
           || (proposal.change.operation === "harness" && proposal.change.stage !== "intent"));
       }
       return answer === APPLY || answer === STALE_OPTIONS["stale-update"] || answer === STALE_OPTIONS["stale-delete"];
@@ -515,6 +525,24 @@ export function overflowDeferral(ref: PreparedProposalRef, evidence: SessionTool
     if (Array.isArray(details?.selected) && details.selected.some((entry) => isDeepStrictEqual(entry?.reference, ref))) return undefined;
     if (Array.isArray(details?.deferred) && details.deferred.some((entry) => isDeepStrictEqual(entry?.reference, ref))) return OVERFLOW_REASON;
   }
+}
+
+type PreparedProjectEntry = PreparedEntry & { proposal: { kind: "project"; change: ProjectEdit | { operation: "direct-edit" } } };
+
+export function preparedProjectEntries(evidence: SessionToolEvidence, passStart: number): PreparedProjectEntry[] {
+  const entries = new Map<string, PreparedProjectEntry>();
+  for (const { call, result } of evidence.completedCalls(REVIEW_TOOL_NAME)) {
+    if (call.position <= passStart || call.args.action !== "prepare" || result.isError !== false) continue;
+    const eligible = (result.details as Partial<ReviewDetails> | undefined)?.eligible;
+    if (!Array.isArray(eligible)) continue;
+    for (const entry of eligible) {
+      const proposal = entry?.proposal;
+      if (proposal?.kind === "project" && "change" in proposal && ["project-edit", "direct-edit"].includes(proposal.change.operation)) {
+        entries.set(proposal.candidateId, entry as PreparedProjectEntry);
+      }
+    }
+  }
+  return [...entries.values()].reverse();
 }
 
 function guidanceContext(ctx: ExtensionContext, files: ObserverFiles): GuidanceContext {
@@ -777,6 +805,8 @@ function actionLabel(proposal: PreparedProposal): string {
       return `${change.target.sha256 === null ? "Add" : "Rewrite"} ${isPinKind(proposal.kind) ? "pattern amendment" : "barrier rule"}`;
     case "direct-edit":
       return proposal.kind === "new" ? "Create skill" : "Edit";
+    case "project-edit":
+      return change.afterHash === null ? "Remove file" : change.beforeHash === null ? "Create file" : "Edit file";
     case "harness": {
       const isCompanion = proposal.kind === "harness" && proposal.target.root === "companion";
       if (change.stage === "removal") return "Remove hook";
@@ -1185,6 +1215,15 @@ function preparedProposal(
     return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, change: { operation: "harness", stage: "intent" }, preview: intentPreview(candidate.target, fingerprint, draft, context) };
   }
   if (draft.operation === "harness") throw new Error("a harness change needs a harness target: the project or global hooks directory, or the companion extension");
+  if (draft.operation === "project-edit") {
+    if (candidate.kind !== "project") throw new Error("a project edit needs a project target");
+    const fingerprint = proposalIdentity(candidate, decisions);
+    identify(`proposal:${fingerprint}`);
+    if (draft.text !== undefined && typeof draft.text !== "string") throw new Error("project replacement text must be a string");
+    if (isDeclined(fingerprint)) return undefined;
+    return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, ...prepareProjectEdit(candidate.target, draft.text, draft.check) };
+  }
+  if (candidate.kind === "project") throw new Error("a project change needs its exact replacement or removal and check; prepare a project edit");
   if (draft.operation === "direct-edit") {
     if (isPinKind(candidate.kind)) throw new Error("an upstream or plugin skill takes amendment rules, not a direct edit");
     const fingerprint = proposalIdentity(candidate, decisions);
@@ -1193,7 +1232,6 @@ function preparedProposal(
     if (typeof draft.preview !== "string" || !draft.preview.trim()) throw new Error("a direct edit needs its exact preview");
     return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, change: { operation: "direct-edit" }, preview: draft.preview };
   }
-  if (candidate.kind === "project") throw new Error("a project proposal is a direct edit");
   const { skill, kind } = candidate;
   const { dirs, referencesDir } = context;
   /** `prepare` validates and reads the change's target only once the identity is known not to be declined. */

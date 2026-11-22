@@ -1,0 +1,2 @@
+- `on-read-append` with the `section` of an upstream or plugin on-read fix;
+- `rule` with the `name`, `body`, `pattern`, `scope`, `matches` and `spares` of a pattern amendment or barrier rule, as `observer_check` passed it;

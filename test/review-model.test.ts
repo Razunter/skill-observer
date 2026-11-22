@@ -14,7 +14,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 const schema: Schema = { optional: () => schema, describe: () => schema };
 const model = { provider: "fixture", id: "explicit-judge" };
 const projectRepair = (gist: string, quote: string, count: number, remedy = "Other fix") =>
-  ({ kind: "project", gist, priority: "evidence", remedy, change: { operation: "direct-edit", preview: `Exact ${gist} diff` }, evidence: [{ quote, count }] });
+  ({ kind: "project", gist, priority: "evidence", remedy, change: { operation: "project-edit", text: `New check: ${gist}\n`, check: "bun test" }, evidence: [{ quote, count }] });
 const drafts = [
   projectRepair("Weak", "Weak support", 1, "Fix weak"),
   projectRepair("Strong", "Strong support", 4, "Fix strong"),

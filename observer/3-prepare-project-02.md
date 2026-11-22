@@ -1,0 +1,1 @@
+- `project-edit` with the complete resulting `text` (omit only to remove an existing file) and the exact meaningful foreground Bash `check` in the target checkout. Prepare snapshots the original path and content and renders the change itself. If the destination or necessary check is unavailable or denied, make a report item with the next action, not an Apply question.

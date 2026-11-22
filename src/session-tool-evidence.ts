@@ -26,6 +26,7 @@ export interface ToolCallEvidence {
   readonly id: string;
   readonly name: string | undefined;
   readonly args: ToolArguments;
+  readonly authorization?: string;
 }
 
 export interface ToolResultEvidence {
@@ -46,6 +47,7 @@ export interface ToolResultEvidence {
 export interface CompletedToolCall {
   readonly call: ToolCallEvidence;
   readonly result: ToolResultEvidence;
+  readonly observed?: { call: ToolCallEvidence; result: ToolResultEvidence };
 }
 
 export interface SessionToolEvidence {
@@ -125,8 +127,8 @@ export function sessionToolEvidence(branch: readonly SessionEntry[]): SessionToo
  * Saves the hook copy of a starting call. Its native call is not on the branch
  * yet, so every call is copied; the views tell native ones apart later.
  */
-export function recordHookCall(pi: ExtensionAPI, event: ToolCallEvent): void {
-  pi.appendEntry(HOOK_CALL_TYPE, { toolCallId: event.toolCallId, toolName: event.toolName, input: structuredClone(event.input) });
+export function recordHookCall(pi: ExtensionAPI, event: ToolCallEvent, authorization?: string): void {
+  pi.appendEntry(HOOK_CALL_TYPE, { toolCallId: event.toolCallId, toolName: event.toolName, input: structuredClone(event.input), ...(authorization && { authorization }) });
 }
 
 /** Saves the hook copy of a call's outcome when its start was copied; an outcome alone has no request to pair with. */
@@ -265,7 +267,8 @@ function callsIn(entry: SessionEntry, position: number): ToolCallEvidence[] {
   if (entry.type !== "custom" || entry.customType !== HOOK_CALL_TYPE || !data || typeof data !== "object" ||
       !("toolCallId" in data) || typeof data.toolCallId !== "string" || !("toolName" in data) || typeof data.toolName !== "string" ||
       !("input" in data) || !data.input || typeof data.input !== "object" || Array.isArray(data.input)) return [];
-  return [{ origin: "hook", position, id: data.toolCallId, name: data.toolName, args: data.input as ToolArguments }];
+  return [{ origin: "hook", position, id: data.toolCallId, name: data.toolName, args: data.input as ToolArguments,
+    ...("authorization" in data && typeof data.authorization === "string" && { authorization: data.authorization }) }];
 }
 
 function resultIn(entry: SessionEntry, position: number): ToolResultEvidence | undefined {
@@ -313,5 +316,5 @@ function pairCompletedCall(id: string, calls: readonly ToolCallEvidence[], resul
       result.position <= call.position || result.name !== call.name) {
     throw new Error(`no completed observed tool call for ${id}`);
   }
-  return { call, result };
+  return { call, result, ...(hookCall && hookResult && { observed: { call: hookCall, result: hookResult } }) };
 }

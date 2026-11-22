@@ -20,6 +20,8 @@ import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
 import { remedyOutcomes } from "../src/outcomes.js";
 import { INSTRUCTIONS_PATH, toolResultGuidance } from "../src/payload.js";
 import { createProvenanceResolver, skillHash } from "../src/provenance.js";
+import { projectToolAuthorization } from "../src/project-publication.js";
+import { recordHookCall, recordHookResult } from "../src/session-tool-evidence.js";
 import { groundRepairs } from "./grounding.js";
 import { makeSkillHome } from "./skill-home.js";
 
@@ -60,7 +62,10 @@ function fixture() {
   type Details = { failures: string[]; deferred: string[]; cleanup: string[]; records: LedgerRecord[]; publications: unknown[]; selected: Selected[]; recording: { rows: string[]; error?: string } };
   const tools: Record<string, ToolDefinition<unknown, Details>> = {};
   const files = { storeFile: () => join(home, "observer.sqlite"), rulesDir: () => join(home, "rules"), amendmentsDir: () => join(home, "amendments"), referencesDir: () => join(home, "refs") };
-  const pi = { zod, registerTool: (value: ToolDefinition<unknown, Details>) => { tools[value.name] = value; }, appendEntry: () => {} } as unknown as ExtensionAPI;
+  const pi = { zod, registerTool: (value: ToolDefinition<unknown, Details>) => { tools[value.name] = value; },
+    appendEntry: (customType: string, data: SessionEntry["data"]) => { branch.push({ type: "custom", customType, data }); },
+    getAllTools: () => ["write", "bash"].map((name) => ({ name, sourceInfo: { source: "builtin", path: `<builtin:${name}>` } })),
+  } as unknown as ExtensionAPI;
   registerResolveTool(pi, files);
   registerReviewTool(pi, files, () => undefined);
   let branch: SessionEntry[] = [{ type: "custom_message", customType: OBSERVATION_MESSAGE_TYPE, content: "Observation pass." }];
@@ -111,7 +116,15 @@ function fixture() {
     branch = [...branch, toolCall(id, name, args),
       { type: "message", message: { role: "toolResult", toolCallId: id, toolName: name, content: "ok", isError: false, ...(details && { details }) } }];
   };
-  return { files, roots, run, add, approve, withdraw, compaction, saveTool, branch: () => branch };
+  const saveOwner = (toolCallId: string, toolName: string, input: Record<string, unknown>, details?: ToolResultDetails, run?: () => void) => {
+    const event = { toolCallId, toolName, input };
+    const authorization = projectToolAuthorization(event, roots.cwd, branch, 0);
+    expect(authorization).toBeTruthy();
+    recordHookCall(pi, event, authorization);
+    run?.();
+    recordHookResult(pi, { ...event, details, content: [], isError: false }, branch);
+  };
+  return { files, roots, run, add, approve, withdraw, compaction, saveTool, saveOwner, branch: () => branch };
 }
 
 async function publishDirectEdit(f: ReturnType<typeof fixture>) {
@@ -128,14 +141,17 @@ async function publishDirectEdit(f: ReturnType<typeof fixture>) {
   return { path, content, outcome: { kind: "local", skill, gist, outcome: "applied", approval, publication: { writeToolCallId: "edit-skill" } } };
 }
 
-function publishProjectEdit(f: ReturnType<typeof fixture>) {
+async function publishProjectEdit(f: ReturnType<typeof fixture>) {
   const target = { scope: "project", root: f.roots.cwd, path: "config.txt", mechanism: "configure build" } as const;
   const path = join(target.root, target.path);
   const content = "new config\n";
-  writeFileSync(path, content);
-  f.saveTool("write-config", "write", { path, content });
-  f.saveTool("check-config", "bash", { command: "cat config.txt", cwd: f.roots.cwd }, { exitCode: 0 });
-  return { path, outcome: { kind: "project", target, gist: "Update config", outcome: "applied",
+  const gist = "Update config";
+  const check = "grep -Fx 'new config' config.txt";
+  const [approval] = await f.approve([{ kind: "project", target, gist, priority: "evidence", remedy: gist,
+    change: { operation: "project-edit", text: content, check } }]);
+  f.saveOwner("write-config", "write", { path, content }, undefined, () => writeFileSync(path, content));
+  f.saveOwner("check-config", "bash", { command: check, cwd: f.roots.cwd }, { exitCode: 0 });
+  return { path, outcome: { kind: "project", target, gist, outcome: "applied", approval,
     publication: { writeToolCallId: "write-config", checkToolCallIds: ["check-config"], afterHash: createHash("sha256").update(content).digest("hex") } } };
 }
 const toolCall = (id: string, name: string, args: Record<string, unknown>): SessionEntry =>
@@ -224,7 +240,7 @@ it("rechecks affected decisions after replay without refusing independent answer
   }]);
   rmSync(hook);
   const direct = await publishDirectEdit(f);
-  const project = publishProjectEdit(f);
+  const project = await publishProjectEdit(f);
   const directFingerprint = proposalFingerprint(direct.outcome.skill, direct.outcome.gist);
   const scopedFingerprint = projectFingerprint(project.outcome.target);
   vi.stubEnv("PATH", "");
@@ -535,11 +551,7 @@ it.each(["corrupt", "locked", "writer locked"])("reports a verified external pub
   const f = fixture();
   const file = f.files.storeFile();
   const [approval] = await f.approve([{ kind: "upstream", skill: "tdd", gist: "first", priority: "evidence", remedy: "Fix", change: { operation: "on-read-append", section: "## first\nFix first." } }]);
-  const path = join(f.roots.cwd, "config.txt");
-  const bytes = "new config\n";
-  writeFileSync(path, bytes);
-  f.saveTool("write-config", "write", { path, content: bytes });
-  f.saveTool("check-config", "bash", { command: "cat config.txt", cwd: f.roots.cwd }, { exitCode: 0 });
+  const project = await publishProjectEdit(f);
   let lock: Database | undefined;
   if (fault === "corrupt") writeFileSync(file, "invalid database");
   else {
@@ -549,8 +561,7 @@ it.each(["corrupt", "locked", "writer locked"])("reports a verified external pub
   }
   try {
     const result = await f.run({ outcomes: [
-      { kind: "project", target: { scope: "project", root: f.roots.cwd, path: "config.txt", mechanism: "configure build" },
-        gist: "Update config", outcome: "applied", publication: { writeToolCallId: "write-config", checkToolCallIds: ["check-config"], afterHash: createHash("sha256").update(bytes).digest("hex") } },
+      project.outcome,
       { skill: "tdd", kind: "upstream", gist: "first", outcome: "applied", approval },
     ] });
     expect(result.isError).toBe(true);
@@ -565,7 +576,7 @@ it.each(["corrupt", "locked", "writer locked"])("reports a verified external pub
     } else {
       expect(text).toContain("Could not read the observer store");
     }
-    expect(readFileSync(path, "utf8")).toBe(bytes);
+    expect(readFileSync(project.path, "utf8")).toBe("new config\n");
     expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")).toBeUndefined();
   } finally {
     lock?.close();

@@ -506,7 +506,7 @@ describe("/observe", () => {
       priority: "evidence", gist: "Cover two half-cent lines in the existing invoice suite",
       remedy: "Run the existing check with this test: total rounding returns 5, but per-line rounding charges 6.",
       evidence: [{ quote: "The two-line discount preview quoted 5 cents, but checkout charged 6.", count: 1, source: "checkout-request" }],
-      change: { operation: "direct-edit", preview: `--- a/invoice.test.js\n+++ b/invoice.test.js\n@@ -3 +3,2 @@\n ${singleLine}\n+${regression}` },
+      change: { operation: "project-edit", text: `${tests}${regression}\n`, check: "bun run check" },
     }] });
     expect(prepared.isError).toBeFalsy();
     const selected = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
@@ -897,18 +897,20 @@ describe("observation publication receipt metadata", () => {
     const root = host.skillHome.roots.cwd;
     const file = join(root, "package.json");
     const content = '{"scripts":{"check":"node --check app.js"}}\n';
+    const target = { scope: "project", root, path: "package.json", mechanism: "Wire check" };
+    const gist = "Wire the existing check";
+    const command = "node --check app.js";
+    const { approval } = await approveCandidates(host, [{ kind: "project", target, gist, priority: "evidence", remedy: gist,
+      change: { operation: "project-edit", text: content, check: command } }]);
+    const writeArgs = { path: file, content };
+    const checkArgs = { command, cwd: root };
+    expect(await host.toolCall("write", writeArgs, "call_write|fc_opaque_write")).toBeUndefined();
     writeFileSync(file, content);
-    const branch = [
-      { type: "custom_message", customType: "skill-observer", content: "Observation pass" },
-      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "call_write|fc_opaque_write", name: "write", arguments: { path: file, content } }] } },
-      { type: "message", message: { role: "toolResult", toolName: "write", toolCallId: "call_write|fc_opaque_write", isError: false } },
-      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "call_bash|fc_opaque_check", name: "bash", arguments: { command: "node --check app.js", cwd: root } }] } },
-      { type: "message", message: { role: "toolResult", toolName: "bash", toolCallId: "call_bash|fc_opaque_check", isError: false, details: { timeoutSeconds: 30, wallTimeMs: 5 } } },
-    ];
-    host.setBranch(JSON.parse(JSON.stringify(branch)));
     const original = [{ type: "text", text: "[project/file#58EB]\nObserved tool output." }, { type: "image" }];
-    const write = await host.toolResult({ toolName: "write", toolCallId: "call_write|fc_opaque_write", content: original, isError: false });
-    const check = await host.toolResult({ toolName: "bash", toolCallId: "call_bash|fc_opaque_check", content: original, details: { timeoutSeconds: 30, wallTimeMs: 5 }, isError: false });
+    const write = await host.toolResult({ toolName: "write", toolCallId: "call_write|fc_opaque_write", input: writeArgs, content: original, isError: false });
+    expect(await host.toolCall("bash", checkArgs, "call_bash|fc_opaque_check")).toBeUndefined();
+    const check = await host.toolResult({ toolName: "bash", toolCallId: "call_bash|fc_opaque_check", input: checkArgs, content: original,
+      details: { timeoutSeconds: 30, wallTimeMs: 5 }, isError: false });
     const visibleId = (blocks: Array<{ type: string; text?: string }>) => {
       for (const block of blocks) {
         if (block.type !== "text" || !block.text) continue;
@@ -921,8 +923,7 @@ describe("observation publication receipt metadata", () => {
       return undefined;
     };
     const result = await host.callTool("observer_resolve", { outcomes: [{
-      kind: "project", target: { scope: "project", root, path: "package.json", mechanism: "Wire check" },
-      gist: "Wire the existing check", outcome: "applied",
+      kind: "project", target, gist, outcome: "applied", approval: approval(gist),
       publication: { writeToolCallId: visibleId(write.content), checkToolCallIds: [visibleId(check.content)], afterHash: createHash("sha256").update(content).digest("hex") },
     }] });
     expect(result.details).toMatchObject({ records: [{ kind: "project", outcome: "applied" }], failures: [] });
@@ -936,13 +937,16 @@ describe("observation publication receipt metadata", () => {
     const host = loadExtension();
     const root = host.skillHome.roots.cwd;
     const content = "{}\n";
-    writeFileSync(join(root, "package.json"), content);
-    host.setBranch([{ type: "custom_message", customType: "skill-observer", content: "Observation pass" }]);
+    const target = { scope: "project", root, path: "package.json", mechanism: "Parse written JSON" };
+    const gist = target.mechanism;
+    const { approval } = await approveCandidates(host, [{ kind: "project", target, gist, priority: "evidence", remedy: gist,
+      change: { operation: "project-edit", text: content, check: "node --check app.js" } }]);
     for (const [name, id, input, details] of [
-      ["write", "native-write", { path: "package.json", content }, {}],
+      ["write", "native-write", { path: join(root, "package.json"), content }, {}],
       ["bash", "native-check", { command: "node --check app.js", cwd: root }, { exitCode: 0 }],
     ] as const) {
-      await host.toolCall(name, input, id);
+      expect(await host.toolCall(name, input, id)).toBeUndefined();
+      if (name === "write") writeFileSync(input.path, content);
       host.setBranch([...host.getBranch(), { type: "message", message: { role: "assistant",
         content: [{ type: "toolCall", id, name, arguments: input }] } }]);
       await host.toolResult({ toolName: name, toolCallId: id, input, content: [], isError: false, details });
@@ -950,8 +954,7 @@ describe("observation publication receipt metadata", () => {
         toolCallId: id, isError: false, details } }]);
     }
     const result = await host.callTool("observer_resolve", { outcomes: [{
-      kind: "project", target: { scope: "project", root, path: "package.json", mechanism: "Parse written JSON" },
-      gist: "Parse written JSON", outcome: "applied",
+      kind: "project", target, gist, outcome: "applied", approval: approval(gist),
       publication: { writeToolCallId: "native-write", checkToolCallIds: ["native-check"], afterHash: createHash("sha256").update(content).digest("hex") },
     }] });
     expect(result.details).toMatchObject({ records: [{ kind: "project", outcome: "applied" }], failures: [] });
@@ -1191,13 +1194,13 @@ describe("observer_review selection", () => {
       candidate("One mechanism"),
       { ...candidate("One mechanism", "note"), evidence: [{ quote: "Another source", count: 2 }, { quote: "Evidence for One mechanism", count: 1 }] },
       { ...project, target: { ...project.target, root }, priority: "evidence", remedy: "Wire the existing check",
-        change: { operation: "direct-edit", preview: "Exact project diff" }, evidence: [{ quote: "Unwired", count: 1 }] },
+        change: { operation: "project-edit", text: "{}\n", check: "bun test" }, evidence: [{ quote: "Unwired", count: 1 }] },
     ] });
     expect(result.isError).toBeFalsy();
     expect(result.details).toMatchObject({
       eligible: [
         { proposal: { gist: "One mechanism", priority: "note", evidence: [{ quote: "Evidence for One mechanism", count: 1 }, { quote: "Another source", count: 2 }] } },
-        { proposal: { kind: "project", gist: "Wire check", change: { operation: "direct-edit" }, preview: "Exact project diff" } },
+        { proposal: { kind: "project", gist: "Wire check", change: { operation: "project-edit", text: "{}\n" } } },
       ],
       needsRanking: false,
       judgeStates: {},
@@ -1205,7 +1208,7 @@ describe("observer_review selection", () => {
     expect(JSON.stringify(result.details)).not.toContain("Declined mechanism");
     await host.callTool("observer_resolve", { outcomes: [{ ...project, target: { ...project.target, root }, outcome: "declined" }] });
     const suppressed = await host.callTool("observer_review", { action: "prepare", candidates: [
-      { ...project, target: { ...project.target, root }, priority: "evidence", remedy: "Wire check", change: { operation: "direct-edit", preview: "Exact diff" } },
+      { ...project, target: { ...project.target, root }, priority: "evidence", remedy: "Wire check", change: { operation: "project-edit", text: "{}\n", check: "bun test" } },
     ] });
     expect(suppressed.details).toMatchObject({ eligible: [], judgeStates: {}, needsRanking: false });
   });
@@ -1705,7 +1708,7 @@ describe("observer_review prepared proposals", () => {
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
       { ...onReadCandidate({ gist: "Test one behaviour per test.", section: ONE_BEHAVIOUR }), evidence },
       { ...onReadCandidate({ skill: "domain-modeling", gist: "Define terms first.", section: "## Terms\n\nDefine terms first." }), evidence },
-      { kind: "project", target, gist: "Wire the typecheck.", priority: "evidence", remedy, change: { operation: "direct-edit", preview: "Exact project diff" }, evidence },
+      { kind: "project", target, gist: "Wire the typecheck.", priority: "evidence", remedy, change: { operation: "project-edit", text: "{}\n", check: "bun run typecheck" }, evidence },
       { ...stale, change: { operation: "stale-update", rule: "grill-stale", body: "Rewritten." } },
       { ...stale, change: { operation: "stale-delete", rule: "grill-stale" } },
     ] });
@@ -1716,7 +1719,7 @@ describe("observer_review prepared proposals", () => {
       eligible: [
         { ...shown(scope), kind: "upstream", skill: "tdd", preview: scope?.proposal.preview, amendmentSections: ["Seams", "Red"] },
         { ...shown(terms), kind: "upstream", skill: "domain-modeling", preview: terms?.proposal.preview, amendmentSections: [] },
-        { ...shown(project), kind: "project", target: canonicalProjectTarget(root, target), preview: "Exact project diff" },
+        { ...shown(project), kind: "project", target: canonicalProjectTarget(root, target), preview: expect.stringContaining("bun run typecheck") },
         { ...shown(question), kind: "upstream", skill: "grill-with-docs", previews: question?.proposal.alternatives?.map(({ preview }) => preview) },
       ],
       needsRanking: false, judgeStates: {}, failures: [],
@@ -2552,6 +2555,167 @@ describe("observer_resolve", () => {
   });
 });
 
+describe("exact project publication", () => {
+  const regression = "import { expect, test } from 'bun:test';\nimport { total } from './invoice.js';\ntest('round the sum once', () => expect(total([5, 5])).toBe(5));\n";
+  const command = "bun --no-env-file test invoice.test.js";
+  const targetOf = (root: string) => ({ scope: "project", root, path: "invoice.test.js", mechanism: "Keep invoice rounding covered" });
+  const candidate = (root: string, text: string | null = regression) => ({
+    kind: "project", target: targetOf(root), gist: "Cover the 5-cent invoice", priority: "note",
+    remedy: "Check the amount from the witnessed half-cent rounding regression",
+    change: { operation: "project-edit", ...(text !== null && { text }), check: command },
+    evidence: [{ quote: "Checkout charged 6 cents rather than 5 cents.", count: 1 }],
+  });
+
+  async function postResult(host: ReturnType<typeof loadExtension>, toolName: string, toolCallId: string, input: ToolArguments, details?: unknown, isError = false) {
+    await host.toolResult({ toolName, toolCallId, input, content: [], details, isError });
+  }
+
+  it("only records a checked regression test written under the exact native Apply", async () => {
+    const host = loadExtension();
+    const root = host.skillHome.roots.cwd;
+    const draft = candidate(root);
+    const path = join(root, draft.target.path);
+    const input = { path, content: regression };
+    writeFileSync(join(root, "invoice.js"), "export const total = lines => Math.round(lines.reduce((a, b) => a + b, 0) / 2);\n");
+    const { approval } = await approveCandidates(host, [draft]);
+
+    expect(await host.toolCall("write", input, "approved-write")).toBeUndefined();
+    writeFileSync(path, regression);
+    await postResult(host, "write", "approved-write", input);
+
+    const check = { cwd: root, command };
+    expect(await host.toolCall("bash", check, "invoice-check")).toBeUndefined();
+    const run = spawnSync("bun", ["--no-env-file", "test", "invoice.test.js"], { cwd: root, encoding: "utf8" });
+    expect(run.stderr).toContain("1 pass");
+    expect(run.status).toBe(0);
+    await postResult(host, "bash", "invoice-check", check, { exitCode: run.status });
+
+    const outcome = { kind: "project", target: draft.target, gist: draft.gist, outcome: "applied",
+      publication: { writeToolCallId: "approved-write", checkToolCallIds: ["invoice-check"], afterHash: createHash("sha256").update(regression).digest("hex") } };
+    const missingApproval = await host.callTool("observer_resolve", { outcomes: [outcome] });
+    expect(missingApproval.isError).toBe(true);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+    const resolved = await host.callTool("observer_resolve", { outcomes: [{ ...outcome, approval: approval(draft.gist) }] });
+    expect(resolved.details).toMatchObject({ records: [{ kind: "project", target: draft.target, outcome: "applied" }], failures: [] });
+
+    const broken = join(root, "rounded-per-line");
+    mkdirSync(broken);
+    writeFileSync(join(broken, "invoice.js"), "export const total = lines => lines.reduce((sum, line) => sum + Math.round(line / 2), 0);\n");
+    writeFileSync(join(broken, draft.target.path), readFileSync(path));
+    const old = spawnSync("bun", ["--no-env-file", "test", "invoice.test.js"], { cwd: broken, encoding: "utf8" });
+    expect(old.status).toBe(1);
+    expect(old.stderr).toMatch(/Expected: 5\s+Received: 6/);
+  });
+
+  it.each(["missing Apply", "timed-out Ask", "free text", "altered form", "non-native Ask", "unselected", "superseded", "material note"] as const)(
+    "blocks the owner write for %s", async (failure) => {
+      const host = loadExtension();
+      const root = host.skillHome.roots.cwd;
+      const draft = candidate(root);
+      const { approval } = await approveCandidates(host, [draft], () => failure === "free text" ? "Other: Apply" :
+        failure === "material note" ? { option: "Apply", note: "Also edit invoice.js." } : "Apply");
+      const ref = approval(draft.gist);
+      const branch = host.getBranch();
+      const call = branch.find((entry) => entry.id === `call-${ref.askToolCallId}`)!;
+      const result = branch.find((entry) => entry.id === `result-${ref.askToolCallId}`)!;
+      if (failure === "missing Apply" || failure === "non-native Ask") {
+        host.setBranch(branch.filter((entry) => entry !== call && entry !== result));
+        if (failure === "non-native Ask") {
+          const block = (call.message!.content as Array<{ arguments: ToolArguments }>)[0]!;
+          await host.toolCall("ask", block.arguments, ref.askToolCallId, "eval");
+          await postResult(host, "ask", ref.askToolCallId, block.arguments, result.message!.details);
+        }
+      } else if (failure === "timed-out Ask") result.message!.details!.timedOut = true;
+      else if (failure === "altered form") (call.message!.content as Array<{ arguments: ToolArguments }>)[0]!.arguments.html += "\n";
+      else if (failure === "unselected") {
+        const select = branch.find((entry) => entry.message?.toolCallId === ref.selectionToolCallId);
+        host.setBranch(branch.filter((entry) => entry !== select));
+      } else if (failure === "superseded") {
+        await host.callTool("observer_review", { action: "prepare", candidates: [candidate(root, `${regression}// refreshed\n`)] });
+      }
+      const path = join(root, draft.target.path);
+      expect(await host.toolCall("write", { path, content: regression }, "refused")).toMatchObject({ block: true });
+      expect(existsSync(path)).toBe(false);
+      expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+    },
+  );
+
+  it.each(["changed bytes", "changed content", "different destination", "symlink leaf", "symlink parent", "extra destination"] as const)(
+    "blocks the exact write when given %s", async (failure) => {
+      const host = loadExtension();
+      const root = host.skillHome.roots.cwd;
+      const nested = join(root, "test");
+      mkdirSync(nested);
+      const draft = { ...candidate(root), target: { ...targetOf(root), path: "test/invoice.test.js" } };
+      const path = join(root, draft.target.path);
+      if (failure === "changed bytes") writeFileSync(path, "// original\n");
+      await approveCandidates(host, [draft]);
+      const outside = join(host.skillHome.home, "outside");
+      mkdirSync(outside);
+      if (failure === "symlink parent") { renameSync(nested, `${nested}-old`); symlinkSync(outside, nested); }
+      if (failure === "symlink leaf") {
+        writeFileSync(join(outside, "invoice.test.js"), "// not reviewed\n");
+        symlinkSync(join(outside, "invoice.test.js"), path);
+      }
+      if (failure === "changed bytes") writeFileSync(path, "// someone changed it\n");
+      const input = { path: failure === "different destination" ? join(root, "other.test.js") : path, content: failure === "changed content" ? "// substituted\n" : regression };
+      const patch = { input: `*** Begin Patch\n[${path}#1234]\nREM\n[${join(root, "other.test.js")}#5678]\nREM\n*** End Patch\n` };
+      const [tool, args] = failure === "extra destination" ? ["edit", patch] as const : ["write", input] as const;
+      expect(await host.toolCall(tool, args, "refused")).toMatchObject({ block: true });
+      expect(existsSync(join(root, "other.test.js"))).toBe(false);
+      if (failure === "changed bytes") expect(readFileSync(path, "utf8")).toBe("// someone changed it\n");
+      if (failure === "symlink leaf") expect(readFileSync(join(outside, "invoice.test.js"), "utf8")).toBe("// not reviewed\n");
+      else expect(existsSync(join(outside, "invoice.test.js"))).toBe(false);
+    },
+  );
+
+  it.each(["replace", "remove", "wrong check cwd", "extra check argument", "second check command", "newline", "failed check", "no owner receipt", "check before write", "expired Apply"] as const)(
+    "records only verified operations: %s", async (scenario) => {
+      const host = loadExtension();
+      const root = host.skillHome.roots.cwd;
+      const removals = scenario === "remove";
+      const draft = candidate(root, removals ? null : regression);
+      const path = join(root, draft.target.path);
+      if (removals || scenario === "replace") writeFileSync(path, "// stale test\n");
+      const { approval } = await approveCandidates(host, [draft], () => ({ option: "Apply", note: "Verify only" }));
+      const write = removals ? { input: `*** Begin Patch\n[${path}#1234]\nREM\n*** End Patch\n` } : { path, content: regression };
+      const writeTool = removals ? "edit" : "write";
+      const check = { command: scenario === "extra check argument" ? `${command} --help` :
+        scenario === "second check command" ? `${command}; true` : scenario === "newline" ? `${command}\ntrue` : command,
+        cwd: scenario === "wrong check cwd" ? host.skillHome.home : root, name: null };
+      const runCheck = async () => {
+        expect(await host.toolCall("bash", check, "check")).toBeUndefined();
+        await postResult(host, "bash", "check", check, { exitCode: scenario === "failed check" ? 1 : 0 }, scenario === "failed check");
+      };
+      if (scenario === "check before write") await runCheck();
+      if (scenario !== "no owner receipt") expect(await host.toolCall(writeTool, write, "write")).toBeUndefined();
+      if (removals) rmSync(path); else writeFileSync(path, regression);
+      if (scenario !== "no owner receipt") await postResult(host, writeTool, "write", write);
+      if (scenario !== "check before write") await runCheck();
+      if (scenario === "expired Apply") await host.commitPrompt("Review ended; new question.");
+      const afterHash = removals ? null : createHash("sha256").update(regression).digest("hex");
+      const result = await host.callTool("observer_resolve", { outcomes: [{
+        kind: "project", target: draft.target, gist: draft.gist, outcome: "applied", approval: approval(draft.gist),
+        publication: { writeToolCallId: "write", checkToolCallIds: ["check"], afterHash },
+      }] });
+      const accepted = scenario === "replace" || removals;
+      expect(ledgerRecords(host.ledgerFile).map(({ outcome }) => outcome)).toEqual(accepted ? ["applied"] : []);
+      expect(result.isError ?? false).toBe(!accepted);
+      if (scenario === "failed check") expect(resultText(result)).toContain("written but unverified");
+      if (removals) expect(existsSync(path)).toBe(false);
+    },
+  );
+
+  it.each(["true", "git status", "bun test --help", "bun test; true", "bun test\ntrue"])("does not offer Apply for %s", async (check) => {
+    const host = loadExtension();
+    const draft = candidate(host.skillHome.roots.cwd);
+    startPass(host);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...draft, change: { ...draft.change, check } }] });
+    expect(reviewEntries(prepared)).toEqual([]);
+    expect(resultText(prepared)).toContain("meaningful foreground check");
+  });
+});
+
 describe("project proposal decisions", () => {
   const projectAnswer = (root: string, path = "package.json", answer = "declined") => ({
     kind: "project", target: { scope: "project", root, path, mechanism: "Wire the existing typecheck." },
@@ -2640,7 +2804,7 @@ describe("project proposal decisions", () => {
     expect(existsSync(host.ledgerFile)).toBe(false);
   });
 
-  it("records an observed normal-tool project publication without making a skill rule", async () => {
+  it("requires fresh review for a legacy unpublished project receipt", async () => {
     const host = loadExtension();
     const root = host.skillHome.roots.cwd;
     const file = join(root, "package.json");
@@ -2657,86 +2821,40 @@ describe("project proposal decisions", () => {
       afterHash: createHash("sha256").update(content).digest("hex"),
     };
     const result = await host.callTool("observer_resolve", { outcomes: [{ ...projectAnswer(root, "package.json", "applied"), publication }] });
-    expect(result.isError).toBeFalsy();
-    expect(result.details).toMatchObject({ records: [{ kind: "project", outcome: "applied", publication }] });
-    expect(ledgerRecords(host.ledgerFile)[0]).not.toHaveProperty("skill");
-    expect(ledgerRecords(host.ledgerFile)[0]).not.toHaveProperty("rule");
-    expect(rulesWritten(host)).toEqual([]);
+    expect(result.isError).toBe(true);
+    expect(result.details).toMatchObject({ records: [] });
+    expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+    expect(resultText(result)).toContain("needs `approval`");
     expect(readFileSync(file, "utf8")).toBe(content);
   });
-
-  it("accepts a nullable service name on a completed foreground verification", async () => {
-    const host = loadExtension();
-    const root = host.skillHome.roots.cwd;
-    const content = "{}\n";
-    writeFileSync(join(root, "package.json"), content);
-    host.setBranch([
-      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "write", name: "write", arguments: { path: "package.json", content } }] } },
-      { type: "message", message: { role: "toolResult", toolName: "write", toolCallId: "write", isError: false } },
-      { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "check", name: "bash", arguments: { command: "node --check app.js", cwd: root, name: null, async: false } }] } },
-      { type: "message", message: { role: "toolResult", toolName: "bash", toolCallId: "check", isError: false, details: { exitCode: 0 } } },
-    ]);
-    const result = await host.callTool("observer_resolve", { outcomes: [{
-      ...projectAnswer(root, "package.json", "applied"),
-      publication: { writeToolCallId: "write", checkToolCallIds: ["check"], afterHash: createHash("sha256").update(content).digest("hex") },
-    }] });
-    expect(result.details).toMatchObject({ records: [{ outcome: "applied" }], failures: [] });
-  });
-
-  it.each(["safe sibling", "outside sibling", "symlink escape", "missing target", "outside sibling with target hint"] as const)(
-    "validates every multi-file edit path with %s", async (scenario) => {
-      const host = loadExtension();
-      const root = host.skillHome.roots.cwd;
-      const content = "{}\n";
-      writeFileSync(join(root, "package.json"), content);
-      writeFileSync(join(root, "other.json"), content);
-      const outside = join(host.skillHome.home, "outside.json");
-      writeFileSync(outside, content);
-      symlinkSync(outside, join(root, "escape.json"));
-      const sibling = scenario.startsWith("outside sibling") ? outside : scenario === "symlink escape" ? "escape.json" : join(root, "other.json");
-      const input = `*** Begin Patch\n[${scenario === "missing target" ? "other.json" : "package.json"}#1234]\nPUT 1.=1:\n+{}\n[${sibling}#5678]\nPUT 1.=1:\n+{}\n*** End Patch\n`;
-      host.setBranch([
-        { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "edit", name: "edit", arguments: {
-          input, ...(scenario === "outside sibling with target hint" && { path: "package.json" }),
-        } }] } },
-        { type: "message", message: { role: "toolResult", toolName: "edit", toolCallId: "edit", isError: false } },
-        { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "check", name: "bash", arguments: { command: "node --check app.js", cwd: root } }] } },
-        { type: "message", message: { role: "toolResult", toolName: "bash", toolCallId: "check", isError: false, details: { exitCode: 0 } } },
-      ]);
-      const result = await host.callTool("observer_resolve", { outcomes: ["package.json", "other.json"].map((path) => ({
-        ...projectAnswer(root, path, "applied"),
-        publication: { writeToolCallId: "edit", checkToolCallIds: ["check"], afterHash: createHash("sha256").update(content).digest("hex") },
-      })) });
-      const accepted = scenario === "safe sibling";
-      expect(result.isError ?? false).toBe(!accepted);
-      expect(ledgerRecords(host.ledgerFile).map((record) => record.kind === "project" ? record.target.path : undefined))
-        .toEqual(accepted ? ["package.json", "other.json"] : scenario === "missing target" ? ["other.json"] : []);
-    },
-  );
 
   it.each(["successful", "failed write", "failed check", "missing result", "check before write", "duplicate call", "named service", "replaced write", "replaced check"] as const)(
     "resolves nested eval receipts only with complete provenance: %s", async (scenario) => {
       const host = loadExtension();
       const root = host.skillHome.roots.cwd;
       const content = "{}\n";
-      writeFileSync(join(root, "package.json"), content);
-      host.setBranch([{ type: "custom_message", customType: "skill-observer", content: "Observation pass" }]);
+      const { target, gist } = projectAnswer(root);
+      const file = join(root, target.path);
+      const { approval } = await approveCandidates(host, [{ kind: "project", target, gist, priority: "evidence", remedy: gist,
+        change: { operation: "project-edit", text: content, check: "node --check app.js" } }]);
       const check = async () => {
         const input = { command: "node --check app.js", cwd: root, ...(scenario === "named service" && { name: "server" }) };
-        await host.toolCall("bash", input, "js-bash-check");
+        await host.toolCall("bash", input, "js-bash-check", "nested");
         await host.toolResult({ toolName: "bash", toolCallId: "js-bash-check",
           input: { ...input, cwd: scenario === "replaced check" ? host.skillHome.home : root },
           content: [], isError: scenario === "failed check", details: { exitCode: scenario === "failed check" ? 1 : 0 } });
       };
       if (scenario === "check before write") await check();
-      await host.toolCall("write", { path: "package.json", content }, "js-write-target");
-      if (scenario === "duplicate call") await host.toolCall("write", { path: "other.json", content }, "js-write-target");
+      const write = { path: file, content };
+      await host.toolCall("write", write, "js-write-target", "nested");
+      if (scenario === "duplicate call") await host.toolCall("write", write, "js-write-target", "nested");
+      writeFileSync(file, content);
       if (scenario !== "missing result") await host.toolResult({ toolName: "write", toolCallId: "js-write-target",
-        input: { path: scenario === "replaced write" ? "other.json" : "package.json", content },
+        input: { ...write, path: scenario === "replaced write" ? join(root, "other.json") : file },
         content: [], isError: scenario === "failed write" });
       if (scenario !== "check before write") await check();
       const result = await host.callTool("observer_resolve", { outcomes: [{
-        ...projectAnswer(root, "package.json", "applied"),
+        ...projectAnswer(root, "package.json", "applied"), approval: approval(gist),
         publication: { writeToolCallId: "js-write-target", checkToolCallIds: ["js-bash-check"], afterHash: createHash("sha256").update(content).digest("hex") },
       }] });
       expect(result.isError ?? false).toBe(scenario !== "successful");
@@ -2750,7 +2868,10 @@ describe("project proposal decisions", () => {
       const host = loadExtension();
       const root = host.skillHome.roots.cwd;
       const content = "{}\n";
-      writeFileSync(join(root, "package.json"), content);
+      const { target, gist } = projectAnswer(root);
+      const file = join(root, target.path);
+      const { approval } = await approveCandidates(host, [{ kind: "project", target, gist, priority: "evidence", remedy: gist,
+        change: { operation: "project-edit", text: content, check: "node --check app.js" } }]);
       const nativeCall = (id: string, name: string, args: Record<string, unknown>) =>
         ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } });
       const nativeResult = (id: string, name: string, isError: boolean, details?: Record<string, unknown>) =>
@@ -2761,7 +2882,10 @@ describe("project proposal decisions", () => {
       const persistedFirst = dispatched || scenario === "conflicting status persisted before the hooks";
       const native = dispatched ? { name: "write", input: { path: "xd://bash", content: JSON.stringify(input) } } : { name: "bash", input };
       const resultId = scenario === "mismatched result ID" ? "other-check" : "check";
-      host.setBranch([nativeCall("write", "write", { path: "package.json", content }), nativeResult("write", "write", false)]);
+      const write = { path: file, content };
+      await host.toolCall("write", write, "write");
+      writeFileSync(file, content);
+      await host.toolResult({ toolName: "write", toolCallId: "write", input: write, isError: false, content: [] });
       // A device dispatch is persisted natively before its inner hook; an ordinary call's hook precedes persistence, but capture must not depend on it.
       if (persistedFirst) host.setBranch([...host.getBranch(), nativeCall("check", native.name, native.input)]);
       await host.toolCall("bash", input, "check");
@@ -2776,41 +2900,13 @@ describe("project proposal decisions", () => {
       else branch.push(resultEntry);
       if (scenario === "duplicate native result") branch.push(resultEntry);
       host.setBranch(branch);
-      expect(host.getBranch().filter((entry) => entry.customType === "skill-observer-tool-call")).toHaveLength(1);
       const result = await host.callTool("observer_resolve", { outcomes: [{
-        ...projectAnswer(root, "package.json", "applied"),
+        ...projectAnswer(root, "package.json", "applied"), approval: approval(gist),
         publication: { writeToolCallId: "write", checkToolCallIds: ["check"], afterHash: createHash("sha256").update(content).digest("hex") },
       }] });
       const accepted = scenario === "matching native and hook";
       expect(result.isError ?? false).toBe(!accepted);
       expect(ledgerRecords(host.ledgerFile).map((record) => record.outcome)).toEqual(accepted ? ["applied"] : []);
-    },
-  );
-
-  it.each(["wrong write target", "wrong check project", "failed check", "check before write", "stale hash", "async check"] as const)(
-    "does not record applied with %s", async (failure) => {
-      const host = loadExtension();
-      const root = host.skillHome.roots.cwd;
-      const file = join(root, "package.json");
-      const content = "{}\n";
-      writeFileSync(file, content);
-      const writeEntries = [
-        { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "write", name: "write", arguments: { path: failure === "wrong write target" ? join(root, "other.json") : file, content } }] } },
-        { type: "message", message: { role: "toolResult", toolName: "write", toolCallId: "write", isError: false } },
-      ];
-      const checkEntries = [
-        { type: "message", message: { role: "assistant", content: [{ type: "toolCall", id: "check", name: "bash", arguments: { command: "bun run typecheck", cwd: failure === "wrong check project" ? host.skillHome.home : root, async: failure === "async check" } }] } },
-        { type: "message", message: { role: "toolResult", toolName: "bash", toolCallId: "check", isError: failure === "failed check", details: { exitCode: failure === "failed check" ? 1 : 0 } } },
-      ];
-      host.setBranch(JSON.parse(JSON.stringify(failure === "check before write" ? [...checkEntries, ...writeEntries] : [...writeEntries, ...checkEntries])));
-      const result = await host.callTool("observer_resolve", { outcomes: [{
-        ...projectAnswer(root, "package.json", "applied"),
-        publication: { writeToolCallId: "write", checkToolCallIds: ["check"], afterHash: failure === "stale hash" ? "0".repeat(64) : createHash("sha256").update(content).digest("hex") },
-      }] });
-      expect(result.isError).toBe(true);
-      expect(result.details).toMatchObject({ records: [] });
-      expect(existsSync(host.ledgerFile)).toBe(false);
-      expect(readFileSync(file, "utf8")).toBe(content);
     },
   );
 
@@ -6919,7 +7015,7 @@ describe("evidence-gated instructions", () => {
     await approveCandidates(host, [{
       kind: "project", target: { scope: "project", root, path: "package.json", mechanism: "Wire the typecheck." },
       gist: "Wire the typecheck.", priority: "evidence", remedy: "Run the existing script.",
-      change: { operation: "direct-edit", preview: "Wire typecheck in package.json." },
+      change: { operation: "project-edit", text: "{}", check: "bun run typecheck" },
     }]);
     await withoutGuidance("## 4. Apply", async () => {
       for (const parent of [undefined, "eval-wrapper"]) {
@@ -7258,7 +7354,7 @@ describe("migrated observer state", () => {
     for (const hidden of [seen.text, "Old condition.", declined.gist, "Foreign Later must stay hidden."]) expect(payload).not.toContain(hidden);
 
     const draft = (path: string) => ({ kind: "project", target: project(path), gist: `Repair ${path}.`, priority: "evidence",
-      remedy: "Run the fixture check.", change: { operation: "direct-edit", preview: "Wire the fixture check." } });
+      remedy: "Run the fixture check.", change: { operation: "project-edit", text: "{}\n", check: "bun test" } });
     const selection = await prepareAndSelect(host, [draft("checks.json"), draft("new.json")]);
     expect(reviewEntries(selection, "selected").map(({ proposal }) => proposal.gist)).toEqual(["Repair new.json."]);
     const withdrawn = await resolveApproved(host, { withdrawals: [{ fingerprint: applied.fingerprint, gist: applied.gist }] });
@@ -8222,7 +8318,7 @@ describe("observer_review inspect and grounded repairs", () => {
     startPass(host);
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
       { kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path: "AGENTS.md", mechanism: "navigation" }, gist: "Point at the check.",
-        priority: "evidence", remedy: "Add a pointer", change: { operation: "direct-edit", preview: "+ Run bun run check." } },
+        priority: "evidence", remedy: "Add a pointer", change: { operation: "project-edit", text: "Guidance.\nRun bun run check.\n", check: "grep -Fx 'Run bun run check.' AGENTS.md" } },
     ] });
     expect(failures(prepared)).toEqual([]);
     expect(reviewEntries(prepared).map(({ proposal }) => proposal)).toEqual([expect.not.objectContaining({ diagnosis: expect.anything() })]);
@@ -8923,7 +9019,7 @@ describe("approval compatibility under the evidence gate", () => {
     const prepared = await prepare(host, [
       withdrawalCandidate({ skill: "domain-modeling", fingerprint: fix!.fingerprint, gist: String(fix!.gist) }),
       { kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path: "AGENTS.md", mechanism: "navigation" }, gist: "Point at the check.",
-        priority: "evidence", remedy: "Add a pointer", change: { operation: "direct-edit", preview: "+ Run bun run check." } },
+        priority: "evidence", remedy: "Add a pointer", change: { operation: "project-edit", text: "Guidance.\nRun bun run check.\n", check: "grep -Fx 'Run bun run check.' AGENTS.md" } },
     ]);
     expect(failures(prepared)).toEqual([]);
     const selection = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
