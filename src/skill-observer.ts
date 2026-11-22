@@ -60,7 +60,6 @@ function isObservable(ctx: ExtensionContext): boolean {
 function activeSessionSource(session: ExtensionContext["sessionManager"], branch: readonly SessionEntry[]): PassEvidence["sessionSource"] {
   return {
     id: session.getSessionId(),
-    file: session.getSessionFile?.(),
     leaf: branch.at(-1)?.id,
     compaction: branch.findLast((entry) => entry.type === "compaction")?.id,
   };
@@ -105,6 +104,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
   const catalogGap = registerCatalogCapture(pi, isObservable);
   let pendingPassToolUpdate: Promise<void> | undefined;
   pi.on("tool_call", (event, ctx) => {
+    if (event.toolName === REVIEW_TOOL_NAME && event.input?.action === "source") return;
     try {
       const nativeAsk = event.toolName === "ask" && event.parentToolCallId === undefined;
       const ownerWrite = ["write", "edit", "manage_skill"].includes(event.toolName);
@@ -132,6 +132,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    if (event.toolName === REVIEW_TOOL_NAME && event.input?.action === "source") return;
     const isReceiptTool = ["write", "edit", "bash", "manage_skill", "ask", REVIEW_TOOL_NAME, CHECK_TOOL_NAME].includes(event.toolName);
     const branch = ctx.sessionManager.getBranch();
     recordHookResult(pi, event, branch);

@@ -520,7 +520,7 @@ function answerRef(ref: Partial<ProposalAnswerRef> | undefined): ProposalAnswerR
 }
 
 /** A message the user wrote: a prompt, or steering when `steering` is set; harness- and agent-written ones are not. */
-function isFromUser(message: AgentMessage | undefined): boolean {
+export function isFromUser(message: AgentMessage | undefined): boolean {
   return message?.role === "user" && !message.synthetic && message.attribution !== "agent";
 }
 

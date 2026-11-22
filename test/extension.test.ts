@@ -466,8 +466,161 @@ describe("/observe", () => {
     expect(content).toContain("`checkout-leaf`");
     expect(content).not.toContain("abandoned-leaf");
     expect(content).not.toContain("The existing single-line test passed");
-    if (saved) expect(content).toContain(`\`${sessionFile}\``);
-    else expect(content).toMatch(/saved session file unavailable/i);
+    expect(content).not.toContain(sessionFile);
+    expect(content).toContain('`action: "source"`');
+  });
+
+  it("recovers bounded pre-pass source from the active branch without a saved file", async () => {
+    const host = loadExtension({ validateToolArguments: true });
+    const older = Array.from({ length: 5 }, (_, i): SessionEntry => ({
+      type: "message", id: `older-${i}`, message: { role: "assistant", content: `Earlier reply ${i}.` },
+    }));
+    const call: SessionEntry = { type: "message", id: "checkout-call", message: {
+      role: "assistant", content: [
+        { type: "thinking", text: "private reasoning" },
+        { type: "toolCall", id: "checkout-read", name: "read", arguments: { path: "invoice.ts", extra: "x".repeat(5_000) } },
+      ],
+    } };
+    const synthetic: SessionEntry = { type: "message", id: "harness-prompt", message: { role: "user", synthetic: true, content: "Synthetic prompt." } };
+    const kept: SessionEntry = { type: "message", id: "kept-reply", message: { role: "assistant", content: "Reply kept in context." } };
+    const result: SessionEntry = { type: "message", id: "kept-result", message: {
+      role: "toolResult", toolName: "bash", toolCallId: "checkout-check", content: [
+        { type: "text", text: "Checkout check passed." },
+        { type: "text", text: '{"observerToolCallId":"checkout-check"}' },
+        { type: "text", text: "Observer procedure." },
+      ],
+    } };
+    const observer: SessionEntry = { type: "message", id: "old-review", message: {
+      role: "assistant", content: [
+        { type: "text", text: "Earlier approval procedure." },
+        { type: "toolCall", id: "old-review-call", name: "functions.observer_review", arguments: { action: "select" } },
+      ],
+    } };
+    const oldResult: SessionEntry = { type: "message", id: "old-result", message: {
+      role: "toolResult", toolName: "tool.observer_review", toolCallId: "old-review-call", content: "Past observer receipt.",
+    } };
+    const duplicate: SessionEntry = { type: "message", id: "duplicate", message: { role: "assistant", content: "Ambiguous text." } };
+    const compacted: SessionEntry = { type: "compaction", id: "compact", parentId: kept.id, firstKeptEntryId: kept.id };
+    const abandoned: SessionEntry = { type: "message", id: "abandoned-leaf", message: { role: "assistant", content: "Abandoned reply." } };
+    host.setBranch([...ordinaryWork, abandoned]);
+    host.setBranch([...older, ...ordinaryWork, call, synthetic, observer, oldResult, duplicate, kept, result, duplicate, compacted]);
+    await host.runCommand("observe");
+    await host.commitMessage(host.sent[0]!.message);
+
+    const source = async (params: { at?: string; cursor?: string } = {}) => {
+      const result = await host.callTool("observer_review", { action: "source", ...params });
+      return JSON.parse(result.content[0]!.text!);
+    };
+    expect(await source({ at: "checkout-reply" })).toEqual({ entries: [{
+      id: "checkout-reply", role: "assistant",
+      text: "Round the total, not each line. The existing single-line test passed with both calculations.",
+    }], gaps: [] });
+    expect(await source({ at: "kept-reply" })).toEqual({ entries: [{
+      id: "kept-reply", role: "assistant", text: "Reply kept in context.",
+    }], gaps: [] });
+    expect(await source({ at: "kept-result" })).toEqual({ entries: [{
+      id: "kept-result", role: "toolResult", text: "Checkout check passed.",
+    }], gaps: [] });
+    const first = await source();
+    expect(first.entries.map(({ id }: { id: string }) => id)).toEqual([
+      "checkout-call", "checkout-reply", "checkout-request", "older-4", "older-3", "older-2",
+    ]);
+    expect(first.entries[0]).toMatchObject({ role: "assistant", clipped: true });
+    expect(first.entries[0].text).toContain("read");
+    expect(first.entries[0].text).toContain("invoice.ts");
+    expect(first.entries[0].text).not.toContain("private reasoning");
+    expect(first.entries[0].text.length).toBeLessThanOrEqual(2_000);
+    expect(first.next).toBe("older-2");
+    expect(await source({ cursor: first.next })).toEqual({
+      entries: [
+        { id: "older-1", role: "assistant", text: "Earlier reply 1." },
+        { id: "older-0", role: "assistant", text: "Earlier reply 0." },
+      ], gaps: [],
+    });
+    const postPass = host.getBranch().at(-1)!.id!;
+    for (const params of [{ at: "abandoned-leaf" }, { at: "missing" }, { at: "harness-prompt" }, { at: "old-review" }, { at: "old-result" },
+      { at: "duplicate" }, { at: postPass }, { cursor: "abandoned-leaf" }, { at: "checkout-reply", cursor: first.next }]) {
+      expect(await source(params)).toEqual({ entries: [], gaps: [expect.any(String)] });
+    }
+
+    await host.commitPrompt("A new prompt");
+    const expired = await host.callTool("observer_review", { action: "source", at: "checkout-reply" });
+    expect(expired.isError).toBe(true);
+    expect(expired.content[0]?.text).not.toContain("Round the total");
+  });
+
+  it("recovers source from delivered native and nested tool-error occurrences without copying it into hook receipts", async () => {
+    const host = loadExtension({ validateToolArguments: true });
+    const incident = (text: string) => [{ type: "text", text: `${"leading part ".repeat(12)}${text}${" trailing part".repeat(25)}` }];
+    const nativeText = incident("Native failure details.");
+    const nestedText = incident("Nested failure details.");
+    const nativeResult: SessionEntry = { type: "message", id: "native-result", message: {
+      role: "toolResult", toolName: "functions.read", toolCallId: "native-check", content: nativeText, isError: true,
+    } };
+    const nestedResult: SessionEntry = { type: "custom", id: "nested-result", customType: "skill-observer-tool-result", data: {
+      toolName: "read", toolCallId: "nested-check", content: nestedText, isError: true,
+    } };
+    const steering: SessionEntry = { type: "message", id: "corrected", message: {
+      role: "user", steering: true, content: "Read the checked-in fixture instead.",
+    } };
+    host.setBranch([...ordinaryWork, { type: "message", id: "failed-calls", message: {
+      role: "assistant", content: [
+        { type: "toolCall", id: "native-check", name: "functions.read", arguments: { path: "native.txt" } },
+        { type: "toolCall", id: "eval-check", name: "eval", arguments: { code: 'await tool.read({path:"nested.txt"})' } },
+      ],
+    } }, nativeResult, { type: "custom", id: "nested-call", customType: "skill-observer-tool-call", data: {
+      toolName: "read", toolCallId: "nested-check", input: { path: "nested.txt" },
+    } }, nestedResult, steering]);
+    await host.runCommand("observe");
+    const payload = host.sent[0]!.message;
+    await host.commitMessage(payload);
+    const occurrences = [...String(payload.content).matchAll(/\[occurrences: ([^\]]*tool-result:[^\]]+)\]/g)].map((match) => match[1]);
+    expect(occurrences).toHaveLength(2);
+    expect(payload.content).not.toContain("failure details.");
+
+    const excerpts = [];
+    for (const at of occurrences) {
+      const input = { action: "source", at };
+      await host.toolCall("observer_review", input, "source-lookup");
+      const lookup = await host.callTool("observer_review", input);
+      await host.toolResult({ toolName: "observer_review", toolCallId: "source-lookup", input, content: lookup.content });
+      const result = JSON.parse(lookup.content[0]!.text!);
+      expect(result.gaps).toEqual([]);
+      excerpts.push(result.entries[0]);
+    }
+    expect(excerpts).toEqual([
+      { id: "tool-result:native-check", role: "toolResult", text: nativeText[0]!.text },
+      { id: "tool-result:nested-check", role: "toolResult", text: nestedText[0]!.text },
+    ]);
+    const correction = String(payload.content).match(/\[occurrences: ([^\]]*:steering:)\]/)?.[1];
+    expect(correction).toBeTruthy();
+    const source = await host.callTool("observer_review", { action: "source", at: correction });
+    expect(JSON.parse(source.content[0]!.text!)).toEqual({ gaps: [], entries: [{
+      id: "corrected", role: "user", text: "Read the checked-in fixture instead.",
+    }] });
+    expect(host.getBranch()).not.toContainEqual(expect.objectContaining({
+      type: "custom", data: expect.objectContaining({ toolCallId: "source-lookup" }),
+    }));
+  });
+
+  it("does not turn conflicting results or mismatched occurrence kinds into primary evidence", async () => {
+    const host = loadExtension();
+    const saved = (id: string, toolCallId: string, isError: boolean): SessionEntry => ({
+      type: "message", id, message: { role: "toolResult", toolName: "read", toolCallId, isError, content: id },
+    });
+    host.setBranch([...ordinaryWork, saved("failed-first", "conflict", true),
+      saved("failed-second", "conflict", true), saved("successful", "succeeded", false)]);
+    await host.runCommand("observe");
+    await host.commitMessage(host.sent[0]!.message);
+
+    for (const at of ["tool-result:conflict:tool-error:", "tool-result:succeeded:tool-error:", "checkout-reply:steering:"]) {
+      const source = await host.callTool("observer_review", { action: "source", at });
+      expect(JSON.parse(source.content[0]!.text!)).toEqual({ entries: [], gaps: [expect.any(String)] });
+    }
+    const source = await host.callTool("observer_review", { action: "source", at: "successful" });
+    expect(JSON.parse(source.content[0]!.text!)).toEqual({ entries: [{
+      id: "successful", role: "toolResult", text: "successful",
+    }], gaps: [] });
   });
 
   it("reviews an invoice regression-test draft from completed work without retro or a failing tool call", async () => {

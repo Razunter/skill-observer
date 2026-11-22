@@ -239,7 +239,7 @@ export function describePayloadEstimate({ total, bySection }: PayloadEstimate): 
 /** The evidence `/observe` gathered before it decided to start a pass. */
 export interface PassEvidence {
   note: string;
-  sessionSource: { id: string; file?: string; leaf?: string; compaction?: string };
+  sessionSource: { id: string; leaf?: string; compaction?: string };
   digest: SessionDigest;
   stale: readonly ObserverRule[];
   /** The project's pending observations. */
@@ -303,12 +303,11 @@ export function observationPayload(cwd: string, evidence: PassEvidence): Observa
   return { estimate: payloadEstimate(present), content: present.map(({ text }) => text).join("\n\n"), leads, retroUnavailable: retro?.available === false };
 }
 
-function renderSessionSource({ id, file, leaf, compaction }: PassEvidence["sessionSource"]): string {
+function renderSessionSource({ id, leaf, compaction }: PassEvidence["sessionSource"]): string {
   return [
     `Active session: \`${id}\`.`,
     leaf && `Active branch leaf: \`${leaf}\`.`,
     compaction && `Latest branch compaction: \`${compaction}\`.`,
-    file ? `Saved session file: \`${file}\`.` : "Saved session file unavailable from the host.",
   ].filter(Boolean).join(" ");
 }
 

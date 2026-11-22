@@ -380,7 +380,7 @@ function isUserPrompt(message: AgentMessage): boolean {
 /** The `customType` of the message `/observe` sends to start an observation pass. */
 export const OBSERVATION_MESSAGE_TYPE = "skill-observer";
 
-const OBSERVER_BOOKKEEPING_TOOLS: Record<string, true> = { observe: true, observer_review: true, observer_check: true, observer_resolve: true };
+export const OBSERVER_BOOKKEEPING_TOOLS: Record<string, true> = { observe: true, observer_review: true, observer_check: true, observer_resolve: true };
 
 export function buildDigest(
   entries: readonly SessionEntry[],

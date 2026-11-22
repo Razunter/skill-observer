@@ -257,8 +257,28 @@ function isPureToolCommandRun(outer: ToolResultEvidence, command: unknown, byId:
   });
 }
 
+/** Source lookup does not use the digest's first-result display policy. */
+export function findBranchToolResult(branch: readonly SessionEntry[], end: number, id: string): ToolResultEvidence | undefined {
+  let native: ToolResultEvidence | undefined;
+  let hook: ToolResultEvidence | undefined;
+  for (let position = 0; position < end; position++) {
+    const entry = branch[position]!;
+    const result = resultIn(entry, position, id);
+    if (!result) continue;
+    if (result.origin === "native") {
+      if (native || entry.message?.synthetic) return;
+      native = result;
+    } else {
+      if (hook) return;
+      hook = result;
+    }
+  }
+  if (native && hook && (digestName(native.name) !== digestName(hook.name) || !!native.isError !== !!hook.isError)) return;
+  return native ?? hook;
+}
+
 /** Hosts can prefix a tool name with its namespace, as in `functions.read`. */
-function digestName(name: string | undefined): string {
+export function digestName(name: string | undefined): string {
   return (name ?? "unknown").replace(/^(?:functions|tool)\./, "");
 }
 
@@ -281,15 +301,16 @@ function callsIn(entry: SessionEntry, position: number): ToolCallEvidence[] {
     ...(bound !== undefined && { authorization: bound }) }];
 }
 
-function resultIn(entry: SessionEntry, position: number): ToolResultEvidence | undefined {
+function resultIn(entry: SessionEntry, position: number, id?: string): ToolResultEvidence | undefined {
   const message = entry.message;
-  if (message?.role === "toolResult" && typeof message.toolCallId === "string") {
+  if (message?.role === "toolResult" && typeof message.toolCallId === "string" && (id === undefined || message.toolCallId === id)) {
     return { origin: "native", position, id: message.toolCallId, name: message.toolName,
       isError: message.isError, content: message.content, details: message.details };
   }
   const data = entry.data;
   if (entry.type !== "custom" || entry.customType !== HOOK_RESULT_TYPE || !data || typeof data !== "object" ||
-      !("toolCallId" in data) || typeof data.toolCallId !== "string" || !("toolName" in data) || typeof data.toolName !== "string" ||
+      !("toolCallId" in data) || typeof data.toolCallId !== "string" || (id !== undefined && data.toolCallId !== id) ||
+      !("toolName" in data) || typeof data.toolName !== "string" ||
       !("isError" in data) || typeof data.isError !== "boolean") return undefined;
   return { origin: "hook", position, id: data.toolCallId, name: data.toolName, isError: data.isError,
     content: "content" in data ? data.content as AgentMessage["content"] : undefined,

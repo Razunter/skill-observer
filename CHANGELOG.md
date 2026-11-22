@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-11-22
 
 ### Added
 
@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- `/observe` retrieves clipped or compacted evidence on demand from the active branch. The lookup omits sibling entries and reports when it cannot recover a source.
 - The session digest shows only the inner tools when the records show that `bash` did no other work. It still shows mixed shell work. Approval receipts are unchanged.
 - `/observe` summaries use terminal-safe Markdown, with required occurrence IDs visible in lists instead of raw disclosure tags.
 - Remedy outcomes ignore marked redacted quotes when matching exact tool exercises. An independent delivery receipt or a separate exact quote can still establish an outcome.

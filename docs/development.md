@@ -4,7 +4,9 @@ For installation, see [Setup](setup.md). For the user-facing observation pass an
 
 ## Staged observation pass
 
-The main agent starts a pass only when the user runs `/observe` in an interactive session. A truly empty branch returns before starting a model turn. A completed response to real work can start discovery even without a tool failure or loaded skill. Use the digest as an index. Recover decisive clipped or compacted evidence from the active branch's saved session and entry locators. A User note, observation or earlier `retro` suggestion can point to primary evidence. If you cannot recover that evidence, report the gap instead of treating the lead as verified. Optional `retro` categories do not control eligibility.
+The main agent starts a pass only when the user runs `/observe` in an interactive session. A truly empty branch returns before starting a model turn. A completed response to real work can start discovery without a tool failure or loaded skill. A User note, observation, or earlier `retro` suggestion can point to primary evidence. Optional `retro` categories do not control eligibility.
+
+Use `observer_review` with `action: "source"` to recover decisive clipped or compacted evidence from before the current pass. Use `at` with one exact entry ID or a digest tool-error or steering occurrence ID. Without `at` or `cursor`, paging starts before the latest compaction's first kept entry when known, or before the pass otherwise. Pass the result's `next` as `cursor` to continue toward older entries. The lookup reads OMP's active ancestry, not the session file, marks clipped excerpts, and reports unavailable sources. It does not expose sibling entries or authorize action.
 
 The initial message contains discovery instructions and evidence. It keeps current rule identities, amendment headings, firings, remedy outcomes and maintenance cues visible. `observer_review` `action: "evidence"` retrieves historical details by `key.skill`, `key.rule` or `key.fingerprint`. Prefer a direct read. Use a read-only scout only when a bounded lookup in named or narrowly scoped same-project sessions would cost materially more to do directly. The main agent validates the excerpts. Neither the transcript nor a scout can authorize scope.
 
@@ -245,7 +247,7 @@ It writes `observer/<section>-<gate|core>-<n>.md`, one file per fragment, where 
 bun pm pack
 ```
 
-Run this from the source checkout's extension root. It creates `skill-observer-0.3.0.tgz` using the `files` allowlist in `package.json`: runtime source, the hook check script, `observer.md` and its generated `observer/` fragments, reader documentation, the licence and third-party notices, the README, and changelog. It excludes tests, development configuration, and installed dependencies. Packing creates a local archive for distribution checks; it does not publish the package. Normal setup uses `omp install` with the repository URL.
+Run this from the source checkout's extension root. It creates `skill-observer-0.4.0.tgz` using the `files` allowlist in `package.json`: runtime source, the hook check script, `observer.md` and its generated `observer/` fragments, reader documentation, the licence and third-party notices, the README, and changelog. It excludes tests, development configuration, and installed dependencies. Packing creates a local archive for distribution checks; it does not publish the package. Normal setup uses `omp install` with the repository URL.
 
 ### Modules
 

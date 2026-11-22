@@ -42,6 +42,7 @@ import type { ObserverFiles } from "./resolve.js";
 import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 import { readObserverStore } from "./observer-store.js";
 import { type EvidenceKey, lookupRuleEvidence } from "./rule-evidence.js";
+import { lookupBranchSource } from "./branch-source.js";
 
 export const REVIEW_TOOL_NAME = "observer_review";
 const PRIORITIES = ["stale", "note", "evidence", "compaction"] as const;
@@ -173,7 +174,7 @@ export interface PreparedEntry { reference: PreparedProposalRef; proposal: Prepa
 
 interface Ranking { id: string; score: number; confidence: number; consistent: boolean }
 interface ReviewParams {
-  action: "draft" | "inspect" | "catalog" | "evidence" | "prepare" | "select" | "record";
+  action: "draft" | "inspect" | "catalog" | "evidence" | "source" | "prepare" | "select" | "record";
   key?: EvidenceKey;
   skill?: string;
   references?: string[];
@@ -376,9 +377,9 @@ export function registerReviewTool(
   };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
-    description: "Observation pass: read procedure, skill guidance, catalog or evidence; prepare eligible proposals, explain rejections and select the Ask form. No writes or model calls.",
+    description: "Observation pass: read procedure, skill guidance, catalog, primary branch source or rule evidence; prepare eligible proposals, explain rejections and select the Ask form. No writes or model calls.",
     parameters: z.object({
-      action: z.enum(["draft", "inspect", "catalog", "evidence", "prepare", "select", "record"]),
+      action: z.enum(["draft", "inspect", "catalog", "evidence", "source", "prepare", "select", "record"]),
       key: z.object({ skill: z.string().optional(), rule: z.string().optional(), fingerprint: z.string().optional() }).optional()
         .describe("Evidence: one exact skill name, rule name or proposal fingerprint."),
       skill: z.string().optional().describe("Inspect only: the installed skill whose current guidance to read; with `terms`, the name of the proposed new skill. Catalog: the exact skill name to look up, instead of `terms`."),
@@ -386,9 +387,9 @@ export function registerReviewTool(
         .describe("Inspect only: file names in the skill's observer reference folder to read too; the others are only listed by fingerprint and are not inspected."),
       terms: z.array(z.string()).optional()
         .describe("Inspect, for a proposed new skill: the words of its workflow to look for, case-insensitively, in every current skill's name and description. Catalog, instead of `skill`: words that must all appear, case-insensitively and literally, in an observed skill's rendered description; names are not searched."),
-      at: z.string().optional().describe("Catalog only: the exact ID of an entry on the active branch; the lookup returns the latest observation at or before it, with the skill notices, compactions and resets up to it and the known gaps in between."),
+      at: z.string().optional().describe("Source: one exact pre-pass entry ID or tool-error or steering occurrence ID, without `cursor`. Catalog: the exact active branch entry ID at or before which to find the latest catalog observation."),
       limit: z.number().optional().describe("Catalog only: the page size, a whole number of at least 1; 20 when omitted."),
-      cursor: z.string().optional().describe("Catalog or Evidence: the previous page's `next` for the same lookup."),
+      cursor: z.string().optional().describe("Source: start before this exact pre-pass entry ID, without `at`. Catalog or Evidence: the previous page's `next` for the same lookup."),
       // Leave malformed siblings for Prepare to reject by index without hiding the draft shapes from the model.
       candidates: z.array(z.union([candidate, z.unknown()])).optional()
         .describe("Prepare only: exact candidate changes. Project and profile identity includes target and mechanism."),
@@ -399,6 +400,14 @@ export function registerReviewTool(
     }),
     async execute(toolCallId, params, signal, _update, ctx) {
       signal?.throwIfAborted();
+      if (params?.action === "source") {
+        const branch = ctx.sessionManager.getBranch();
+        const passStart = ctx.hasUI && ctx.agent?.kind === "main" ? observationPassStart(branch) : undefined;
+        const source = passStart === undefined
+          ? { entries: [], gaps: ["Only the main agent in a current observation pass can retrieve branch source."] }
+          : lookupBranchSource(branch, passStart, params);
+        return { content: [{ type: "text", text: JSON.stringify(source) }], details: emptyDetails(), isError: passStart === undefined };
+      }
       if (params?.action === "inspect" || params?.action === "catalog" || params?.action === "evidence") {
         return readOnlyActionResult(params, files, ctx, catalogGap);
       }
@@ -457,7 +466,7 @@ export function registerReviewTool(
                 return true;
               }));
         } else {
-          throw new Error("review needs draft/inspect/catalog/evidence/prepare/select/record");
+          throw new Error("review needs draft/inspect/catalog/evidence/source/prepare/select/record");
         }
         const classCounts: Record<Priority, number> = { stale: 0, note: 0, evidence: 0, compaction: 0 };
         for (const { proposal } of details.eligible) classCounts[proposal.priority]++;
