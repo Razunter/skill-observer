@@ -19,11 +19,11 @@ import {
   type RuleDirs, rulePath, sectionHeadings, skillAmendment, skillAmendmentName,
 } from "./amendments.js";
 import {
-  canonicalHarnessTarget, canonicalMissingPath, canonicalProfileTarget, canonicalProjectTarget, type Evidence, type HarnessFile, harnessFingerprint, hookFileKey, hookPath,
+  canonicalHarnessTarget, canonicalInstalledCopyTarget, canonicalMissingPath, canonicalProfileTarget, canonicalProjectTarget, type Evidence, type HarnessFile, harnessFingerprint, hookFileKey, hookPath,
   ledgerDecisionInProject, type LedgerRecord, projectFingerprint, PROPOSAL_KINDS, HARNESS_ROOTS, type HarnessTarget, type ProposalKind, removalFingerprint,
   normaliseText, type ProjectTarget, profileFingerprint, proposalFingerprint, readLedgerDecision, requireCheckedExecutableTarget, targetLabel, type TargetScope,
 } from "./ledger.js";
-import type { ExtensionAPI, ExtensionContext, SchemaBuilder, SessionEntry } from "./omp.js";
+import type { ExtensionAPI, ExtensionContext, Schema, SchemaBuilder, SessionEntry } from "./omp.js";
 import { type CatalogLookup, type CatalogSkill, lookupCatalog, parseSkillsBlock } from "./catalog.js";
 import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, checkReconciliation, checkTarget, isReconcilable, observationPassStart, preparedInPass, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
@@ -181,7 +181,7 @@ interface ReviewParams {
   at?: string;
   limit?: number;
   cursor?: string;
-  candidates?: ReviewCandidate[];
+  candidates?: unknown[];
   proposals?: PreparedProposalRef[];
   rankings?: Ranking[];
   rankingFailure?: string;
@@ -266,40 +266,43 @@ export function registerReviewTool(
     text: z.string().optional().describe("Complete result; omit to remove an existing file."),
     check: z.string().describe("Exact foreground check after writing, in the target root."),
   };
-  const change = z.union([
-    z.object({ operation: z.enum(["direct-edit"]), preview: z.string().describe("Exact skill edit or new skill.") }),
-    z.object({ operation: z.enum(["project-edit"]), ...projectEdit }),
-    z.object({ operation: z.enum(["project-edits"]), edits: z.array(z.object({ target: projectTarget, ...projectEdit })) })
-      .describe("One fix across named checkouts; omit outer `target`."),
-    z.object({ operation: z.enum(["profile-edit"]), text: z.string().describe("Complete replacement text."), check: z.union([
-      z.object({ kind: z.enum(["content"]), contains: z.string().describe("Decisive passage present after the edit."), excludes: z.string().optional(),
-        installedCopy: z.object({ skill: z.string(), why: z.string().describe("Why controls, amendment and owned source do not fit.") }).optional() }),
-      z.object({ kind: z.enum(["pattern"]), replayToolCallId: z.string().describe("Passing observer_check on the exact ruleText.") }),
-      z.object({ kind: z.enum(["skill-control"]), skill: z.string(), mode: z.enum(["manual-only", "disable"]) }),
-    ]) }),
-    z.object({ operation: z.enum(["on-read-append"]), section: z.string().describe("Append one `## ` heading and its text.") }),
-    z.object({ operation: z.enum(["rule"]), name: z.string(), body: z.string(), pattern: z.string(), ...sampleSchemas(z) })
+  const profileChecks = {
+    content: z.object({ kind: z.enum(["content"]), contains: z.string().describe("Decisive passage present after the edit."), excludes: z.string().optional(),
+      installedCopy: z.object({ skill: z.string(), why: z.string().describe("Why controls, amendment and owned source do not fit.") }).optional() }),
+    pattern: z.object({ kind: z.enum(["pattern"]), replayToolCallId: z.string().describe("Passing observer_check on the exact ruleText.") }),
+    "skill-control": z.object({ kind: z.enum(["skill-control"]), skill: z.string(), mode: z.enum(["manual-only", "disable"]) }),
+  };
+  const profileEdit = { operation: z.enum(["profile-edit"]), text: z.string().describe("Complete replacement text.") };
+  const changes = {
+    "direct-edit": z.object({ operation: z.enum(["direct-edit"]), preview: z.string().describe("Exact skill edit or new skill.") }),
+    "project-edit": z.object({ operation: z.enum(["project-edit"]), ...projectEdit }),
+    "project-edits": z.object({ operation: z.enum(["project-edits"]), edits: z.array(z.object({ target: projectTarget, ...projectEdit })) })
+      .describe("One fix across named destinations in one or more reviewed checkouts; omit outer `target`."),
+    "profile-edit": z.object({ ...profileEdit, check: z.union([profileChecks.content, profileChecks.pattern, profileChecks["skill-control"]]) }),
+    "on-read-append": z.object({ operation: z.enum(["on-read-append"]), section: z.string().describe("Append one `## ` heading and its text.") }),
+    rule: z.object({ operation: z.enum(["rule"]), name: z.string(), body: z.string(), pattern: z.string(), ...sampleSchemas(z) })
       .describe("A pattern amendment (upstream/plugin) or barrier rule (local/managed), as checked by observer_check."),
-    z.object({ operation: z.enum(["stale-update"]), rule: z.string(), body: z.string(), references: referenceFiles.optional() }),
-    z.object({ operation: z.enum(["stale-delete"]), rule: z.string() }),
-    z.object({ operation: z.enum(["withdrawal"]), body: z.string().optional(), references: referenceFiles.optional() })
+    "stale-update": z.object({ operation: z.enum(["stale-update"]), rule: z.string(), body: z.string(), references: referenceFiles.optional() }),
+    "stale-delete": z.object({ operation: z.enum(["stale-delete"]), rule: z.string() }),
+    withdrawal: z.object({ operation: z.enum(["withdrawal"]), body: z.string().optional(), references: referenceFiles.optional() })
       .describe("Withdraw the applied fix named by `fingerprint`; for an on-read fix, give the full remaining `body` (empty deletes)."),
-    z.object({ operation: z.enum(["compaction"]), includes: z.array(z.string()), body: z.string(), references: referenceFiles })
+    compaction: z.object({ operation: z.enum(["compaction"]), includes: z.array(z.string()), body: z.string(), references: referenceFiles })
       .describe("`includes`: covered on-read appends from this Prepare, by gist or fingerprint. `references`: complete set."),
-    z.object({
+    harness: z.object({
       operation: z.enum(["harness"]), stage: z.enum(["checked"]),
       files: z.array(z.object({ path: z.string(), text: z.string().optional() }))
         .describe("All exact files, relative to executable root; omit `text` only for removal."),
       checkToolCallId: z.string().describe("Same-pass successful foreground Bash check of these exact changes in scratch."),
       lowerRungs: z.string().describe("Why a simpler remedy cannot fix this mechanism."),
     }).describe("Checked executable code. One exact native Apply authorizes publication, not activation."),
-  ]);
+  } satisfies Record<(typeof OPERATIONS)[number], Schema>;
   const formatting = " Inline `code`; at most two **bold** phrases.";
   const draft = {
     gist: z.string().describe("One sentence starting with what changes. Inline `code` renders."),
     priority: z.enum(PRIORITIES),
     remedy: z.string().describe(`How this fixes the finding and how to verify it.${formatting}`),
-    change,
+    change: z.union([changes["direct-edit"], changes["project-edit"], changes["project-edits"], changes["profile-edit"],
+      changes["on-read-append"], changes.rule, changes["stale-update"], changes["stale-delete"], changes.withdrawal, changes.compaction, changes.harness]),
     evidence: z.array(z.object({ quote: z.string(), count: z.number(), source: z.string().optional(), occurrenceIds: z.array(z.string()).optional() })).optional(),
     fingerprint: z.string().optional(),
     reconciles: z.object({
@@ -319,6 +322,55 @@ export function registerReviewTool(
       })).optional().describe("Required for repairs, omitted for new skills. Ground the explanation with `lines`, `section` or both per source."),
     }).optional().describe("Required for new skills, local/managed direct edits, on-read appends and rules. Omit for project/harness remedies, stale answers, withdrawals and compactions."),
   };
+  const skill = { kind: z.enum(PROPOSAL_KINDS), skill: z.string() };
+  const scopes = {
+    project: { kind: z.enum(["project"]), target: projectTarget.optional() },
+    profile: { kind: z.enum(["profile"]), target: z.object({
+      scope: z.enum(["profile"]), root: z.string().describe("Active OMP agent directory."),
+      path: z.string().describe("Profile-relative path; exact inspected absolute SKILL.md only for an explicitly chosen installed copy."),
+      mechanism: z.string(),
+    }) },
+    harness: { kind: z.enum(["harness"]), target: z.object({
+      scope: z.enum(["harness"]), root: z.enum(HARNESS_ROOTS),
+      path: z.string().optional().describe("An existing hook file, relative to its hooks directory; omit for a new hook, which is named by its fingerprint, and for the companion."),
+      source: z.string().optional().describe("For an owned extension: its canonical absolute source directory."),
+      checkout: z.string().optional().describe("Canonical checkout owning the extension source, if outside the current project."),
+      mechanism: z.string(),
+    }) },
+  };
+  const candidateKind = z.enum([...PROPOSAL_KINDS, "project", "profile", "harness"]);
+  const candidate = z.object({
+    ...draft,
+    kind: candidateKind,
+    skill: z.string().optional().describe("Required for skill proposals only."),
+    target: z.union([projectTarget, scopes.profile.target, scopes.harness.target]).optional()
+      .describe("Required for project, profile and harness proposals. Omit for `project-edits` and skill proposals."),
+  });
+  const parseCandidate = (raw: unknown): ReviewCandidate | string => {
+    const kind = inputField(raw, "kind");
+    const rawChange = inputField(raw, "change");
+    const operation = inputField(rawChange, "operation");
+    if (kind === "harness" && operation === "harness" && inputField(rawChange, "stage") === "intent") {
+      return "Report item. Next action: specify the exact executable file changes and cite the observed scratch check; legacy approvals are not valid.";
+    }
+
+    // Validate by kind, operation and profile check type so errors do not list fields from other draft variants.
+    const scope: Record<string, Schema> = schemaVariant(scopes, kind) ?? (PROPOSAL_KINDS.some((value) => value === kind) ? skill
+      : { kind: candidateKind });
+    const change = operation === "profile-edit"
+      ? z.object({ ...profileEdit, check: schemaVariant(profileChecks, inputField(inputField(rawChange, "check"), "kind"))
+        ?? z.object({ kind: z.enum(["content", "pattern", "skill-control"]) }) })
+      : schemaVariant(changes, operation) ?? z.object({ operation: z.enum(OPERATIONS) });
+    const exact = z.object({ ...draft, ...scope, change }).safeParse(raw);
+    if (exact.success) return exact.data as ReviewCandidate;
+    const paths = exact.error.issues.map(({ path }) => path.map(String).join(".")).filter(Boolean);
+    if (paths.length === 0) return "malformed candidate: supply a proposal object with a complete change";
+    const fields = [...new Set(paths)].map((path) => `\`${path}\``).join(", ");
+    if (kind === "profile" && paths.some((path) => path === "change.check" || path.startsWith("change.check."))) {
+      return `Report item. Next action: prepare the exact profile replacement and a check for that destination. Correct ${fields}.`;
+    }
+    return `malformed candidate: check ${fields}`;
+  };
   pi.registerTool<ReviewParams, ReviewDetails>({
     name: REVIEW_TOOL_NAME, label: "Observer Review", approval: "read", loadMode: "essential", defaultInactive: true,
     description: "Observation pass: read procedure, skill guidance, catalog or evidence; prepare eligible proposals, explain rejections and select the Ask form. No writes or model calls.",
@@ -334,20 +386,9 @@ export function registerReviewTool(
       at: z.string().optional().describe("Catalog only: the exact ID of an entry on the active branch; the lookup returns the latest observation at or before it, with the skill notices, compactions and resets up to it and the known gaps in between."),
       limit: z.number().optional().describe("Catalog only: the page size, a whole number of at least 1; 20 when omitted."),
       cursor: z.string().optional().describe("Catalog or Evidence: the previous page's `next` for the same lookup."),
-      candidates: z.array(z.union([
-        z.object({ ...draft, kind: z.enum(PROPOSAL_KINDS), skill: z.string() }),
-        z.object({ ...draft, kind: z.enum(["project"]), target: projectTarget.optional() }),
-        z.object({ ...draft, kind: z.enum(["profile"]), target: z.object({
-          scope: z.enum(["profile"]), root: z.string().describe("Active OMP agent directory."), path: z.string(), mechanism: z.string(),
-        }) }),
-        z.object({ ...draft, kind: z.enum(["harness"]), target: z.object({
-          scope: z.enum(["harness"]), root: z.enum(HARNESS_ROOTS),
-          path: z.string().optional().describe("An existing hook file, relative to its hooks directory; omit for a new hook, which is named by its fingerprint, and for the companion."),
-          source: z.string().optional().describe("For an owned extension: its canonical absolute source directory."),
-          checkout: z.string().optional().describe("Canonical checkout owning the extension source, if outside the current project."),
-          mechanism: z.string(),
-        }) }),
-      ])).optional().describe("Prepare only: exact candidate changes. Project and profile identity includes target and mechanism."),
+      // Leave malformed siblings for Prepare to reject by index without hiding the draft shapes from the model.
+      candidates: z.array(z.union([candidate, z.unknown()])).optional()
+        .describe("Prepare only: exact candidate changes. Project and profile identity includes target and mechanism."),
       proposals: z.array(proposalRefSchema(z)).optional()
         .describe("Select only: the `reference` of each eligible proposal, exactly as Prepare returned it."),
       rankings: z.array(z.object({ id: z.string(), score: z.number(), confidence: z.number(), consistent: z.unknown().describe("Boolean: true only after inspecting agreement with cited evidence.") })).optional().describe("Select only: each compared candidateId exactly once, score 0..3 and confidence 0..1 from host judge, with consistent as a boolean after inspecting evidence agreement. Do not rank singleton classes."),
@@ -387,7 +428,7 @@ export function registerReviewTool(
           }
           const ownerTools = new Set(pi.getAllTools().filter(({ sourceInfo }) => sourceInfo?.source === "builtin").map(({ name }) => name));
           const prepared = withReviewDecisions(files.storeFile(), ctx.cwd, (decisions) =>
-            prepareProposals(candidates, { ...guidance, cwd: ctx.cwd, projectRoot, agentDir: ompAgentDir(),
+            prepareProposals(candidates, parseCandidate, { ...guidance, cwd: ctx.cwd, projectRoot, agentDir: ompAgentDir(),
               ownerTools, decisions, amendmentSections }));
           details.rejected = prepared.rejected;
           details.eligible = prepared.eligible.map((proposal) => ({
@@ -399,6 +440,9 @@ export function registerReviewTool(
           details.eligible = withReviewDecisions(files.storeFile(), ctx.cwd, ({ scoped }) =>
             preparedEntries(params.proposals, guidance.evidence, guidance.branch)
               .filter(({ proposal }) => {
+                if (proposal.kind === "harness") {
+                  return scoped(proposal.fingerprint, harnessProjectRoot(proposal.target))?.outcome !== "declined";
+                }
                 if (proposal.kind !== "project" || !("change" in proposal)) return scoped(proposal.fingerprint)?.outcome !== "declined";
                 if (proposal.change.operation !== "project-edits") {
                   projectRoot(proposal.target.root);
@@ -816,13 +860,13 @@ function renderFieldset(proposal: PreparedProposal): string {
     : proposal.change.operation === "withdrawal" || isHookRemoval(proposal) ? [APPLY, "Decline"] : [APPLY, "Later", "Decline"];
   const notedAsksAgain = isStale ? "An Update or Delete with a note is asked again."
     : proposal.change.operation === "harness" ? "A note that changes the code requires a newly checked change and another Apply."
-    : ["withdrawal", "compaction"].includes(proposal.change.operation) ? "An Apply with a note is asked again." : undefined;
+    : ["withdrawal", "compaction"].includes(proposal.change.operation) ? "If you add a note to Apply, you'll be asked again to review the proposal." : undefined;
   const evidence = proposal.evidence.map(({ quote, count, source }) => `<li>“${escapeHtml(quote)}” <b>×${count}</b>${source ? ` · ${escapeHtml(source)}` : ""}</li>`);
   const name = escapeHtml(proposal.candidateId).replace(/"/g, "&quot;");
   const { diagnosis } = proposal;
   return [
     "<fieldset>",
-    `<legend>${inline(`${actionLabel(proposal)} · ${!isStale && proposal.change.operation === "project-edits" ? "named checkouts (project)" : targetLabel(proposal)}`)}</legend>`,
+    `<legend>${inline(`${actionLabel(proposal)} · ${!isStale && proposal.change.operation === "project-edits" ? "reviewed files (project)" : targetLabel(proposal)}`)}</legend>`,
     `<p><b>${inline(proposal.gist)}</b></p>`,
     `<h4>${isStale ? "Keep, update or delete this stale amendment?" : "Apply this change?"}</h4>`,
     // The host reports text typed into the group's Other row as an option's label when it equals that option's value, so no value is a bare label.
@@ -854,7 +898,7 @@ function actionLabel(proposal: PreparedProposal): string {
     case "project-edits":
       return "Apply the same fix";
     case "profile-edit":
-      return change.beforeHash === null ? "Create profile file" : "Edit profile file";
+      return change.installedCopy ? "Edit installed copy" : change.beforeHash === null ? "Create profile file" : "Edit profile file";
     case "harness":
       return isHookRemoval(proposal) ? "Remove hook" : "Publish checked code";
     case "withdrawal":
@@ -958,16 +1002,22 @@ function withReviewDecisions<T>(file: string, cwd: string, check: (decisions: Re
   }) ?? check({ get: () => undefined, scoped: () => undefined });
 }
 
-function prepareProposals(candidates: readonly ReviewCandidate[], context: PrepareContext): {
+function prepareProposals(candidates: readonly unknown[], parseCandidate: (raw: unknown) => ReviewCandidate | string, context: PrepareContext): {
   eligible: PreparedProposal[]; rejected: RejectedDraft[];
 } {
   const eligible = new Map<string, PreparedProposal>();
   type DraftGroup = { drafts: number[]; reason?: string };
   const rejected = new Map<number, string>();
+  const drafts = candidates.map((raw, index) => {
+    const draft = parseCandidate(raw);
+    if (typeof draft !== "string") return draft;
+    rejected.set(index, draft);
+    return undefined;
+  });
   const collect = (compaction: boolean) => {
     const groups = new Map<string, DraftGroup>();
-    for (const [index, draft] of candidates.entries()) {
-      if ((draft?.change?.operation === "compaction") !== compaction) continue;
+    for (const [index, draft] of drafts.entries()) {
+      if (!draft || (draft.change.operation === "compaction") !== compaction) continue;
       let group: DraftGroup | undefined;
       try {
         const candidate = checkedCandidate(draft, context);
@@ -983,7 +1033,7 @@ function prepareProposals(candidates: readonly ReviewCandidate[], context: Prepa
         eligible.set(proposal.candidateId, previous ? joined(previous, proposal) : proposal);
       } catch (error) {
         if (error instanceof CommonReviewError) throw error;
-        const reason = draft?.kind === "profile" ? `Report item. Next action: ${errorMessage(error)}` : errorMessage(error);
+        const reason = draft.kind === "profile" ? `Report item. Next action: ${errorMessage(error)}` : errorMessage(error);
         rejected.set(index, reason);
         if (group) group.reason ??= reason;
       }
@@ -998,16 +1048,25 @@ function prepareProposals(candidates: readonly ReviewCandidate[], context: Prepa
       }
     }
   };
-  // A compaction can only cover appends that passed preparation as a complete identity.
+  // A compaction can include only appends accepted by this Prepare call.
   collect(false);
   collect(true);
   return {
     eligible: [...eligible.values()],
     rejected: [...rejected].sort(([a], [b]) => a - b).map(([index, reason]) => {
-      const gist = candidates[index]?.gist;
+      const gist = inputField(candidates[index], "gist");
       return { index, ...(typeof gist === "string" && { gist }), reason };
     }),
   };
+}
+
+function inputField(input: unknown, key: string): unknown {
+  return input !== null && typeof input === "object" && Object.hasOwn(input, key)
+    ? (input as Record<string, unknown>)[key] : undefined;
+}
+
+function schemaVariant<T extends object>(variants: T, key: unknown): T[keyof T] | undefined {
+  return typeof key === "string" && Object.hasOwn(variants, key) ? variants[key as keyof T] : undefined;
 }
 
 function staleChoiceRefusal(proposal: PreparedProposal, provenance: ProvenanceResolver): string | undefined {
@@ -1214,7 +1273,9 @@ function checkedCandidate(candidate: ReviewCandidate, context: PrepareContext): 
   }
   if (candidate.kind === "profile") {
     if (candidate.skill !== undefined || evidence.length === 0) throw new Error("cite the session evidence for the profile remedy; name the file via target, not skill");
-    return { ...candidate, target: canonicalProfileTarget(candidate.target), evidence };
+    const { change } = candidate;
+    const installedCopy = change.operation === "profile-edit" && change.check.kind === "content" && change.check.installedCopy !== undefined;
+    return { ...candidate, target: installedCopy ? candidate.target : canonicalProfileTarget(candidate.target), evidence };
   }
   if (candidate.kind === "harness") {
     if (candidate.skill !== undefined) throw new Error("harness review candidates carry no skill name");
@@ -1237,7 +1298,7 @@ function preparedProposal(
 ): PreparedProposal | undefined {
   const { change: draft } = candidate;
   const { decisions } = context;
-  const isDeclined = (fingerprint: string) => decisions.scoped(fingerprint)?.outcome === "declined";
+  const isDeclined = (fingerprint: string, root?: string) => decisions.scoped(fingerprint, root)?.outcome === "declined";
   const isStale = draft.operation === "stale-update" || draft.operation === "stale-delete";
   if ((candidate.priority === "stale") !== isStale) throw new Error("stale priority is exactly a stale Update/Delete change");
   if ((candidate.priority === "compaction") !== (draft.operation === "compaction")) throw new Error("compaction priority is exactly a compaction change");
@@ -1251,12 +1312,11 @@ function preparedProposal(
       !edit?.target || (edit.text !== undefined && typeof edit.text !== "string"))) {
       throw new Error("grouped project edits need at least two exact project destinations");
     }
-    const roots = draft.edits.map(({ target }) => context.projectRoot(target.root));
-    const targets = draft.edits.map(({ target }, i) => canonicalProjectTarget(roots[i]!, target));
+    const targets = draft.edits.map(({ target }) => canonicalProjectTarget(context.projectRoot(target.root), target));
     for (const target of targets) requireProjectOwnership(target, context.agentDir);
-    if (new Set(roots).size < 2 || new Set(targets.map(({ root, path }) => join(root, path))).size !== targets.length ||
+    if (new Set(targets.map(({ root, path }) => join(root, path))).size !== targets.length ||
         new Set(targets.map(({ mechanism }) => normaliseText(mechanism))).size !== 1) {
-      throw new Error("a project group needs one mechanism, distinct files and at least two checkouts");
+      throw new Error("a project proposal needs one mechanism and distinct destination files");
     }
     const fingerprints = targets.map(projectFingerprint);
     const fingerprint = createHash("sha256").update(JSON.stringify(["project-edits", [...fingerprints].sort()])).digest("hex").slice(0, 12);
@@ -1269,7 +1329,7 @@ function preparedProposal(
         throw new Error(`\`${join(target.root, target.path)}\` was declined; review revised scope rather than omitting it`);
       }
       const { text, check } = draft.edits[i]!;
-      const prepared = prepareProjectEdit(target, text, check);
+      const prepared = prepareOwnedProjectEdit(target, text, check, context.ownerTools);
       previews.push(prepared.preview);
       return { target, change: prepared.change };
     });
@@ -1285,7 +1345,8 @@ function preparedProposal(
     identify(`proposal:${fingerprint}`);
     if (draft.text !== undefined && typeof draft.text !== "string") throw new Error("project replacement text must be a string");
     if (decisions.scoped(fingerprint, target.root)?.outcome === "declined") return undefined;
-    return { candidateId: `proposal:${fingerprint}`, fingerprint, ...metadata, kind: "project", target, ...prepareProjectEdit(target, draft.text, draft.check) };
+    return { candidateId: `proposal:${fingerprint}`, fingerprint, ...metadata, kind: "project", target,
+      ...prepareOwnedProjectEdit(target, draft.text, draft.check, context.ownerTools) };
   }
   if (candidate.kind === "project") throw new Error("a project change needs its exact replacement or removal and check; prepare a project edit");
   const scope: TargetScope = candidate.kind === "profile" ? { kind: "profile", target: candidate.target }
@@ -1303,7 +1364,7 @@ function preparedProposal(
     const candidateId = `${removal ? "removal" : "proposal"}:${fingerprint}`;
     identify(candidateId);
     checkCurrentFingerprint(candidate, fingerprint);
-    if (isDeclined(fingerprint)) return undefined;
+    if (isDeclined(fingerprint, harnessProjectRoot(target))) return undefined;
     if (!Array.isArray(draft.files) || !context.ownerTools.has("bash") ||
         draft.files.some((file) => !context.ownerTools.has(file?.text === undefined ? "edit" : "write"))) {
       throw new Error("the ordinary owner tools or foreground Bash check are unavailable; report this finding to its owner");
@@ -1315,25 +1376,30 @@ function preparedProposal(
   if (draft.operation === "harness") throw new Error("a checked executable change needs a harness target");
   if (candidate.kind === "profile") {
     if (draft.operation !== "profile-edit") throw new Error("prepare a profile edit with its exact replacement and target-bound check");
-    const fingerprint = proposalIdentity(candidate, decisions);
+    const installedCopy = draft.check.kind === "content" ? draft.check.installedCopy : undefined;
+    let diagnosis: CandidateDiagnosis | undefined;
+    let inspection: Parameters<typeof prepareProfileEdit>[5];
+    let target = candidate.target;
+    if (installedCopy !== undefined) {
+      const { skill } = installedCopy;
+      const pass = context.passStart === undefined ? undefined : context.branch[context.passStart];
+      if (!pass?.details?.observationLeads?.leads.some(({ kind, text }) => kind === "note" && text === `allow-installed-copy ${skill}`)) {
+        throw new Error(`prefer skill controls, an amendment or owned source. Only the user can opt into an installed copy with /observe allow-installed-copy ${skill}`);
+      }
+      const installed = context.provenance.byName(skill);
+      if (installed.kind !== "upstream" && installed.kind !== "plugin") throw new Error("inspect the named installed upstream or plugin skill");
+      diagnosis = candidateDiagnosis({ ...candidate, kind: installed.kind, skill, target: undefined }, context);
+      const source = inspectionReceipt(diagnosis.inspection, context).sources.find(({ role }) => role === "skill");
+      if (!source) throw new Error("the inspection did not record the exact installed skill source");
+      target = canonicalInstalledCopyTarget(target, source.path);
+      inspection = { installed, source };
+    }
+    const fingerprint = proposalIdentity({ ...candidate, target }, decisions);
     identify(`proposal:${fingerprint}`);
     if (isDeclined(fingerprint)) return undefined;
     if (!context.ownerTools.has("write")) throw new Error("the built-in write tool is unavailable; ask the operator to apply the documented change through its owner");
-    const prepared = prepareProfileEdit(candidate.target, draft.text, draft.check, context.evidence, context.passStart);
-    const skill = prepared.change.installedSkill;
-    let diagnosis: CandidateDiagnosis | undefined;
-    if (skill !== undefined) {
-      const pass = context.passStart === undefined ? undefined : context.branch[context.passStart];
-      if (!pass?.details?.observationLeads?.leads.some(({ kind, text }) => kind === "note" && text === `allow-installed-copy ${skill}`)) {
-        throw new Error(`prefer skill controls, an amendment or owned source. Only the user can opt into a disposable copy with /observe allow-installed-copy ${skill}`);
-      }
-      const current = context.provenance.byName(skill);
-      if (!isPinKind(current.kind) || !("path" in current) || canonicalMissingPath(current.path) !== prepared.change.file) {
-        throw new Error("inspect the named installed skill and confirm its exact path stays inside the profile; otherwise use its owner or report the finding");
-      }
-      diagnosis = candidateDiagnosis({ ...candidate, kind: current.kind, skill, target: undefined }, context);
-    }
-    return { candidateId: `proposal:${fingerprint}`, fingerprint, ...base, ...prepared, ...(diagnosis && { diagnosis }) };
+    const prepared = prepareProfileEdit(target, draft.text, draft.check, context.evidence, context.passStart, inspection);
+    return { candidateId: `proposal:${fingerprint}`, fingerprint, ...metadata, kind: "profile", ...prepared, ...(diagnosis && { diagnosis }) };
   }
   if (draft.operation === "profile-edit") throw new Error("a profile edit needs a profile target");
   if (draft.operation === "direct-edit") {
@@ -1479,6 +1545,19 @@ function includedAddition(skill: string, addition: string, prepared: readonly Pr
     throw new Error(`the compaction of \`${skill}\` includes ${JSON.stringify(addition)}, which names ${match ? "more than one" : "no"} on-read append of this Prepare`);
   }
   return match.fingerprint;
+}
+
+function harnessProjectRoot(target: HarnessTarget): string | undefined {
+  return target.root === "extension" ? target.checkout : target.root === "project-hooks" ? target.project : undefined;
+}
+
+function prepareOwnedProjectEdit(target: ProjectTarget, text: string | undefined, check: string, ownerTools: ReadonlySet<string>) {
+  const owner = text === undefined ? "edit" : "write";
+  const missing = [owner, "bash"].filter((tool) => !ownerTools.has(tool));
+  if (missing.length > 0) {
+    throw new Error(`Report item. Next action: arrange for the owner to apply and verify \`${join(target.root, target.path)}\`; missing registered built-in tool(s): ${missing.join(", ")}`);
+  }
+  return prepareProjectEdit(target, text, check);
 }
 
 function requireProjectOwnership(target: ProjectTarget, agentDir: string): void {

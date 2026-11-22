@@ -411,8 +411,8 @@ function checkLatestAnswer(approval: ProposalAnswerRef, evidence: SessionToolEvi
   const isReprepared = latestPrepared(candidateId, evidence)?.reviewToolCallId !== reviewToolCallId;
   const { call: ask } = evidence.completedCall(approval.askToolCallId);
   const form = ask.args.html;
-  const afterPrepare = choice === "Decline" ? evidence.completedCall(reviewToolCallId).result.position : undefined;
-  if (afterPrepare !== undefined) {
+  const afterPrepare = evidence.completedCall(reviewToolCallId).result.position;
+  if (choice === "Decline") {
     const selected = reviewSelectionForForm(evidence, afterPrepare, form, ask.position);
     if (!selected?.some(({ reference }) => isDeepStrictEqual(reference, approval.proposal))) {
       throw new Error("the Ask's latest matching Select did not select this exact prepared proposal");
@@ -421,8 +421,8 @@ function checkLatestAnswer(approval: ProposalAnswerRef, evidence: SessionToolEvi
   const isReasked = evidence.completedCalls("ask").some(({ call, result }) =>
     result.position > answeredAt && call.origin === "native" &&
     (call.args.html === form || result.details?.answers?.some((answer) => answer?.name === candidateId) ||
-      (afterPrepare !== undefined && reviewSelectionForForm(evidence, afterPrepare, call.args.html, call.position)
-        ?.some(({ reference }) => reference.candidateId === candidateId))));
+      reviewSelectionForForm(evidence, afterPrepare, call.args.html, call.position)
+        ?.some(({ reference }) => reference.candidateId === candidateId)));
   if (isReprepared || isReasked) {
     throw new Error(`this ${choice} is superseded: a later Prepare or Ask of this pass holds the same proposal again; cite the user's latest answer, which must be ${choice === APPLY ? "an" : "a"} ${choice}`);
   }

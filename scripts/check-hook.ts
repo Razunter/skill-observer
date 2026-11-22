@@ -61,7 +61,7 @@ const samples = readSamples(samplesFile);
 let handlers: Map<string, Handler[]>;
 if (absent) {
   if (lstatSync(resolve(hookFile), { throwIfNoEntry: false })) fail(`hook file ${hookFile} must be absent`);
-  if (samples.some((sample) => sample.expect !== "untouched")) fail("absence checks require untouched samples");
+  if (samples.some((sample) => sample.expect !== "untouched")) fail('With --absent, every sample must expect "untouched".');
   handlers = new Map();
 } else {
   handlers = await loadHook(hookFile);

@@ -358,13 +358,37 @@ export function projectFingerprint(target: ProjectTarget): string {
   return createHash("sha256").update(JSON.stringify(["project", target.root, target.path, mechanism])).digest("hex").slice(0, 12);
 }
 
-export function canonicalProfileTarget(target: ProfileTarget): ProfileTarget {
+function activeProfileRoot(target: ProfileTarget): string {
   if (target?.scope !== "profile" || typeof target.root !== "string" ||
       typeof target.mechanism !== "string" || !target.mechanism.trim()) throw new Error("a profile target needs root, path and mechanism");
   const root = realpathSync(ompAgentDir());
   if (!statSync(root).isDirectory() || realpathSync(target.root) !== root) throw new Error("profile root must be the active OMP agent directory");
+  return root;
+}
+
+export function canonicalProfileTarget(target: ProfileTarget): ProfileTarget {
+  const root = activeProfileRoot(target);
   const path = canonicalPathIn(root, target.path, "profile target");
   if (path !== target.path) throw new Error("use the exact canonical profile path; inspect the symlink before proposing a change");
+  return { scope: "profile", root, path, mechanism: target.mechanism.trim() };
+}
+
+/** Validates the spelling of an installed-copy target, not authority to write it. */
+export function canonicalInstalledCopyTarget(target: ProfileTarget, inspectedFile: string): ProfileTarget {
+  const root = activeProfileRoot(target);
+  const path = isAbsolute(target.path) ? target.path : canonicalProfileTarget(target).path;
+  const file = isAbsolute(path) ? path : join(root, path);
+  const home = homedir();
+  const skills = join(home, ".agents", "skills");
+  const plugins = join(home, ".omp", "plugins");
+  const pluginParts = relative(plugins, file).split(sep);
+  const ordinarySkill = dirname(dirname(file)) === skills;
+  const pluginSkill = withinRoot(plugins, file) && pluginParts.length >= 4 && pluginParts.at(-3) === "skills";
+  if (file !== inspectedFile || !absoluteCanonicalSpelling(file) || basename(file) !== "SKILL.md" ||
+      (!ordinarySkill && !pluginSkill) || canonicalMissingPath(file) !== file ||
+      (isAbsolute(path) && withinRoot(root, file))) {
+    throw new Error("name the exact inspected SKILL.md of the installed copy without aliases; otherwise use its owner or report the finding");
+  }
   return { scope: "profile", root, path, mechanism: target.mechanism.trim() };
 }
 
@@ -400,24 +424,35 @@ export function ledgerForProject(records: readonly LedgerRecord[], cwd: string):
   return records.filter((record) => ledgerDecisionInProject(record, root));
 }
 
+export function ledgerProjectRoot(record: LedgerRecord): string | undefined {
+  if (record.kind === "project") return record.target.root;
+  if (record.kind !== "harness") return undefined;
+  const { target } = record;
+  if (target.root === "project-hooks") return target.project;
+  if (target.root === "extension") return target.checkout;
+}
+
 export function ledgerDecisionInProject(record: LedgerRecord, canonicalRoot: string): boolean {
+  const project = ledgerProjectRoot(record);
+  if (project !== undefined && project !== canonicalRoot) return false;
   switch (record.kind) {
     case "project":
-      if (record.target.root !== canonicalRoot) return false;
       try {
         return projectFingerprint(canonicalProjectTarget(canonicalRoot, record.target)) === record.fingerprint;
       } catch { return false; }
     case "profile":
       try {
-        return profileFingerprint(canonicalProfileTarget(record.target)) === record.fingerprint;
+        const target = isAbsolute(record.target.path)
+          ? canonicalInstalledCopyTarget(record.target, record.target.path)
+          : canonicalProfileTarget(record.target);
+        return profileFingerprint(target) === record.fingerprint;
       } catch { return false; }
     case "harness":
-      if (record.target.root === "extension") {
-        if (record.target.checkout !== undefined) return record.target.checkout === canonicalRoot;
+      if (record.target.root === "extension" && project === undefined) {
         try { return nativeExtensionDirectory(record.target.source, undefined, canonicalMissingPath(ompAgentDir())); }
         catch { return false; }
       }
-      return record.target.root !== "project-hooks" || record.target.project === canonicalRoot;
+      return true;
     default:
       return record.target === undefined;
   }

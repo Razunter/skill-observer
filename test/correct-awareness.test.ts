@@ -2,8 +2,9 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import skillObserver from "../src/skill-observer.js";
-import type { CommandHandler, CustomMessage, ExtensionAPI, ExtensionContext, Schema } from "../src/omp.js";
+import type { CommandHandler, CustomMessage, ExtensionAPI, ExtensionContext } from "../src/omp.js";
 import { entries } from "./fixtures.js";
+import { zod } from "./host-schema.js";
 import { makeSkillHome } from "./skill-home.js";
 
 const homes: string[] = [];
@@ -18,12 +19,11 @@ it.each([true, false])("discovers the existing user-only correct reference in a 
   if (available) { mkdirSync(join(roots.skillsDir, "correct"), { recursive: true }); writeFileSync(path, original); }
   let observe: CommandHandler | undefined;
   const sent: CustomMessage[] = [];
-  const schema: Schema = { optional: () => schema, describe: () => schema };
   const pi = {
     on() {}, registerTool() {}, appendEntry() {},
     registerCommand(name: string, command: { handler: CommandHandler }) { if (name === "observe") observe = command.handler; },
     getActiveTools: () => [], setActiveTools: async () => {}, sendMessage(message: CustomMessage) { sent.push(message); },
-    zod: Object.fromEntries(["object", "array", "string", "number", "enum", "union", "record", "unknown"].map(key => [key, () => schema])),
+    zod,
   } as unknown as ExtensionAPI;
   skillObserver(pi);
   const ctx = { hasUI: true, cwd: roots.cwd, agent: { kind: "main" }, sessionManager: { getSessionId: () => "fixture-session", getBranch: () => entries.skillLessTurn, getEntries: () => entries.skillLessTurn }, ui: { notify() {}, setStatus() {} } } as unknown as ExtensionContext;

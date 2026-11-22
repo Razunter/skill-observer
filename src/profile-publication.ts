@@ -1,9 +1,10 @@
 import { YAML } from "bun";
-import { existsSync, lstatSync } from "node:fs";
-import { basename, join } from "node:path";
+import { lstatSync } from "node:fs";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { canonicalMissingPath, canonicalProfileTarget, type ProfileTarget } from "./ledger.js";
+import { canonicalInstalledCopyTarget, canonicalMissingPath, canonicalProfileTarget, type ProfileTarget } from "./ledger.js";
 import { checkScalarFileState, fileId, prepareScalarFile, type ScalarFileEdit } from "./project-publication.js";
+import { createProvenanceResolver, defaultSkillRoots, type SkillProvenance } from "./provenance.js";
 import { CHECK_TOOL_NAME, replayCase, type PatternDraft } from "./replay.js";
 import type { SessionToolEvidence } from "./session-tool-evidence.js";
 
@@ -18,23 +19,40 @@ export interface ProfileEdit extends ScalarFileEdit {
   text: string;
   afterHash: string;
   verification: string;
-  installedSkill?: string;
+  installedCopy?: Extract<SkillProvenance, { kind: "upstream" | "plugin" }>;
 }
 
-export function prepareProfileEdit(target: ProfileTarget, text: string, check: ProfileCheck, evidence: SessionToolEvidence, passStart: number | undefined): { change: ProfileEdit; preview: string } {
+export function prepareProfileEdit(requestedTarget: ProfileTarget, text: string, check: ProfileCheck, evidence: SessionToolEvidence,
+    passStart: number | undefined, inspection?: { installed: SkillProvenance; source?: { path: string; sha256: string } }):
+    { target: ProfileTarget; change: ProfileEdit; preview: string } {
   if (typeof text !== "string" || !check || typeof check !== "object") throw new Error("supply exact replacement text and a meaningful target-bound inspection or replay");
+  const installedCopy = check.kind === "content" ? check.installedCopy : undefined;
+  let source: ProfileEdit["installedCopy"];
+  if (installedCopy !== undefined) {
+    if (!installedCopy || typeof installedCopy.skill !== "string" || !installedCopy.skill.trim() ||
+        typeof installedCopy.why !== "string" || !installedCopy.why.trim()) {
+      throw new Error("name the installed skill and explain why its controls, amendment and owned source do not fit");
+    }
+    const installed = inspection?.installed;
+    if ((installed?.kind !== "upstream" && installed?.kind !== "plugin") ||
+        installed.name !== installedCopy.skill || installed.path !== inspection?.source?.path) {
+      throw new Error("inspect the named installed copy in this pass and cite its exact current skill source");
+    }
+    source = installed;
+  }
+  const target = source ? canonicalInstalledCopyTarget(requestedTarget, source.path) : canonicalProfileTarget(requestedTarget);
   const settings = /^config\.ya?ml$/.test(target.path);
   const rule = /^rules\/(?:[^/]+\/)*[^/]+\.mdc?$/.test(target.path);
-  const installedCopy = check.kind === "content" ? check.installedCopy : undefined;
   const skillEntry = basename(target.path) === "SKILL.md";
-  const installed = skillEntry && installedCopy;
   const guidance = !skillEntry && /^(?:(?:AGENTS|RULES|SYSTEM|APPEND_SYSTEM)\.md|(?:docs|guides|instructions|prompts)\/.+\.md)$/.test(target.path);
-  if (!settings && !rule && !guidance && !installed) throw new Error("the destination is not profile guidance, a rule or a supported host setting; use its normal owner or report the blocker");
-  if (installed && (typeof installed.skill !== "string" || !installed.skill.trim() || typeof installed.why !== "string" || !installed.why.trim())) {
-    throw new Error("name the installed skill and explain why its controls, amendment and owned source do not fit");
-  }
+  if (!settings && !rule && !guidance && !source) throw new Error("the destination is not profile guidance, a rule or a supported host setting; use its normal owner or report the blocker");
   if (settings && check.kind !== "skill-control") throw new Error("verify the exact host skill control, not arbitrary config content");
-  const { edit, before, preview } = prepareScalarFile(target, text);
+  const { edit, before, preview } = prepareScalarFile(isAbsolute(target.path)
+    ? { root: dirname(target.path), path: basename(target.path) }
+    : target, text);
+  if (source && (edit.beforeHash === null || edit.beforeHash !== inspection?.source?.sha256)) {
+    throw new Error("the installed copy changed since the current-pass inspection; inspect again before proposing an edit");
+  }
   const beforeRule = rule ? ruleFrontmatter(before) : {};
   const afterRule = rule ? ruleFrontmatter(text) : {};
   if (rule && (before === undefined || "generatedBy" in beforeRule || "generatedBy" in afterRule)) {
@@ -67,7 +85,7 @@ export function prepareProfileEdit(target: ProfileTarget, text: string, check: P
         throw new Error("name a decisive passage introduced by the edit or a superseded passage it removes; the requirement must distinguish the before and after texts");
       }
       verification = `inspect exact published content for ${JSON.stringify(contains)}${excludes ? ` and absence of ${JSON.stringify(excludes)}` : ""}`;
-      activation = installed ? `Installed-copy last resort. Updates can overwrite it. Why durable alternatives do not fit: ${installed.why}`
+      activation = installedCopy ? `Affects sessions that load this installed copy. Installed-copy last resort. Updates can overwrite it. Why durable alternatives do not fit: ${installedCopy.why}`
         : rule ? "Affects sessions in this profile when OMP reloads the rule. The rule remains user-owned."
         : "Takes effect when OMP or the agent next loads this guidance.";
       break;
@@ -77,18 +95,38 @@ export function prepareProfileEdit(target: ProfileTarget, text: string, check: P
   }
   const root = lstatSync(target.root);
   const change: ProfileEdit = { ...edit, operation: "profile-edit", profileRootId: fileId(root), text, afterHash: edit.afterHash!, verification,
-    ...(installed && { installedSkill: installed.skill }) };
-  return { change, preview: `${preview}\nProfile-wide in ${target.root}. ${activation}\nVerification: ${verification}.` };
+    ...(source && { installedCopy: source }) };
+  const scope = source ? "" : `Profile-wide in ${target.root}. `;
+  return { target, change, preview: `${preview}\n${scope}${activation}\nVerification: ${verification}.` };
 }
 
 export function checkProfileState(target: ProfileTarget, change: ProfileEdit, before: boolean): void {
-  const current = canonicalProfileTarget(target);
+  const installed = change.installedCopy;
+  const current = installed ? canonicalInstalledCopyTarget(target, installed.path) : canonicalProfileTarget(target);
+  const file = isAbsolute(current.path) ? current.path : join(current.root, current.path);
   const root = lstatSync(current.root);
-  if (current.path !== target.path || join(current.root, current.path) !== change.file || fileId(root) !== change.profileRootId) {
+  if (current.path !== target.path || file !== change.file || fileId(root) !== change.profileRootId) {
     throw new Error("the approved profile or destination changed; prepare and ask again");
   }
-  if (target.path === "config.yaml" && existsSync(join(current.root, "config.yml"))) throw new Error("config.yml now takes precedence; inspect the active settings and ask again");
+  requireNoCompetingConfig(current, change.beforeHash === null);
   checkScalarFileState(change, before);
+  if (installed) {
+    const resolver = createProvenanceResolver(defaultSkillRoots(current.root));
+    const live = before ? resolver.byName(installed.name) : resolver.byPath(installed.path);
+    // The approved bytes may rename the skill, but they cannot change its installation provenance.
+    if (!isDeepStrictEqual(live, before ? installed : { ...installed, name: live.name })) {
+      throw new Error("the selected installed copy changed ownership or destination; inspect and ask again");
+    }
+  }
+}
+
+function requireNoCompetingConfig({ root, path }: ProfileTarget, creating: boolean): void {
+  const competitor = path === "config.yaml" ? "config.yml" : path === "config.yml" && creating ? "config.yaml" : undefined;
+  if (!competitor) return;
+  const file = join(root, competitor);
+  if (lstatSync(file, { throwIfNoEntry: false }) || canonicalMissingPath(file) !== file) {
+    throw new Error(`competing ${competitor} exists or is redirected; inspect the active config and ask again`);
+  }
 }
 
 function ruleFrontmatter(text: string | undefined): Record<string, unknown> {
@@ -125,13 +163,8 @@ function checkedPattern(target: ProfileTarget, text: string, metadata: Record<st
 }
 
 function verifySkillControl(target: ProfileTarget, before: string | undefined, text: string, check: Extract<ProfileCheck, { kind: "skill-control" }>): void {
-  const { root, path } = target;
-  const primary = join(root, "config.yml");
-  const alternate = join(root, "config.yaml");
-  if ((path === "config.yaml" && (canonicalMissingPath(primary) !== primary || existsSync(primary) || before === undefined)) ||
-      (path === "config.yml" && before === undefined && (canonicalMissingPath(alternate) !== alternate || existsSync(alternate)))) {
-    throw new Error("inspect and edit the existing active config.yml/config.yaml, not a competing config file");
-  }
+  requireNoCompetingConfig(target, before === undefined);
+  if (target.path === "config.yaml" && before === undefined) throw new Error("create config.yml instead of a competing config file");
   if (typeof check.skill !== "string" || !/^[\w@.-]+(?:\/[\w.@~-]+)?$/.test(check.skill) || !["manual-only", "disable"].includes(check.mode)) {
     throw new Error("name one installed skill and choose manual-only or disable");
   }

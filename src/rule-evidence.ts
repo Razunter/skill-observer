@@ -1,7 +1,7 @@
 import { closeSync, constants, fstatSync, openSync, readSync, readdirSync, realpathSync, type Dirent } from "node:fs";
 import { basename, join } from "node:path";
 import { buildDigest } from "./digest.js";
-import { ledgerDecisionInProject, type LedgerRecord, readLedgerDecision, targetLabel } from "./ledger.js";
+import { ledgerDecisionInProject, ledgerProjectRoot, type LedgerRecord, readLedgerDecision, targetLabel } from "./ledger.js";
 import { readObserverStore } from "./observer-store.js";
 import type { ExtensionContext, SessionEntry } from "./omp.js";
 import { remedyOutcomes } from "./outcomes.js";
@@ -50,7 +50,7 @@ export function lookupRuleEvidence(key: EvidenceKey | undefined, cursor: string 
   return {
     matches: page.map((record) => ({
       fingerprint: record.fingerprint, kind: record.kind, target: targetLabel(record), gist: record.gist,
-      scope: record.kind === "project" || (record.kind === "harness" && record.target.root === "project-hooks") ? "project" : "global",
+      scope: ledgerProjectRoot(record) === undefined ? "global" : "project",
       ...(record.rule && { rule: basename(record.rule, ".md") }), ...(record.compaction && { compaction: true }),
       outcome: record.outcome, remedyOutcome: outcomes.get(record.fingerprint)?.status,
       remedyEvidence: outcomes.get(record.fingerprint)?.evidence,
@@ -84,7 +84,7 @@ function recordEvidence(record: LedgerRecord, sourceFor: (id: string) => Session
     if (!occurrenceIds?.length) {
       const primary = source.findQuote(quote);
       if (primary) ids.add(primary);
-      else gaps.add("Some quotes have no recorded entry locator or literal match in the saved session.");
+      else gaps.add("For some quotes, no entry ID was recorded and the exact text could not be found in the saved session.");
     }
     if (ids.size === 0) return [];
     if (quote.length > QUOTE_CHARS) gaps.add("A recorded quote was clipped; read its primary source for the full text.");

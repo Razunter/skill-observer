@@ -95,23 +95,16 @@ type CitingAnswer = Omit<ProposalAnswer, "skill" | "kind" | "gist"> & Partial<Pi
 
 interface ProjectAnswer {
   kind: "project";
-  target: ProjectTarget;
-  gist: string;
+  target?: ProjectTarget;
+  gist?: string;
   outcome: ProposalOutcome;
   fingerprint?: string;
   evidence?: Evidence[];
   reoffer?: string;
   approval?: ProposalAnswerRef;
+  proposal?: PreparedProposalRef;
   publication?: ProjectPublication;
   rule?: never;
-}
-
-interface ProjectGroupAnswer {
-  kind: "project-group";
-  outcome: ProposalOutcome;
-  approval?: ProposalAnswerRef;
-  proposal?: PreparedProposalRef;
-  reoffer?: string;
 }
 
 interface ProfileAnswer {
@@ -149,7 +142,7 @@ export interface CompactionAnswer {
 }
 
 interface ResolveParams {
-  outcomes: (CitingAnswer | ProjectAnswer | ProjectGroupAnswer | ProfileAnswer | HarnessAnswer)[];
+  outcomes: (CitingAnswer | ProjectAnswer | ProfileAnswer | HarnessAnswer)[];
   compactions?: CompactionAnswer[];
   stale?: StaleAnswer[];
 }
@@ -181,33 +174,71 @@ function fixDraft(change: ApprovedChange): FixDraft {
   return { name, body, pattern: condition, scope, matches, spares };
 }
 
-function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[], timestamp: string, sessionId: string): ProjectLedgerRecord {
-  const { outcome } = answer;
-  if (!PROPOSAL_OUTCOMES.includes(answer.outcome) || typeof answer.gist !== "string" || !answer.gist.trim() ||
-      answer.rule !== undefined || "skill" in answer) throw new Error("project answers need a gist and Apply/Later/Decline; they are not skill amendments");
+function projectRecords(answer: ProjectAnswer, cwd: string, branch: SessionEntry[], timestamp: string, sessionId: string,
+    failures: string[]): Array<{ record: ProjectLedgerRecord; edit?: ProjectEdit }> {
+  const { outcome, proposal: reference } = answer;
+  if (!PROPOSAL_OUTCOMES.includes(outcome)) throw new Error("project answers need Apply, Later or Decline");
+  const evidence = sessionToolEvidence(branch);
+  if (reference !== undefined) {
+    if (outcome !== "later" || !isProposalRef(reference) ||
+        Object.keys(answer).some(key => !["kind", "outcome", "proposal", "reoffer"].includes(key))) {
+      throw new Error("project overflow Later cites only the deferred Prepare reference and optional reoffer");
+    }
+    const { proposal } = preparedInPass(reference, evidence, branch);
+    requireLatestReference(reference, evidence);
+    const deferral = overflowDeferral(reference, evidence);
+    if (!deferral) throw new Error("project Later without a native answer requires an eligible proposal deferred by the Ask cap");
+    if (proposal.kind !== "project" || !("change" in proposal)) throw new Error("the cited proposal is not a project change");
+    const { change, target, gist } = proposal;
+    if (change.operation !== "project-edit" && change.operation !== "project-edits") throw new Error("the cited proposal is not an exact project change");
+    const reoffer = answer.reoffer?.trim();
+    const later = reoffer && reoffer !== deferral ? `${deferral} ${reoffer}` : deferral;
+    const edits = change.operation === "project-edits" ? change.edits : [{ target, change }];
+    return edits.map(({ target, change: edit }) => ({
+      ...(change.operation === "project-edits" && { edit }),
+      record: { kind: "project", target, fingerprint: projectFingerprint(target), gist, outcome,
+        evidence: proposal.evidence, reoffer: later, timestamp, sessionId },
+    }));
+  }
   const choice = choiceForOutcome(outcome);
-  let approved = outcome === "applied" || answer.approval !== undefined ? approvedProject(answer.approval, branch, undefined, choice) : undefined;
-  if (approved?.change.operation === "project-edits") throw new Error("resolve a reviewed group with one project-group outcome");
-  const root = projectRootScope(cwd, approved && { roots: [approved.proposal.target.root], worktrees: [] })(answer.target?.root);
+  let approved = outcome === "applied" || answer.approval !== undefined
+    ? approvedProject(answer.approval, branch, evidence, choice)
+    : undefined;
+  if (approved?.change.operation === "project-edits") {
+    if (Object.keys(answer).some(key => !["kind", "outcome", "approval"].includes(key))) {
+      throw new Error("For a multi-target project outcome, cite only the native approval. Resolve gets the destinations from the reviewed changes and the publication evidence from the tool calls it observed.");
+    }
+    const { proposal, change, approval, answeredAt, note } = approved;
+    const reoffer = laterReoffer({ outcome, reoffer: note });
+    const results: Array<{ record: ProjectLedgerRecord; edit: ProjectEdit }> = [];
+    for (const { target, change: edit } of change.edits) {
+      try {
+        const publication = outcome === "applied" ? observedProjectPublication(target, edit, approval, answeredAt, evidence) : undefined;
+        results.push({ edit, record: { kind: "project", target, fingerprint: projectFingerprint(target),
+          gist: proposal.gist, outcome, evidence: proposal.evidence, ...reoffer,
+          ...(publication && { publication }), timestamp, sessionId } });
+      } catch (error) {
+        failures.push(`\`${edit.file}\`: ${(error as Error).message}`);
+      }
+    }
+    return results;
+  }
+  if (typeof answer.gist !== "string" || !answer.gist.trim() || !answer.target ||
+      answer.rule !== undefined || "skill" in answer) throw new Error("a single project answer needs its reviewed target and gist; it is not a skill amendment");
+  const root = projectRootScope(cwd, approved && { roots: [approved.proposal.target.root], worktrees: [] })(answer.target.root);
   const target = canonicalProjectTarget(root, answer.target);
   const fingerprint = projectFingerprint(target);
   if (answer.fingerprint !== undefined && answer.fingerprint !== fingerprint) throw new Error("project fingerprint does not match its scoped identity");
-  let reoffer = answer.reoffer;
   const passStart = observationPassStart(branch);
   if (outcome === "declined" && approved === undefined && passStart === undefined) {
     throw new Error("a project Decline needs a current native Decline; no observation pass is current on this branch");
   }
   if (passStart !== undefined && approved === undefined) {
-    const evidence = sessionToolEvidence(branch);
     const prepared = preparedProjectEntries(evidence, passStart).find(({ proposal }) => proposal.change.operation === "project-edit" &&
       proposal.fingerprint === fingerprint && proposal.gist === answer.gist);
     approved = prepared && findProjectApproval(prepared.reference, evidence, branch, passStart, choice);
-    if (!approved) {
-      const deferred = outcome === "later" && prepared && overflowDeferral(prepared.reference, evidence);
-      if (!deferred) throw new Error(outcome === "declined" ? "a project Decline needs a current native Decline for this exact prepared project change"
-        : "record a native project answer or an eligible overflow; rejected drafts and report items are not ledger decisions");
-      reoffer = reoffer && reoffer !== deferred ? `${deferred} ${reoffer}` : deferred;
-    }
+    if (!approved) throw new Error(outcome === "declined" ? "a project Decline needs a current native Decline for this exact prepared project change"
+      : "record a native project answer or cite the eligible overflow proposal reference; rejected drafts and report items are not ledger decisions");
   }
   if (approved) {
     const { proposal, change, approval, answeredAt } = approved;
@@ -215,59 +246,27 @@ function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[
         proposal.target.path !== target.path || proposal.target.mechanism !== target.mechanism || proposal.gist !== answer.gist) {
       throw new Error("the answer does not name the exact single project change selected in that Ask");
     }
-    if (outcome === "applied") checkProjectPublication(target, change, approval, answeredAt, answer.publication, branch);
+    if (outcome === "applied") checkProjectPublication(target, change, approval, answeredAt, answer.publication, evidence);
   }
   if (outcome !== "applied" && answer.publication !== undefined) throw new Error("only an applied project remedy cites publication");
-  const evidence = approved?.proposal.evidence ?? answer.evidence;
-  return { kind: "project", target, fingerprint, gist: answer.gist, outcome,
-    ...(evidence?.length && { evidence }), ...laterReoffer({ outcome, reoffer: approved ? approved.note : reoffer }),
-    ...(outcome === "applied" && { publication: answer.publication }), timestamp, sessionId };
-}
-
-function projectGroupRecords(answer: ProjectGroupAnswer, branch: SessionEntry[], timestamp: string, sessionId: string, failures: string[]) {
-  const evidence = sessionToolEvidence(branch);
-  const { outcome, approval, proposal: deferred } = answer;
-  if (!PROPOSAL_OUTCOMES.includes(outcome) || (approval !== undefined && deferred !== undefined) ||
-      "target" in answer || "publication" in answer || "edits" in answer) {
-    throw new Error("a project group resolves the exact reviewed destinations, not a replacement list or supplied publication");
-  }
-  const answered = deferred === undefined
-    ? approvedProject(approval, branch, evidence, choiceForOutcome(outcome))
-    : undefined;
-  let reoffer = answered?.note;
-  if (deferred !== undefined) {
-    if (!isProposalRef(deferred) || outcome !== "later" || !(reoffer = overflowDeferral(deferred, evidence))) {
-      throw new Error("an answer without native Ask is only for a prepared group deferred by the Ask cap");
-    }
-    requireLatestReference(deferred, evidence);
-    if (answer.reoffer?.trim()) reoffer += ` ${answer.reoffer.trim()}`;
-  }
-  const proposal = answered?.proposal ?? preparedInPass(deferred!, evidence, branch).proposal;
-  const change = "change" in proposal ? proposal.change : undefined;
-  if (proposal.kind !== "project" || change?.operation !== "project-edits") throw new Error("the cited proposal is not an exact project group");
-  const results: Array<{ record: ProjectLedgerRecord; edit: ProjectEdit }> = [];
-  for (const { target, change: edit } of change.edits) {
-    try {
-      const publication = outcome === "applied" && answered
-        ? observedProjectPublication(target, edit, answered.approval, answered.answeredAt, evidence)
-        : undefined;
-      results.push({ edit, record: { kind: "project", target, fingerprint: projectFingerprint(target),
-        gist: proposal.gist, outcome, evidence: proposal.evidence, ...laterReoffer({ outcome, reoffer }),
-        ...(publication && { publication }), timestamp, sessionId } });
-    } catch (error) {
-      failures.push(`\`${edit.file}\`: ${(error as Error).message}`);
-    }
-  }
-  return results;
+  const quotes = approved?.proposal.evidence ?? answer.evidence;
+  return [{ record: { kind: "project", target, fingerprint, gist: answer.gist, outcome,
+    ...(quotes?.length && { evidence: quotes }), ...laterReoffer({ outcome, reoffer: approved ? approved.note : answer.reoffer }),
+    ...(outcome === "applied" && { publication: answer.publication }), timestamp, sessionId } }];
 }
 
 function profileRecord(answer: ProfileAnswer, branch: readonly SessionEntry[], timestamp: string, sessionId: string): ProfileLedgerRecord {
-  const target = canonicalProfileTarget(answer.target);
-  const fingerprint = profileFingerprint(target);
   if (!PROPOSAL_OUTCOMES.includes(answer.outcome)) throw new Error("a profile answer is applied, later or declined");
-  const record = { kind: "profile" as const, target, fingerprint, gist: answer.gist, outcome: answer.outcome, timestamp, sessionId };
-  const matches = (proposal: PreparedProposal) => proposal.kind === "profile" && proposal.fingerprint === fingerprint &&
-    proposal.target.root === target.root && proposal.target.path === target.path && proposal.target.mechanism === target.mechanism && proposal.gist === answer.gist;
+  const recordFor = (proposal: PreparedProposal, refusal: string) => {
+    if (proposal.kind !== "profile" || !("change" in proposal) || proposal.change.operation !== "profile-edit") throw new Error(refusal);
+    const { target, fingerprint, gist } = proposal;
+    const requested = proposal.change.installedCopy ? answer.target : canonicalProfileTarget(answer.target);
+    if (requested?.scope !== target.scope || requested.root !== target.root || requested.path !== target.path ||
+        requested.mechanism !== target.mechanism || answer.gist !== gist || profileFingerprint(target) !== fingerprint) {
+      throw new Error(refusal);
+    }
+    return { kind: "profile" as const, target, fingerprint, gist, outcome: answer.outcome, evidence: proposal.evidence, timestamp, sessionId };
+  };
   if (answer.outcome !== "applied" && answer.publication !== undefined) throw new Error("only an applied profile edit cites a write");
   if (answer.proposal !== undefined) {
     const evidence = sessionToolEvidence(branch);
@@ -275,15 +274,14 @@ function profileRecord(answer: ProfileAnswer, branch: readonly SessionEntry[], t
     if (answer.outcome !== "later" || answer.approval || !deferral) throw new Error("only eligible overflow can be recorded without a native answer; a report item is not a decision");
     requireLatestReference(answer.proposal, evidence);
     const { proposal } = preparedInPass(answer.proposal, evidence, branch);
-    if (!matches(proposal)) throw new Error("the cited proposal is not this exact profile target");
-    return { ...record, evidence: proposal.evidence, reoffer: answer.reoffer ? `${deferral} ${answer.reoffer}` : deferral };
+    return { ...recordFor(proposal, "the cited proposal is not this exact profile target"),
+      reoffer: answer.reoffer ? `${deferral} ${answer.reoffer}` : deferral };
   }
   const { proposal, change, approval, answeredAt, note } = approvedProfile(answer.approval, branch, choiceForOutcome(answer.outcome));
-  if (!matches(proposal)) throw new Error("the answer does not name the exact profile edit reviewed in that Ask");
   return {
-    ...record, evidence: proposal.evidence,
+    ...recordFor(proposal, "the answer does not name the exact profile edit reviewed in that Ask"),
     ...laterReoffer({ outcome: answer.outcome, reoffer: note }),
-    ...(answer.outcome === "applied" && { publication: checkProfilePublication(target, change, approval, answeredAt, answer.publication, branch) }),
+    ...(answer.outcome === "applied" && { publication: checkProfilePublication(proposal.target, change, approval, answeredAt, answer.publication, branch) }),
   };
 }
 
@@ -439,25 +437,19 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
               root: z.string().describe("The prepared canonical project root."),
               path: z.string().describe("Root-relative file path, including safe missing leaves."),
               mechanism: z.string().describe("One mechanism; identity normalizes case, punctuation and whitespace."),
-            }),
-            gist: z.string(),
+            }).optional().describe("The reviewed target for a single edit. Omit for multiple reviewed edits or overflow."),
+            gist: z.string().optional().describe("The reviewed gist for a single edit. Omit for multiple reviewed edits or overflow."),
             outcome: z.enum(PROPOSAL_OUTCOMES),
             fingerprint: z.string().optional(),
             evidence: z.array(z.object({ quote: z.string(), count: z.number(), occurrenceIds: z.array(z.string()).optional() })).optional(),
             reoffer: z.string().optional().describe(REOFFER_DESCRIPTION),
-            approval: z.object(approvalShape(z)).optional().describe("Native Ask receipt. Required for Apply or a non-current checkout. Decline requires a current native answer to the exact reviewed project change."),
+            approval: z.object(approvalShape(z)).optional().describe("Exact native Ask receipt. For multiple reviewed edits, send only kind, outcome and approval."),
+            proposal: proposalRefSchema(z).optional().describe("Only for Later deferred by the Ask cap. Send only kind, outcome, the exact Prepare reference, and optionally reoffer."),
             publication: z.object({
               writeToolCallId: z.string(),
               checkToolCallIds: z.array(z.string()),
               afterHash: z.unknown().describe("SHA-256 of the approved result, or null for removal."),
-            }).optional().describe("Applied only: the authorized owner write and subsequent completed check in the target checkout. Resolve does not write project files."),
-          }),
-          z.object({
-            kind: z.enum(["project-group"]),
-            outcome: z.enum(PROPOSAL_OUTCOMES),
-            approval: z.object(approvalShape(z)).optional().describe("One native Ask receipt for every destination."),
-            proposal: proposalRefSchema(z).optional().describe("Later without an Ask, when deferred by the cap."),
-            reoffer: z.string().optional().describe("Reason to revisit an overflow deferral."),
+            }).optional().describe("Single applied edit only: the authorized owner write and completed check. For multiple reviewed edits Resolve reads the observed receipts itself."),
           }),
           z.object({
             kind: z.enum(["profile"]),
@@ -526,7 +518,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const failures: string[] = [];
       const external = new Map<LedgerRecord, readonly string[]>();
       const refusedPublications = new Map<LedgerRecord, string>();
-      const projectGroups = new Map<LedgerRecord, ProjectEdit>();
+      const multiTargetEdits = new Map<LedgerRecord, ProjectEdit>();
       const projectFailures: string[] = [];
       const executableFailures: string[] = [];
       const refuseRecord = (record: LedgerRecord, reason: string) => {
@@ -535,9 +527,11 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       };
       const kept: string[] = [];
       let targetChanged = false;
-      const label = (answer: ResolveParams["outcomes"][number]) => answer.kind === "project" || answer.kind === "profile" ? `\`${answer.target?.path}\` (${answer.gist})`
-        : answer.kind === "harness" || answer.kind === "project-group" || answer.gist === undefined
-          ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
+      const label = (answer: ResolveParams["outcomes"][number]) => {
+        if (answer.kind === "profile" || (answer.kind === "project" && answer.target)) return `\`${answer.target?.path}\` (${answer.gist})`;
+        if (answer.kind !== "project" && answer.kind !== "harness" && answer.gist !== undefined) return `\`${answer.skill}\` (${answer.gist})`;
+        return `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\``;
+      };
       // Fail visibly on an unreadable or unmigrated store without making any internal publication.
       let openError: string | undefined;
       let storeExists = false;
@@ -549,20 +543,6 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const notAttempted = "not attempted because the observer store could not start recording";
 
       const validated = params.outcomes.flatMap((sent): ValidatedAnswer[] => {
-        if (sent.kind === "project-group") {
-          try {
-            for (const { record, edit } of projectGroupRecords(sent, ctx.sessionManager.getBranch(), timestamp, sessionId, projectFailures)) {
-              if (openError !== undefined && !record.publication) {
-                projectFailures.push(`\`${edit.file}\`: ${notAttempted}`);
-                continue;
-              }
-              outsideAmendments.push({ record });
-              projectGroups.set(record, edit);
-              if (record.publication) external.set(record, [edit.file]);
-            }
-          } catch (error) { projectFailures.push(`${label(sent)}: ${(error as Error).message}`); }
-          return [];
-        }
         if (openError !== undefined && (sent.outcome !== "applied" ||
           (sent.kind !== "project" && sent.kind !== "profile" && sent.kind !== "harness" && sent.publication === undefined))) {
           failures.push(`${label(sent)}: ${notAttempted}`);
@@ -570,11 +550,13 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         }
         if (sent.kind === "project") {
           try {
-            const record = projectRecord(sent, ctx.cwd, ctx.sessionManager.getBranch(), timestamp, sessionId);
-            outsideAmendments.push({ record });
-            if (record.publication) external.set(record, [join(record.target.root, record.target.path)]);
-          }
-          catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
+            const results = projectRecords(sent, ctx.cwd, ctx.sessionManager.getBranch(), timestamp, sessionId, projectFailures);
+            for (const { record, edit } of results) {
+              outsideAmendments.push({ record });
+              if (edit) multiTargetEdits.set(record, edit);
+              if (record.publication) external.set(record, [edit?.file ?? join(record.target.root, record.target.path)]);
+            }
+          } catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
           return [];
         }
         if (sent.kind === "profile") {
@@ -744,7 +726,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             }
             const harnessAnswered = new Set<string>();
             for (const { record: first, executable } of outsideAmendments) {
-              const projectEdit = projectGroups.get(first);
+              const projectEdit = multiTargetEdits.get(first);
               if (projectEdit && external.has(first)) {
                 try {
                   checkProjectState(projectEdit, false);
@@ -803,7 +785,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
               const carried = record.evidence ? undefined : inheritedEvidence.get(record.fingerprint);
               if (carried) record.evidence = carried;
             }
-            if (projectGroups.size === 0) {
+            if (multiTargetEdits.size === 0) {
               if (records.length > 0) putLedgerRecords(db, records);
             } else {
               for (let i = 0; i < records.length;) {
@@ -812,7 +794,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
                   putLedgerRecords(db, [record]);
                   i++;
                 } catch (error) {
-                  const edit = projectGroups.get(record);
+                  const edit = multiTargetEdits.get(record);
                   if (!edit || !db.inTransaction) throw error;
                   refuseRecord(record, `\`${edit.file}\`: ${(error as Error).message}`);
                   records.splice(i, 1);
@@ -853,7 +835,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const line = (record: LedgerRecord, rule = record.rule) => {
         const written = record.target === undefined && record.compaction && rule ? readReferenceFiles(referencesDir, record.skill) : [];
         return (
-          `- ${record.outcome} ${projectGroups.has(record) ? `\`${projectGroups.get(record)!.file}\` (project)` : targetLabel(record)}, fingerprint \`${record.fingerprint}\`: ${record.gist}` +
+          `- ${record.outcome} ${multiTargetEdits.has(record) ? `\`${multiTargetEdits.get(record)!.file}\` (project)` : targetLabel(record)}, fingerprint \`${record.fingerprint}\`: ${record.gist}` +
           (rule ? ` Rule file: \`${rule}\`.` : "") +
           (record.kind === "profile" && record.publication ? ` Verified published bytes: ${record.publication.verification}.` : "") +
           referenceFilesSentence(written)

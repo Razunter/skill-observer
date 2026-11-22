@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve as resolvePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { canonicalMissingPath, type HarnessPublication, harnessRootDirs, type ProfileLedgerRecord, type ProfileTarget, type ProjectPublication, type ProjectTarget, requireCheckedExecutableTarget } from "./ledger.js";
-import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
+import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence, type ToolAuthorization } from "./session-tool-evidence.js";
 import type { SessionEntry, ToolArguments, ToolCallEvent } from "./omp.js";
 import { scratchCheckAuthorization } from "./executable-check.js";
 import { checkExecutableState, type ExecutableEdit } from "./executable-publication.js";
@@ -39,13 +39,59 @@ function maybeStat(file: string) {
 }
 
 export function prepareProjectEdit(target: ProjectTarget, text: string | undefined, check: string): { change: ProjectEdit; preview: string } {
-  const words = typeof check === "string" ? plainWords(check) : [];
-  if (!words.length || /^(?:true|false|:|echo|printf|pwd|ls|cat|stat|hash|command|which|type|git|sh|bash|env|exit|sleep)$/.test(basename(words[0]!)) ||
-      words.some((word) => /^(?:--(?:help|version|dry-run|list-tests|skip-tests)(?:=|$)|-[hV]$)/.test(word))) {
-    throw new Error("a project edit needs one meaningful foreground check, not an informational command, a skipped check or a shell sequence");
+  if (!meaningfulProjectCheck(target, text, check)) {
+    throw new Error("a project edit needs one meaningful foreground check for the edited target, not an informational command, a skipped check or a shell sequence");
   }
   const { edit, preview } = prepareScalarFile(target, text);
   return { change: { ...edit, operation: "project-edit", rootIdentity: { path: target.root, id: fileId(lstatSync(target.root)) }, check }, preview: `${preview}\nVerify in ${target.root}: ${check}` };
+}
+
+function meaningfulProjectCheck(target: ProjectTarget, text: string | undefined, check: string): boolean {
+  const words = typeof check === "string" ? plainWords(check) : [];
+  const [program, mode, operand] = words;
+  const namesTarget = (path: string | undefined) => path !== undefined && !path.startsWith("-") &&
+    (path === target.path || path === `./${target.path}` || path === join(target.root, target.path));
+
+  if (program === "node" && mode === "--check") {
+    return words.length === 3 && text !== undefined &&
+      /\.(?:[cm]?js|[cm]?ts)$/.test(target.path) && namesTarget(operand);
+  }
+  if (program === "grep") {
+    const start = operand === "--" ? 3 : 2;
+    const literal = words[start];
+    return (mode === "-F" || mode === "-Fx") && words.length === start + 2 &&
+      !!literal && (start === 3 || !literal.startsWith("-")) && namesTarget(words[start + 1]) &&
+      (mode === "-Fx" ? text?.split("\n").includes(literal) : text?.includes(literal)) === true;
+  }
+  if (program === "test") {
+    return text === undefined && words.length === 4 && mode === "!" && operand === "-e" && namesTarget(words[3]);
+  }
+  if (program === "pytest") return words.length === 1;
+  const nodeTest = program === "node" && mode === "--test";
+  if (!nodeTest && program !== "bun") return false;
+  const bunMode = mode === "--no-env-file" ? 2 : 1;
+  if (!nodeTest && words[bunMode] === "run") {
+    return words.length === bunMode + 2 && /^(?:check|test|typecheck|lint)$/.test(words[bunMode + 1]!);
+  }
+  if (!nodeTest && words[bunMode] !== "test") return false;
+  const testFile = /[\w.-]+\.(?:test|spec)\.[cm]?[jt]sx?$/;
+  const nodeDiscoversTarget = nodeTest && isDefaultNodeTest(target.path);
+  const isTestTarget = nodeDiscoversTarget || testFile.test(target.path);
+  const testPathIndex = nodeTest ? 2 : bunMode + 1;
+  if (words.length === testPathIndex) return !nodeTest || !isTestTarget || (nodeDiscoversTarget && /\.[cm]?js$/.test(target.path));
+  const testPath = words[testPathIndex];
+  if (words.length !== testPathIndex + 1 || testPath === undefined || testPath.startsWith("-") ||
+      !/^(?:[\w.-]+\/)*[\w.-]+$/.test(testPath) || testPath.split("/").includes("..")) return false;
+  const isTestPath = nodeTest ? isDefaultNodeTest(testPath) || (/\.[cm]?[jt]s$/.test(testPath) && testFile.test(testPath))
+    : testFile.test(testPath);
+  if (!isTestPath) return false;
+  const selectsTarget = namesTarget(testPath) || (!nodeTest && !testPath.includes("/") && basename(target.path) === testPath);
+  return selectsTarget ? text !== undefined : !isTestTarget;
+}
+
+function isDefaultNodeTest(path: string): boolean {
+  return /\.[cm]?[jt]s$/.test(path) && !/(?:^|\/)node_modules\//.test(path) &&
+    (/(?:^|\/)test\//.test(path) || /(?:^test(?:-.*)?|[._-]test)\.[cm]?[jt]s$/.test(basename(path)));
 }
 
 export function prepareScalarFile(target: Pick<ProjectTarget, "root" | "path">, text: string | undefined) {
@@ -126,12 +172,14 @@ function exactOwnerCall(change: ScalarFileEdit, name: string | undefined, args: 
   return patch?.[1] === change.file;
 }
 
-export function projectToolAuthorization(event: ToolCallEvent, cwd: string, branch: readonly SessionEntry[], passStart: number): string | undefined {
+export function projectToolAuthorization(event: ToolCallEvent, cwd: string, branch: readonly SessionEntry[], passStart: number): ToolAuthorization | undefined {
   if (!["write", "edit", "bash"].includes(event.toolName)) return;
   const paths = ownerPaths(event.toolName, event.input, cwd);
   if (paths.length === 0 && event.toolName !== "bash") return;
   const evidence = sessionToolEvidence(branch);
   const entries = preparedProjectEntries(evidence, passStart);
+  const checks = event.toolName === "bash" ? new Set<string>() : undefined;
+  let checkError: unknown;
   for (const { reference, proposal } of entries) {
     const { change } = proposal;
     if (change.operation === "harness") {
@@ -150,16 +198,27 @@ export function projectToolAuthorization(event: ToolCallEvent, cwd: string, bran
         if (paths.length !== 1 || !exactOwnerCall(file, event.toolName, event.input)) {
           throw new Error("use the ordinary owner tool for the exact executable path and approved bytes or removal");
         }
-      } else if (pending.length > 0) {
-        throw new Error("finish the approved executable writes before the exact verification check");
+        checkExecutableState(change, pending);
+        return reference.contentHash;
       }
-      checkExecutableState(change, pending);
-      return reference.contentHash;
+      if (pending.length > 0) {
+        checkError ??= new Error("finish the approved executable writes before the exact verification check");
+        continue;
+      }
+      try {
+        checkExecutableState(change);
+        checks!.add(reference.contentHash);
+      } catch (error) {
+        checkError ??= error;
+      }
+      continue;
     }
     if (change.operation === "profile-edit") {
       const { target } = proposal;
       if (target.scope !== "profile") throw new Error("invalid profile publication target");
-      if (!paths.includes(change.file)) continue;
+      if (!paths.includes(change.file) && !(
+        change.installedCopy && paths.some((file) => canonicalMissingPath(file) === change.file)
+      )) continue;
       if (!findOwnerApproval(reference, evidence, branch, passStart)) throw new Error("the profile destination has no current native Apply");
       if (!exactOwnerCall(change, event.toolName, event.input) || paths.length !== 1) {
         throw new Error("use the normal write tool for the exact reviewed profile destination and content");
@@ -173,6 +232,7 @@ export function projectToolAuthorization(event: ToolCallEvent, cwd: string, bran
       }
       continue;
     }
+    if (proposal.kind !== "project") throw new Error("invalid project publication target");
     const edits = change.operation === "project-edits" ? change.edits : [{ target: proposal.target, change }];
     const write = event.toolName !== "bash";
     const matches = edits.filter(({ target, change }) => write ? paths.includes(change.file) : exactCheck(target, change.check, event.input));
@@ -202,14 +262,27 @@ export function projectToolAuthorization(event: ToolCallEvent, cwd: string, bran
       } else {
         checkProjectState(edit, true);
       }
-    } else {
-      const ownerWrite = ownerWriteLookup(evidence, reference.contentHash, approval.answeredAt);
-      const checked = matches.filter(({ change }) => ownerWrite(change));
-      if (!checked.length) continue;
-      if (checked.length === 1) checkProjectState(checked[0]!.change, false);
+      return reference.contentHash;
     }
-    return reference.contentHash;
+    const ownerWrite = ownerWriteLookup(evidence, reference.contentHash, approval.answeredAt);
+    const checked = matches.filter(({ change }) => ownerWrite(change));
+    if (!checked.length) continue;
+    try {
+      for (const { change: edit, target } of checked) {
+        if (!meaningfulProjectCheck(target, edit.text, edit.check)) {
+          throw new Error("the reviewed project check needs fresh Prepare and Apply with a meaningful foreground check");
+        }
+        checkProjectState(edit, false);
+      }
+      checks!.add(reference.contentHash);
+    } catch (error) {
+      checkError ??= error;
+    }
   }
+  // One stale approval must not hide an independent, valid check receipt.
+  if (checks?.size === 1) return checks.values().next().value;
+  if (checks?.size) return [...checks];
+  if (checkError !== undefined) throw checkError;
   for (const { proposal: { change, target } } of entries) {
     if (change.operation === "harness") {
       for (const file of paths) {
@@ -267,7 +340,7 @@ function unapprovedGroupDestination(evidence: SessionToolEvidence, passStart: nu
 }
 
 function exactCheck(target: { root: string }, command: string, args: ToolArguments): boolean {
-  return args.command === command && args.cwd === target.root && args.async !== true && args.name == null;
+  return args.command === command && args.cwd === target.root && args.async !== true && args.name == null && args.ready == null;
 }
 
 function ownerWriteTool(change: ScalarFileEdit): "edit" | "write" {
@@ -308,7 +381,7 @@ export function observedProjectPublication(target: ProjectTarget, change: Projec
     }
     throw new Error("untouched by this pass: no successful authorized owner write");
   }
-  const check = evidence.completedCalls("bash").findLast(({ observed }) => observed?.call.authorization === authorization &&
+  const check = evidence.completedCalls("bash").findLast(({ observed }) => observed && authorizedCheck(observed.call, authorization) &&
     observed.call.position > write.result.position && exactCheck(target, change.check, observed.call.args))?.observed;
   if (!check) throw new Error("written but unverified: the exact completed foreground check in this checkout is missing");
   const publication = { writeToolCallId: write.call.id, checkToolCallIds: [check.call.id], afterHash: change.afterHash };
@@ -316,9 +389,15 @@ export function observedProjectPublication(target: ProjectTarget, change: Projec
   return publication;
 }
 
-function approvedObservedCall(evidence: SessionToolEvidence, id: string, authorization: string, after: number): CompletedToolCall {
+function authorizedCheck(call: CompletedToolCall["call"], hash: string): boolean {
+  const { authorization } = call;
+  return call.name === "bash" && (typeof authorization === "string" ? authorization === hash : authorization?.includes(hash) === true);
+}
+
+function approvedObservedCall(evidence: SessionToolEvidence, id: string, authorization: string, after: number, check = false): CompletedToolCall {
   const { observed } = evidence.completedCall(id);
-  if (!observed || observed.call.authorization !== authorization || observed.call.position <= after ||
+  if (!observed || !(check ? authorizedCheck(observed.call, authorization) : observed.call.authorization === authorization) ||
+      observed.call.position <= after ||
       observed.result.isError !== false || observed.result.supplier?.source !== "builtin") {
     throw new Error(`\`${id}\` is not a successful observed owner call authorized after Apply`);
   }
@@ -337,7 +416,10 @@ export function checkProjectPublication(target: ProjectTarget, change: ProjectEd
   if (!exactOwnerCall(change, write.call.name, write.call.args)) throw new Error("the observed owner call is not the approved change");
   try {
     checkProjectState(change, false);
-    const check = approvedObservedCall(evidence, publication.checkToolCallIds[0]!, id, write.result.position);
+    if (!meaningfulProjectCheck(target, change.text, change.check)) {
+      throw new Error("the reviewed project check needs fresh Prepare and Apply with a meaningful foreground check");
+    }
+    const check = approvedObservedCall(evidence, publication.checkToolCallIds[0]!, id, write.result.position, true);
     checkForegroundCall(check, write.result.position, target.root, change.check);
   } catch (error) {
     throw new Error(`written but unverified: ${(error as Error).message}`);
@@ -353,7 +435,7 @@ export function checkProfilePublication(target: ProfileTarget, change: ProfileEd
   if (!exactOwnerCall(change, write.call.name, write.call.args)) throw new Error("the observed owner call is not the approved profile edit");
   const executed = write.result.input;
   if (!executed || typeof executed !== "object" || !("path" in executed) || !("content" in executed) ||
-      executed.path !== change.file || executed.content !== change.text) throw new Error("the owner result did not execute the reviewed profile destination and content");
+      executed.path !== change.file || executed.content !== change.text) throw new Error("The owner tool result does not show a write to the reviewed profile path with the reviewed content.");
   try {
     // Matching the exact bytes is a check on the published file, not a replay claim about a different draft.
     checkProfileState(target, change, false);
@@ -409,7 +491,7 @@ function writtenPaths({ call }: CompletedToolCall): string[] {
 
 /** `command`'s words when each is plain or single-quoted and split by spaces or tabs, so the shell passes them on as they read: no expansion, redirection, line break or second command. */
 function plainWords(command: string): string[] {
-  if (!/^[ \t]*(?:(?:'[^'\r\n]*'|[\w@%+=:,./-]+)(?:[ \t]+|$))+$/.test(command)) return [];
+  if (!/^[ \t]*(?:(?:'[^'\x00-\x08\x0a-\x1f\x7f]*'|[\w@%+=:,./-]+|!)(?:[ \t]+|$))+$/.test(command)) return [];
   return [...command.matchAll(/'([^']*)'|(\S+)/g)].map(([, quoted, plain]) => quoted ?? plain!);
 }
 
@@ -461,8 +543,8 @@ export function checkHarnessPublication(change: ExecutableEdit, publication: Har
     checkExecutableState(change);
     const after = Math.max(...written.map(({ result }) => result.position));
     const { observed: check } = evidence.completedCall(checkToolCallId);
-    if (!check || check.call.authorization !== id || check.call.position <= after ||
-        check.call.name !== "bash" || !exactCheck(change, change.check.command, check.call.args) ||
+    if (!check || !authorizedCheck(check.call, id) || check.call.position <= after ||
+        !exactCheck(change, change.check.command, check.call.args) ||
         check.result.supplier?.source !== "builtin") {
       throw new Error("the cited verification is not an exact observed foreground check authorized after the approved writes");
     }
@@ -474,17 +556,18 @@ export function checkHarnessPublication(change: ExecutableEdit, publication: Har
   }
 }
 
-function checkForegroundCall(check: CompletedToolCall, after: number, root: string, approved?: string): void {
+function checkForegroundCall(check: CompletedToolCall, after: number, root: string, approved: string): void {
   const checkArgs = check.call.args;
-  if (check.call.name !== "bash" || check.call.position <= after || typeof checkArgs.cwd !== "string" ||
-      canonical(checkArgs.cwd) !== canonical(root) || typeof checkArgs.command !== "string" || !checkArgs.command.trim() ||
-      checkArgs.async === true || checkArgs.name != null) throw new Error("verification must be a completed foreground check in the target root after its write");
-  if (approved !== undefined && checkArgs.command !== approved) throw new Error(`\`${checkArgs.command}\` is not the approved check \`${approved}\`: rerun it exactly`);
+  if (check.call.name !== "bash" || check.call.position <= after || checkArgs.cwd !== root ||
+      checkArgs.async === true || checkArgs.name != null || checkArgs.ready != null) throw new Error("verification must be a completed foreground check in the target root after its write");
+  if (checkArgs.command !== approved) throw new Error(`\`${checkArgs.command}\` is not the approved check \`${approved}\`: rerun it exactly`);
   const details = check.result.details;
   if (!details || typeof details !== "object" ||
       !(details.exitCode === 0 || typeof details.wallTimeMs === "number" && Number.isFinite(details.wallTimeMs) && details.wallTimeMs >= 0) ||
       ("exitCode" in details && details.exitCode !== 0) ||
       ("timedOut" in details && details.timedOut) || "async" in details || "service" in details ||
+      (details.toolCommands !== undefined && (!Array.isArray(details.toolCommands) || details.toolCommands.length > 0)) ||
+      (details.trace?.status !== undefined && details.trace.status !== 0) ||
       ("terminalId" in details && !("wallTimeMs" in details))) throw new Error("the check did not complete successfully");
 }
 

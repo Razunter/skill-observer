@@ -19,6 +19,8 @@ const HOOK_RESULT_TYPE = "skill-observer-tool-result";
 
 export type ToolEvidenceOrigin = "native" | "hook";
 
+export type ToolAuthorization = string | readonly string[];
+
 export interface ToolCallEvidence {
   readonly origin: ToolEvidenceOrigin;
   /** Index of the branch entry holding the request. */
@@ -26,7 +28,7 @@ export interface ToolCallEvidence {
   readonly id: string;
   readonly name: string | undefined;
   readonly args: ToolArguments;
-  readonly authorization?: string;
+  readonly authorization?: ToolAuthorization;
 }
 
 export interface ToolResultEvidence {
@@ -127,8 +129,11 @@ export function sessionToolEvidence(branch: readonly SessionEntry[]): SessionToo
  * Saves the hook copy of a starting call. Its native call is not on the branch
  * yet, so every call is copied; the views tell native ones apart later.
  */
-export function recordHookCall(pi: ExtensionAPI, event: ToolCallEvent, authorization?: string): void {
-  pi.appendEntry(HOOK_CALL_TYPE, { toolCallId: event.toolCallId, toolName: event.toolName, input: structuredClone(event.input), ...(authorization && { authorization }) });
+export function recordHookCall(pi: ExtensionAPI, event: ToolCallEvent, authorization?: ToolAuthorization): void {
+  const bound = authorization !== undefined &&
+    (event.toolName === "bash" ? toolSupplier(pi, "bash")?.source === "builtin" : typeof authorization === "string")
+    ? authorization : undefined;
+  pi.appendEntry(HOOK_CALL_TYPE, { toolCallId: event.toolCallId, toolName: event.toolName, input: structuredClone(event.input), ...(bound && { authorization: bound }) });
 }
 
 /** Saves the hook copy of a call's outcome when its start was copied; an outcome alone has no request to pair with. */
@@ -267,8 +272,13 @@ function callsIn(entry: SessionEntry, position: number): ToolCallEvidence[] {
   if (entry.type !== "custom" || entry.customType !== HOOK_CALL_TYPE || !data || typeof data !== "object" ||
       !("toolCallId" in data) || typeof data.toolCallId !== "string" || !("toolName" in data) || typeof data.toolName !== "string" ||
       !("input" in data) || !data.input || typeof data.input !== "object" || Array.isArray(data.input)) return [];
+  const authorization = "authorization" in data ? data.authorization : undefined;
+  const bound = typeof authorization === "string" ? authorization
+    : data.toolName === "bash" && Array.isArray(authorization) && authorization.length > 1 &&
+        authorization.every((hash): hash is string => typeof hash === "string" && /^[a-f0-9]{64}$/.test(hash))
+      ? authorization : undefined;
   return [{ origin: "hook", position, id: data.toolCallId, name: data.toolName, args: data.input as ToolArguments,
-    ...("authorization" in data && typeof data.authorization === "string" && { authorization: data.authorization }) }];
+    ...(bound !== undefined && { authorization: bound }) }];
 }
 
 function resultIn(entry: SessionEntry, position: number): ToolResultEvidence | undefined {

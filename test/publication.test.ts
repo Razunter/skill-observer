@@ -10,7 +10,7 @@ import { afterEach, expect, it, vi } from "vitest";
 import { registerResolveTool } from "../src/resolve.js";
 import { registerReviewTool } from "../src/review.js";
 import { OBSERVATION_MESSAGE_TYPE } from "../src/digest.js";
-import type { AskDetails, ExtensionAPI, ExtensionContext, Schema, SessionEntry, ToolDefinition, ToolResultDetails } from "../src/omp.js";
+import type { AskDetails, ExtensionAPI, ExtensionContext, SessionEntry, ToolDefinition, ToolResultDetails } from "../src/omp.js";
 import { type Evidence, harnessFingerprint, hookFileKey, projectFingerprint, proposalFingerprint, putLedgerRecords, readLedger, removalFingerprint, type HarnessLedgerRecord, type LedgerRecord } from "../src/ledger.js";
 import { readObserverStore, writeObserverStore } from "../src/observer-store.js";
 import { markObservationsShown, readPendingObservations, recordObservation } from "../src/observations.js";
@@ -25,6 +25,7 @@ import { projectToolAuthorization } from "../src/project-publication.js";
 import { observationPassStart } from "../src/proposal-approval.js";
 import { recordHookCall, recordHookResult } from "../src/session-tool-evidence.js";
 import { groundRepairs } from "./grounding.js";
+import { zod } from "./host-schema.js";
 import { makeSkillHome } from "./skill-home.js";
 
 const renameFault = vi.hoisted(() => ({ check: undefined as ((from: PathLike, to: PathLike) => void) | undefined }));
@@ -58,8 +59,6 @@ function fixture() {
   const { home, roots } = makeSkillHome(); homes.push(home);
   mkdirSync(roots.cwd, { recursive: true });
   vi.stubEnv("HOME", home); vi.stubEnv("PI_CODING_AGENT_DIR", join(home, ".omp/agent"));
-  const schema: Schema = { optional: () => schema, describe: () => schema };
-  const zod = Object.fromEntries(["object", "array", "string", "number", "enum", "union", "record", "unknown"].map(name => [name, () => schema]));
   type Selected = { reference: unknown; proposal: { candidateId: string; gist: string; preview: string; alternatives?: Array<{ change: { operation: string }; preview: string }> } };
   type Details = { failures: string[]; deferred: string[]; cleanup: string[]; records: LedgerRecord[]; publications: unknown[]; selected: Selected[]; recording: { rows: string[]; error?: string } };
   const tools: Record<string, ToolDefinition<unknown, Details>> = {};

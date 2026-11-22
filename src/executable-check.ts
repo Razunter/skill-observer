@@ -15,10 +15,12 @@ export interface ExecutableCheck {
   readonly proof: string;
 }
 
-type CheckPlan = { kind: "extension" } | { kind: "hook"; hook: string; samples: string; absent: boolean };
+type ExtensionRunner = "bun" | "node" | "vitest" | "typescript";
+type CheckPlan = { kind: "extension"; runner: ExtensionRunner } | { kind: "hook"; hook: string; samples: string; absent: boolean };
 type Snapshot = Map<string, string>;
 const DIRECTORY = "directory";
-const EXTENSION_COMMAND = "bun --no-env-file test";
+const BUN_TEST = "bun --no-env-file test";
+const TYPECHECK = "tsc --project tsconfig.json --noEmit --noCheck false --listFiles";
 const AUTHORIZATION = "scratch-check-v1:";
 const MAX_BYTES = 16 * 1024 * 1024;
 const MAX_ENTRIES = 2048;
@@ -52,7 +54,7 @@ export function prepareExecutableCheck(kind: "hook" | "extension", files: readon
   }
   if (plan.kind !== kind || !isAbsolute(targetRoot) || resolve(targetRoot) !== targetRoot ||
       targetRoot === scratch || isWithin(targetRoot, scratch) || isWithin(scratch, targetRoot)) {
-    throw new Error("run the supported check in independent scratch for the reviewed executable owner");
+    throw new Error("Run the supported check for this hook or extension in a scratch directory separate from the destination. Neither directory can contain the other.");
   }
   const pending = new Set<string>();
   for (const { path, text } of files) {
@@ -73,7 +75,7 @@ export function prepareExecutableCheck(kind: "hook" | "extension", files: readon
   const plain = stripVTControlCharacters(output);
   const passed = plan.kind === "hook"
     ? /^OK: ([1-9]\d*) of \1 samples as expected$/m.test(plain)
-    : Number([...plain.matchAll(/^[ \t]*(\d+) pass[ \t]*$/gm)].at(-1)?.[1]) > 0;
+    : extensionPassed(plan.runner, plain, scratch, pending, snapshot);
   if (!passed || /[\r\0]/u.test(output)) {
     throw new Error("the observed result does not show a meaningful successful check");
   }
@@ -84,7 +86,7 @@ export function checkExecutableInputs(check: ExecutableCheck): void {
   reviewedScratch(check);
 }
 
-/** Pending paths are the approved writes still to be made. With none, require the actual complete postimage. */
+/** Pending paths still need their approved writes. When none remain, require the entire published extension tree to match the checked result. */
 export function checkPublishedExecutableInputs(check: ExecutableCheck, root: string, pendingPaths: readonly string[] = []): void {
   const { plan, snapshot } = reviewedScratch(check);
   if (plan.kind === "extension") compareExtension(snapshot, root, new Set(pendingPaths));
@@ -121,16 +123,24 @@ function scratchInputs(command: unknown, scratch: unknown) {
       !/^omp-observe-check\.[A-Za-z0-9_-]+$/.test(basename(scratch)) || dirname(scratch) !== realpathSync(tmpdir())) {
     throw new Error("run the check in a fresh private omp-observe-check.* child of the system temporary directory");
   }
-  const plan = checkPlan(command, scratch);
+  const requested = checkPlan(command, scratch);
   const root = canonicalDirectory(scratch);
   if (root.uid !== process.getuid?.() || (root.mode & 0o077) !== 0) throw new Error("the scratch directory must be private and owned by this user");
-  const snapshot = snapshotTree(scratch, plan.kind === "extension");
+  let manifest: Buffer | undefined;
+  const snapshot = snapshotTree(scratch, requested.kind === "extension", "script" in requested ? bytes => { manifest = bytes; } : undefined);
+  const plan: CheckPlan = "script" in requested
+    ? { kind: "extension", runner: configuredRunner(requested.script, manifest) }
+    : requested;
+  if (plan.kind === "extension" && plan.runner === "typescript" &&
+      (!snapshot.has("tsconfig.json") || snapshot.get("tsconfig.json") === DIRECTORY)) {
+    throw new Error("the TypeScript check requires a tsconfig.json in scratch");
+  }
   let checker: string | undefined;
   if (plan.kind === "hook") {
     const files = [plan.samples, ...(plan.absent ? [] : [plan.hook])];
     if (plan.samples === plan.hook || files.some(path => !snapshot.has(path) || snapshot.get(path) === DIRECTORY) ||
         (plan.absent && snapshot.has(plan.hook))) {
-      throw new Error("the scratch hook check needs its own samples file and the exact hook presence or absence");
+      throw new Error("Supply a separate samples file for the scratch hook check. Include the hook file for an edit, or leave it absent for a removal.");
     }
     // A hook is a single file. Additional scratch source must not influence the replay.
     for (const [path, entry] of snapshot) {
@@ -144,8 +154,11 @@ function scratchInputs(command: unknown, scratch: unknown) {
   return { plan, proof, snapshot, command, scratch };
 }
 
-function checkPlan(command: string, scratch: string): CheckPlan {
-  if (command === EXTENSION_COMMAND) return { kind: "extension" };
+function checkPlan(command: string, scratch: string): CheckPlan | { kind: "extension"; script: string } {
+  const runner = extensionRunner(command);
+  if (runner) return { kind: "extension", runner };
+  const script = packageScript(command);
+  if (script) return { kind: "extension", script };
   // Reconstruct the full command from literal shell words so unrecognized syntax never disappears during tokenization.
   const words = command.length <= 16_384 && command.startsWith("bun --no-env-file ")
     ? command.match(/[A-Za-z0-9_./-]+|'[^'\x00-\x1f\x7f]+'/g) ?? []
@@ -159,11 +172,70 @@ function checkPlan(command: string, scratch: string): CheckPlan {
   if (bun !== "bun" || flag !== "--no-env-file" || unquote(checkerArg) !== HOOK_CHECK_PATH ||
       words.join(" ") !== command || tail.length !== (absent ? 3 : 2) ||
       !hook || hook.startsWith("-") || !plainRelative(hook) || !samples || !isWithin(scratch, samples)) {
-    throw new Error(`unsupported executable check; use ${EXTENSION_COMMAND} or the bundled check-hook.ts with literal paths`);
+    throw new Error("unsupported executable check; use a supported project test or typecheck, or the bundled check-hook.ts with literal paths");
   }
   const samplePath = relative(scratch, samples);
   if (!plainRelative(samplePath) || join(scratch, samplePath) !== samples) throw new Error("the samples path must be canonical and under scratch");
   return { kind: "hook", hook, samples: samplePath, absent };
+}
+
+function extensionRunner(command: unknown): ExtensionRunner | undefined {
+  switch (command) {
+    case BUN_TEST: return "bun";
+    case "node --test":
+    case "node --test --test-reporter=tap":
+    case "node --test --test-reporter=spec": return "node";
+    case "vitest run":
+    case "bun --no-env-file --bun x vitest run": return "vitest";
+    case TYPECHECK: return "typescript";
+    default: return undefined;
+  }
+}
+
+function packageScript(command: string): string | undefined {
+  if (command === "npm test") return "test";
+  return /^(?:npm|bun) run (check|test|typecheck)(?![\s\S])/u.exec(command)?.[1];
+}
+
+function configuredRunner(script: string, bytes: Buffer | undefined): ExtensionRunner {
+  if (!bytes) throw new Error("the configured extension check needs a package.json in scratch");
+  let scripts: Record<string, unknown> | undefined;
+  try {
+    scripts = (JSON.parse(bytes.toString("utf8")) as { scripts?: Record<string, unknown> } | null)?.scripts;
+  } catch {
+    throw new Error("the configured extension check needs a valid JSON package.json in scratch");
+  }
+  const body = (name: string) => scripts && !Object.hasOwn(scripts, `pre${name}`) && !Object.hasOwn(scripts, `post${name}`)
+    ? scripts[name]
+    : undefined;
+  const command = body(script);
+  let runner = extensionRunner(command);
+  if (!runner && script === "check" && typeof command === "string") {
+    // A fixed typecheck-then-test recipe still needs a supported test with a passing summary.
+    if (/^tsc --noEmit && (?:npm test|npm run test|bun run test)(?![\s\S])/u.test(command)) runner = extensionRunner(body("test"));
+    if (runner === "typescript") runner = undefined;
+  }
+  if (!runner) throw new Error(`package.json script ${script} must run a supported check without pre/post scripts`);
+  return runner;
+}
+
+function extensionPassed(runner: ExtensionRunner, output: string, scratch: string, pending: ReadonlySet<string>, snapshot: Snapshot): boolean {
+  switch (runner) {
+    case "bun": return Number([...output.matchAll(/^[ \t]*(\d+) pass[ \t]*$/gm)].at(-1)?.[1]) > 0;
+    case "node": return /^(#|ℹ) tests [1-9]\d*\n\1 suites \d+\n\1 pass [1-9]\d*\n\1 fail 0\n\1 cancelled 0\n\1 skipped \d+\n\1 todo \d+$/mu.test(output);
+    case "vitest": return /^[ \t]*Test Files[ \t]+[1-9]\d* passed(?:[ \t]+\|[ \t]+\d+ skipped)?[ \t]+\(\d+\)[ \t]*\n[ \t]*Tests[ \t]+[1-9]\d* passed(?:[ \t]+\|[ \t]+\d+ (?:skipped|todo))*[ \t]+\(\d+\)[ \t]*$/m.test(output);
+    case "typescript": {
+      const listed = new Set(output.split("\n"));
+      let sourceCount = 0;
+      for (const path of pending) {
+        if (path === "tsconfig.json" || path === "package.json") continue;
+        if (/\.d\.(?:[cm]?ts|[^/]+\.ts)$/u.test(path)) throw new Error("declaration changes require passing tests; a typecheck can list unchecked declarations");
+        if (!/\.(?:[cm]?ts|tsx)$/u.test(path) || !snapshot.has(path) || !listed.has(join(scratch, path))) return false;
+        sourceCount++;
+      }
+      return sourceCount > 0;
+    }
+  }
 }
 
 function plainRelative(path: string): boolean {
@@ -200,14 +272,14 @@ function compareExtension(scratch: Snapshot, root: string, pending: ReadonlySet<
     }
   }
   for (const [path, entry] of scratch) {
-    if (target.get(path) !== entry) throw new Error(`the extension check did not run against the reviewed postimage: ${path}`);
+    if (target.get(path) !== entry) throw new Error(`This path in the extension check does not match what the reviewed change would publish: ${path}`);
   }
   for (const path of target.keys()) {
     if (!scratch.has(path)) throw new Error(`the scratch check omitted an extension input: ${path}`);
   }
 }
 
-function snapshotTree(root: string, extension: boolean): Snapshot {
+function snapshotTree(root: string, extension: boolean, inspectManifest?: (bytes: Buffer) => void): Snapshot {
   const entries: Snapshot = new Map();
   const budget = { left: MAX_BYTES };
   let count = 0;
@@ -226,7 +298,7 @@ function snapshotTree(root: string, extension: boolean): Snapshot {
           entries.set(path, DIRECTORY);
           walk(path, depth + 1);
         } else {
-          entries.set(path, fileDigest(absolute, budget));
+          entries.set(path, fileDigest(absolute, budget, path === "package.json" ? inspectManifest : undefined));
         }
       }
     } finally {
@@ -237,7 +309,7 @@ function snapshotTree(root: string, extension: boolean): Snapshot {
   return entries;
 }
 
-function fileDigest(path: string, budget: { left: number }): string {
+function fileDigest(path: string, budget: { left: number }, inspect?: (bytes: Buffer) => void): string {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const before = fstatSync(fd);
@@ -254,6 +326,7 @@ function fileDigest(path: string, budget: { left: number }): string {
     if (after.size !== before.size || after.ctimeMs !== before.ctimeMs || after.mtimeMs !== before.mtimeMs) {
       throw new Error(`executable check input changed during inspection: ${path}`);
     }
+    inspect?.(bytes);
     return `${before.mode & 0o111 ? "x" : "-"}:${digest(bytes)}`;
   } finally {
     closeSync(fd);

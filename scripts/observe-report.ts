@@ -53,7 +53,10 @@ try {
   });
   process.env.PI_CODING_AGENT_DIR = agentDir;
 
-  const schema: Schema = { optional: () => schema, describe: () => schema };
+  const schema: Schema = {
+    optional: () => schema, describe: () => schema,
+    safeParse: () => ({ success: false, error: { message: "observe-report does not dispatch tools", issues: [] } }),
+  };
   const builder = () => schema;
   const commands: Record<string, CommandHandler> = {};
   const pi = {

@@ -8,14 +8,14 @@ import { scratchCheckAuthorization } from "../src/executable-check.js";
 import { harnessFingerprint, type LedgerRecord, projectFingerprint, type ProjectTarget, proposalFingerprint, putLedgerRecords } from "../src/ledger.js";
 import type { PreparedProposalRef } from "../src/review.js";
 import { writeObserverStore } from "../src/observer-store.js";
-import type { ExtensionAPI, ExtensionContext, Schema, SessionEntry, ToolArguments, ToolDefinition, ToolResultDetails } from "../src/omp.js";
+import type { ExtensionAPI, ExtensionContext, SessionEntry, ToolArguments, ToolDefinition, ToolResultDetails } from "../src/omp.js";
 import { HOOK_CHECK_PATH } from "../src/payload.js";
 import { registerReviewTool } from "../src/review.js";
 import { recordHookCall, recordHookResult } from "../src/session-tool-evidence.js";
+import { zod } from "./host-schema.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-const schema: Schema = { optional: () => schema, describe: () => schema };
 const model = { provider: "fixture", id: "explicit-judge" };
 const projectRepair = (gist: string, quote: string, count: number, remedy = "Other fix") =>
   ({ kind: "project", gist, priority: "evidence", remedy, change: { operation: "project-edit", text: `New check: ${gist}\n`, check: "bun test" }, evidence: [{ quote, count }] });
@@ -36,7 +36,7 @@ function host(options: { assignment?: string; settings?: boolean; models?: boole
   const builtins = ["bash", "write", "edit"].map((name) => ({ name, sourceInfo: { source: "builtin", path: `<builtin:${name}>` } }));
   const branch: SessionEntry[] = [{ type: "custom_message", id: "observe", customType: "skill-observer", content: "Observation pass." }];
   const pi = {
-    zod: { object: () => schema, array: () => schema, string: () => schema, number: () => schema, enum: () => schema, union: () => schema, unknown: () => schema, record: () => schema },
+    zod,
     ...(options.settings !== false && { pi: {
       settings: { getModelRole(role: string) {
         expect(role).toBe("judge");

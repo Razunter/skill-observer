@@ -59,9 +59,9 @@ Install these skills separately. Ordinary observation works without them. See [o
 ## Defaults and limits
 
 - **Interactive review:** `/observe` requires a main session with UI. Amendment delivery also runs in subagents and headless sessions, but requires the extension to stay loaded.
-- **Exact approval:** one native **Apply** covers only the reviewed changes at the named destinations. Project edits can span explicitly scoped checkouts. Profile edits stay in the active OMP profile. Hooks and owned extension source need a passing scratch check before the form. Apply grants no new permissions and does not restart OMP, commit, or deploy.
+- **Exact approval:** one native **Apply** covers only the reviewed changes at the named destinations. Project edits can span explicitly scoped checkouts. Ordinary profile edits stay in the active OMP profile. Hooks and owned extension source need a passing scratch check before the form. Apply grants no new permissions and does not restart OMP, commit, or deploy.
   If a necessary check or owner tool is unavailable, the pass reports the blocker instead of asking you to approve.
-- **Installed skills:** prefer configuration, amendments, or an owned source checkout over editing an installed copy. A direct edit to an installed upstream or plugin skill is an opt-in last resort for a copy inside the active profile. Updates can overwrite it.
+- **Installed skills:** prefer configuration, amendments, or an owned source checkout. Edit an installed upstream or plugin skill only as a last resort, only if you opt in, and only in the exact file inspected. Updates can overwrite the edit.
 - **Instruction delivery, not guaranteed compliance:** amendments add guidance to the model's context. Pattern rules are checked against their supplied samples, not proven correct for every possible output.
 - **Existing state:** the extension does not import old proposal or observation files on load. Use the [one-time migration](docs/setup.md#migrate-existing-observer-state). Loading may still [migrate legacy amendment files](docs/amendments.md).
 

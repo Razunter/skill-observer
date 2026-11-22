@@ -9,8 +9,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readLedger, readLedgerDecision } from "../src/ledger.js";
 import { readPendingObservations, recordObservation } from "../src/observations.js";
 import { observerStorePath, readObserverStore, writeObserverStore } from "../src/observer-store.js";
-import type { ExtensionAPI, ExtensionContext, Schema, ToolDefinition } from "../src/omp.js";
+import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "../src/omp.js";
 import skillObserver from "../src/skill-observer.js";
+import { zod } from "./host-schema.js";
 
 const script = fileURLToPath(new URL("../scripts/migrate-observer-store.ts", import.meta.url));
 let root: string;
@@ -163,8 +164,6 @@ describe("observer store migration", () => {
 
     vi.stubEnv("HOME", root);
     vi.stubEnv("PI_CODING_AGENT_DIR", agent);
-    const schema: Schema = { optional: () => schema, describe: () => schema };
-    const zod = Object.fromEntries(["object", "array", "string", "number", "enum", "union", "record", "unknown"].map((name) => [name, () => schema]));
     const tools = new Map<string, ToolDefinition<{ text: string }, undefined>>();
     skillObserver({
       zod,

@@ -18,7 +18,7 @@ For a hook, put its one exact proposed file at its target-relative path in scrat
 
 Run `bun --no-env-file '<bundled check-hook.ts path>' '<root-relative hook path>' '<absolute scratch sample path>'`. The bundled checker loads the hook and fails if it rewrites a tool call or result. For hook removal, leave the hook absent in scratch, use `--absent` before the hook path and expect both sampled events to be untouched.
 
-For an extension, copy the owned source into scratch, excluding `.git` and `node_modules`; apply the exact draft there. Run `bun --no-env-file test` against a suite that exercises the observed failure and its legitimate counterpart. Prepare compares the checked tree with the complete proposed postimage; do not omit unchanged source, config or test inputs. If a necessary check cannot run without widening permission, or the preview cannot match the checked inputs, report the finding, owner and next action. Do not Ask or record a decision.
+For an extension, copy the owned source into scratch, excluding `.git` and `node_modules`, then apply the exact draft there. Run a supported foreground test such as `bun --no-env-file test`, `node --test` or `vitest run` against the mistake and its legitimate counterpart. Configured scripts and TypeScript-only checks have additional requirements in [the check guide](docs/observation.md#checked-omp-hooks-and-extension-source). Prepare checks that the entire tree used in the check matches the proposed result, including unchanged source, configuration, and test inputs. If the check cannot run with ordinary permissions or the preview cannot match the checked inputs, report the finding, owner and next action.
 
 ## Ask once, publish and record
 

@@ -306,6 +306,9 @@ export interface SendMessageOptions {
 export interface Schema {
   optional(): Schema;
   describe(description: string): Schema;
+  safeParse(value: unknown):
+    | { success: true; data: unknown }
+    | { success: false; error: { message: string; issues: readonly { path: readonly PropertyKey[] }[] } };
 }
 
 export interface SchemaBuilder {

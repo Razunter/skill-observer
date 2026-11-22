@@ -32,7 +32,7 @@ import { CHECK_TOOL_NAME, registerCheckTool } from "./replay.js";
 import { RESOLVE_TOOL_NAME, registerResolveTool } from "./resolve.js";
 import { hasReviewedPublication, registerReviewTool, reviewSelectionForForm, REVIEW_TOOL_NAME } from "./review.js";
 import { evidenceReport, renderEvidenceReport } from "./report.js";
-import { recordHookCall, recordHookResult, sessionToolEvidence } from "./session-tool-evidence.js";
+import { recordHookCall, recordHookResult, sessionToolEvidence, type ToolAuthorization } from "./session-tool-evidence.js";
 import { projectToolAuthorization } from "./project-publication.js";
 import { projectScopeNote } from "./project-scope.js";
 import { countPendingObservations, markObservationsShown, type Observation, readPendingObservations, recordObservation } from "./observations.js";
@@ -108,7 +108,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
     try {
       const nativeAsk = event.toolName === "ask" && event.parentToolCallId === undefined;
       const ownerWrite = ["write", "edit", "manage_skill"].includes(event.toolName);
-      let authorization: string | undefined;
+      let authorization: ToolAuthorization | undefined;
       if ((nativeAsk || ownerWrite || event.toolName === "bash") && isObservable(ctx)) {
         const branch = ctx.sessionManager.getBranch();
         const passStart = observationPassStart(branch);

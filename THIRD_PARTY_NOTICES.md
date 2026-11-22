@@ -11,7 +11,7 @@ The original TypeScript implementation, tests, and project documentation are lic
 - Source: <https://github.com/rebelytics/one-skill-to-rule-them-all>.
 - Licence: [Creative Commons Attribution 4.0 International](https://creativecommons.org/licenses/by/4.0/legalcode.en), including its Section 5 disclaimer of warranties and limitation of liability.
 
-`observer.md` adapts task-observer's session-observation and skill-improvement workflow for OMP. Changes include explicit `/observe` invocation, discovery from completed session work, staged instructions, OMP session digests, provenance-aware skill amendments, evidence-backed approval of exact changes, and sample-based rule replay. The upstream attribution and CC BY 4.0 licence remain applicable to the adapted instructions; the MIT licence does not replace them.
+`observer.md` adapts task-observer's session-observation and skill-improvement workflow for OMP. Changes include explicit `/observe` invocation, discovery from completed session work, and instructions delivered by stage. The adaptation uses OMP session digests and accounts for skill provenance when handling amendments. It ties approval to exact changes supported by evidence and replays rules against samples. The upstream attribution and CC BY 4.0 licence remain applicable to the adapted instructions; the MIT licence does not replace them.
 
 ### Reviewed upstream revision
 

@@ -36,7 +36,7 @@ The digest is an index, not the limit of the review. The agent starts with the a
 
 ## Review and approval
 
-Prepare gives each eligible draft a reference and lists rejected drafts separately with reasons. A bad draft does not invalidate an unrelated one. A shared pass or receipt failure leaves no usable batch. Dependent changes, such as a compaction and the fixes it covers, must still agree before they can reach the form.
+Prepare gives each eligible draft a reference and lists rejected drafts separately with reasons. A bad draft does not invalidate an unrelated one. If the pass itself or a receipt shared by the drafts fails, none of the drafts can proceed. Dependent changes, such as a compaction and the fixes it covers, must still agree before they can reach the form.
 
 Select uses the eligible references to build one native `ask` form with at most five questions. Stale amendments come first, then User note proposals, evidence-backed proposals, and compactions. Each question shows the remedy, evidence, target, and preview. Ordinary options are **Apply**, **Later**, and **Decline**. Stale amendments show **Keep** and the available **Update** or **Delete** options. Withdrawals and hook removals show **Apply** and **Decline**. Nothing is preselected.
 
@@ -143,17 +143,17 @@ Merge evidence for the same scoped mechanism. Prefer a direct fix to a duplicate
 
 The current checkout is in scope by default. To add another checkout, put `Include project root: /absolute/canonical/root` on its own line in your current instruction or User note. To add a worktree of the current repository by branch name, use `Include worktree: <branch>`. A path in a transcript, tool result, or scout report is not permission to inspect or edit another repository. Scope does not grant filesystem access.
 
-A project proposal can cover one mechanism in multiple explicitly scoped checkouts. The form names every destination and shows the before and after text and the check for each file. The changes can differ by checkout. One Apply covers that set, not a subset chosen later or a substitute path. The agent checks each target's identity and before-state before publishing. If a destination changes, it reports what has already happened and asks again before publishing to revised scope.
+A project proposal can cover one mechanism affecting multiple files in one or more explicitly scoped checkouts. The form names every destination and shows the before and after text and the check for each file. One Apply covers that set. The agent checks each target's identity and before-state before publishing. If a destination changes, it reports what has already happened and asks again before publishing to revised scope.
 
-Project files use the reviewed owner write or removal and a meaningful foreground check in the target checkout. A deterministic check should exercise the observed mistake and a legitimate counterpart using temporary inputs. For a documentation change, a check that inspects the changed guidance or follows the new pointer can be enough. A generic success or status check is not evidence. The agent reports each destination separately, including untouched files, writes that could not be verified, and verified publications. One failure does not erase another destination's verified result. Apply does not roll back or repeat a write.
+For project files, use the normal owner tool for the reviewed write or removal, then run a meaningful foreground check in the target checkout. A deterministic check should exercise the observed mistake and a legitimate counterpart using temporary inputs. For a documentation change, a check that inspects the changed guidance or follows the new pointer can be enough. A generic success or status check is not evidence. The agent reports each destination separately, including untouched files, writes that could not be verified, and verified publications. One failure does not erase another destination's verified result. Apply does not roll back or repeat a write.
 
-Profile edits stay in the active OMP agent directory. Supported targets include root guidance such as `AGENTS.md`, Markdown in the profile's guidance directories, existing hand-written rules, and the skill controls below. The preview shows the exact replacement, the profile-wide impact, and when OMP will load it:
+Ordinary profile edits stay in the active OMP agent directory. Supported targets include root guidance such as `AGENTS.md`, Markdown in the profile's guidance directories, existing hand-written rules, and the skill controls below. The preview shows the exact replacement, the profile-wide impact, and when OMP will load it:
 
 - For guidance, the check identifies a decisive passage the edit introduces or removes.
 - For an existing hand-written rule, the edit preserves user ownership. A pattern change needs a replay of the exact draft against the observed mistake and a legitimate counterpart.
 - For a skill setting, `skills.manualSkills` keeps manual invocation available and `disabledExtensions: ["skill:<name>"]` disables the skill. The edit uses the active `config.yml` or `config.yaml` and preserves unrelated settings. Project settings can override profile arrays.
 
-Prefer a suitable setting, an amendment, or a change to owned source over editing an installed skill. If none fits and the installed upstream or plugin skill file is inside the active profile, use `/observe allow-installed-copy <skill>` to permit the pass to propose that exact edit. The edit still needs a current-guidance inspection and Apply. An update can overwrite it.
+Prefer a suitable setting, an amendment, or a change to owned source over editing an installed skill. If none fits, use `/observe allow-installed-copy <skill>` to let the pass propose an edit to the exact inspected upstream or plugin skill file. This can be outside the active agent directory. The edit still needs a current-guidance inspection and Apply. An update can overwrite it.
 
 ## Report items
 
@@ -170,7 +170,7 @@ The agent drafts in a private temporary directory outside the target. It uses or
 The supported checks are:
 
 - **Hooks.** The bundled [`check-hook.ts`](../scripts/check-hook.ts) replays the observed mistake and a legitimate counterpart against a stand-in host. It checks whether the hook blocks a call, adds context, or leaves an event untouched. A removal uses its `--absent` mode. These checks do not prove how the hook will behave in a running session.
-- **Extensions.** `bun --no-env-file test` must observe at least one passing test against a scratch copy that matches the reviewed result. The pass cannot accept an arbitrary substitute command, a symlinked input tree, or a tree beyond the check's inspection limits. A passing test does not establish that the extension loads in a real OMP session.
+- **Extensions.** The direct test commands are `bun --no-env-file test`, `node --test` (optionally `--test-reporter=tap` or `--test-reporter=spec`), `vitest run`, and `bun --no-env-file --bun x vitest run`. They must report passing tests. `npm test` or `npm run` and `bun run` with `check`, `test` or `typecheck` must name a supported recipe in the checked `package.json`, without matching lifecycle scripts. For a TypeScript-only change, `tsc --project tsconfig.json --noEmit --noCheck false --listFiles` must list each changed source. Use passing tests for declaration files, removals, and changes that typechecking does not cover. Prepare checks the exact scratch tree against the proposed result. A passing check does not prove the extension loads in OMP.
 
 A successful check is not a sandbox. Hook and extension code runs with the runner's existing permissions. Apply does not load the code, restart OMP, commit, or deploy. The change takes effect when OMP next loads the code. If a faulty hook stops the agent from using its tools, remove or restore the reviewed hook file outside OMP, then restart OMP.
 
