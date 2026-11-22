@@ -16,14 +16,17 @@
 
 import type { Database } from "bun:sqlite";
 import { existsSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join } from "node:path";
 import { isPinKind, type RuleDirs } from "./amendments.js";
 import {
   ANSWER_OUTCOMES,
   type AnswerOutcome,
   type Evidence,
   type LedgerRecord,
-  canonicalPathIn,
+  canonicalProfileTarget,
+  profileFingerprint,
+  type ProfileTarget,
+  type ProfileLedgerRecord,
   canonicalProjectTarget,
   projectFingerprint,
   type ProjectTarget,
@@ -55,10 +58,12 @@ import { createProvenanceResolver, defaultSkillRoots, type ProvenanceResolver } 
 import { readReferenceFiles, referenceFilesSentence } from "./references.js";
 import { replay } from "./replay.js";
 import { type FixDraft, fixRule } from "./publication.js";
-import { checkHarnessPublication, checkProjectPublication, checkSkillEditPublication, type SkillEditPublication } from "./project-publication.js";
-import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, approvedProject, laterNote, latestPrepared, observationPassStart, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
+import { checkHarnessPublication, checkProfilePublication, checkProjectPublication, checkProjectState, checkSkillEditPublication, type HarnessFileFailure, observedProjectPublication, type ProjectEdit, type SkillEditPublication } from "./project-publication.js";
+import { checkExecutableState, type ExecutableEdit } from "./executable-publication.js";
+import { type AnswerApproval, type ApprovalEvidence, approvalShape, approvedChange, type ApprovedChange, approvedDirectEdit, approvedHarness, approvedProfile, approvedProject, findProjectApproval, laterNote, latestPrepared, observationPassStart, preparedInPass, type ProposalAnswerRef, TargetChangedError } from "./proposal-approval.js";
 import { loadInstructionStage, type ToolResultCondition, whatToDoNow } from "./payload.js";
-import { isProposalRef, overflowDeferral, type PreparedProposal, type PreparedProposalRef, proposalRefSchema } from "./review.js";
+import { projectRootScope } from "./project-scope.js";
+import { isProposalRef, overflowDeferral, preparedProjectEntries, type PreparedProposal, type PreparedProposalRef, proposalRefSchema } from "./review.js";
 import { type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 
 export const RESOLVE_TOOL_NAME = "observer_resolve";
@@ -100,12 +105,26 @@ interface ProjectAnswer {
   publication?: ProjectPublication;
   rule?: never;
 }
-/**
- * The answer to an observer hook or companion proposal: a Later or Decline of
- * any stage cites the prepared proposal; an applied one cites the user's
- * Apply of its code stage and the receipts of its publication, or the Apply
- * of a hook removal, recorded once the file is gone.
- */
+
+interface ProjectGroupAnswer {
+  kind: "project-group";
+  outcome: ProposalOutcome;
+  approval?: ProposalAnswerRef;
+  proposal?: PreparedProposalRef;
+  reoffer?: string;
+}
+
+interface ProfileAnswer {
+  kind: "profile";
+  target: ProfileTarget;
+  gist: string;
+  outcome: ProposalOutcome;
+  approval?: ProposalAnswerRef;
+  proposal?: PreparedProposalRef;
+  publication?: { writeToolCallId: string; afterHash: string };
+  reoffer?: string;
+}
+/** A checked executable answer cites the native decision, or the overflow receipt when not asked. */
 interface HarnessAnswer {
   kind: "harness";
   proposal?: PreparedProposalRef;
@@ -130,7 +149,7 @@ export interface CompactionAnswer {
 }
 
 interface ResolveParams {
-  outcomes: (CitingAnswer | ProjectAnswer | HarnessAnswer)[];
+  outcomes: (CitingAnswer | ProjectAnswer | ProjectGroupAnswer | ProfileAnswer | HarnessAnswer)[];
   compactions?: CompactionAnswer[];
   stale?: StaleAnswer[];
 }
@@ -140,7 +159,7 @@ interface ResolveDetails {
   records: LedgerRecord[];
   /** Whether the transaction recorded each of `records`, in order. */
   recording: { rows: Recording[]; error?: string };
-  /** Answers that wrote nothing, each with the reason. */
+  /** Unrecorded answers and publications with the reason for each. */
   failures: string[];
   /** Deletions carried out and recorded whose reference cleanup failed afterwards, each with what is left. */
   cleanup: string[];
@@ -163,79 +182,154 @@ function fixDraft(change: ApprovedChange): FixDraft {
 }
 
 function projectRecord(answer: ProjectAnswer, cwd: string, branch: SessionEntry[], timestamp: string, sessionId: string): ProjectLedgerRecord {
-  const target = canonicalProjectTarget(cwd, answer.target);
-  const fingerprint = projectFingerprint(target);
-  if (answer.fingerprint !== undefined && answer.fingerprint !== fingerprint) throw new Error("project fingerprint does not match its scoped identity");
+  const { outcome } = answer;
   if (!PROPOSAL_OUTCOMES.includes(answer.outcome) || typeof answer.gist !== "string" || !answer.gist.trim() ||
       answer.rule !== undefined || "skill" in answer) throw new Error("project answers need a gist and Apply/Later/Decline; they are not skill amendments");
-  let evidence = answer.evidence;
-  if (answer.outcome === "applied") {
-    const { proposal, change, approval, answeredAt } = approvedProject(answer.approval, branch);
-    if (proposal.fingerprint !== fingerprint || proposal.target.root !== target.root || proposal.target.path !== target.path ||
-        proposal.target.mechanism !== target.mechanism || proposal.gist !== answer.gist) {
-      throw new Error("the applied answer does not name the project change selected in that Apply");
+  const choice = outcome === "applied" ? "Apply" : outcome === "later" ? "Later" : "Decline";
+  let approved = outcome === "applied" || answer.approval !== undefined ? approvedProject(answer.approval, branch, undefined, choice) : undefined;
+  if (approved?.change.operation === "project-edits") throw new Error("resolve a reviewed group with one project-group outcome");
+  const root = projectRootScope(cwd, approved && { roots: [approved.proposal.target.root], worktrees: [] })(answer.target?.root);
+  const target = canonicalProjectTarget(root, answer.target);
+  const fingerprint = projectFingerprint(target);
+  if (answer.fingerprint !== undefined && answer.fingerprint !== fingerprint) throw new Error("project fingerprint does not match its scoped identity");
+  let reoffer = answer.reoffer;
+  const passStart = observationPassStart(branch);
+  if (passStart !== undefined && approved === undefined) {
+    const evidence = sessionToolEvidence(branch);
+    const prepared = preparedProjectEntries(evidence, passStart).find(({ proposal }) => proposal.change.operation === "project-edit" &&
+      proposal.fingerprint === fingerprint && proposal.gist === answer.gist);
+    approved = prepared && findProjectApproval(prepared.reference, evidence, branch, passStart, choice);
+    if (!approved) {
+      const deferred = outcome === "later" && prepared && overflowDeferral(prepared.reference, evidence);
+      if (!deferred) throw new Error("record a native project answer or an eligible overflow; rejected drafts and report items are not ledger decisions");
+      reoffer = reoffer && reoffer !== deferred ? `${deferred} ${reoffer}` : deferred;
     }
-    checkProjectPublication(target, change, approval, answeredAt, answer.publication, branch);
-    evidence = proposal.evidence;
-  } else if (answer.approval !== undefined || answer.publication !== undefined) {
-    throw new Error("only an applied project remedy cites approval and publication");
   }
-  return { kind: "project", target, fingerprint, gist: answer.gist, outcome: answer.outcome,
-    ...(evidence?.length && { evidence }), ...laterReoffer(answer),
-    ...(answer.outcome === "applied" && { publication: answer.publication }), timestamp, sessionId };
+  if (approved) {
+    const { proposal, change, approval, answeredAt } = approved;
+    if (change.operation !== "project-edit" || proposal.fingerprint !== fingerprint || proposal.target.root !== target.root ||
+        proposal.target.path !== target.path || proposal.target.mechanism !== target.mechanism || proposal.gist !== answer.gist) {
+      throw new Error("the answer does not name the exact single project change selected in that Ask");
+    }
+    if (outcome === "applied") checkProjectPublication(target, change, approval, answeredAt, answer.publication, branch);
+  }
+  if (outcome !== "applied" && answer.publication !== undefined) throw new Error("only an applied project remedy cites publication");
+  const evidence = approved?.proposal.evidence ?? answer.evidence;
+  return { kind: "project", target, fingerprint, gist: answer.gist, outcome,
+    ...(evidence?.length && { evidence }), ...laterReoffer({ outcome, reoffer: approved ? approved.note : reoffer }),
+    ...(outcome === "applied" && { publication: answer.publication }), timestamp, sessionId };
 }
 
-interface HarnessRemoval { root: string; file: string }
+function projectGroupRecords(answer: ProjectGroupAnswer, branch: SessionEntry[], timestamp: string, sessionId: string, failures: string[]) {
+  const evidence = sessionToolEvidence(branch);
+  const { outcome, approval, proposal: deferred } = answer;
+  if (!PROPOSAL_OUTCOMES.includes(outcome) || (approval !== undefined && deferred !== undefined) ||
+      "target" in answer || "publication" in answer || "edits" in answer) {
+    throw new Error("a project group resolves the exact reviewed destinations, not a replacement list or supplied publication");
+  }
+  const answered = deferred === undefined
+    ? approvedProject(approval, branch, evidence, outcome === "applied" ? "Apply" : outcome === "later" ? "Later" : "Decline")
+    : undefined;
+  let reoffer = answered?.note;
+  if (deferred !== undefined) {
+    if (!isProposalRef(deferred) || outcome !== "later" || !(reoffer = overflowDeferral(deferred, evidence))) {
+      throw new Error("an answer without native Ask is only for a prepared group deferred by the Ask cap");
+    }
+    requireLatestReference(deferred, evidence);
+    if (answer.reoffer?.trim()) reoffer += ` ${answer.reoffer.trim()}`;
+  }
+  const proposal = answered?.proposal ?? preparedInPass(deferred!, evidence, branch).proposal;
+  const change = "change" in proposal ? proposal.change : undefined;
+  if (proposal.kind !== "project" || change?.operation !== "project-edits") throw new Error("the cited proposal is not an exact project group");
+  const results: Array<{ record: ProjectLedgerRecord; edit: ProjectEdit }> = [];
+  for (const { target, change: edit } of change.edits) {
+    try {
+      const publication = outcome === "applied" && answered
+        ? observedProjectPublication(target, edit, answered.approval, answered.answeredAt, evidence)
+        : undefined;
+      results.push({ edit, record: { kind: "project", target, fingerprint: projectFingerprint(target),
+        gist: proposal.gist, outcome, evidence: proposal.evidence, ...laterReoffer({ outcome, reoffer }),
+        ...(publication && { publication }), timestamp, sessionId } });
+    } catch (error) {
+      failures.push(`\`${edit.file}\`: ${(error as Error).message}`);
+    }
+  }
+  return results;
+}
+
+function profileRecord(answer: ProfileAnswer, branch: readonly SessionEntry[], timestamp: string, sessionId: string): ProfileLedgerRecord {
+  const target = canonicalProfileTarget(answer.target);
+  const fingerprint = profileFingerprint(target);
+  if (!PROPOSAL_OUTCOMES.includes(answer.outcome)) throw new Error("a profile answer is applied, later or declined");
+  const record = { kind: "profile" as const, target, fingerprint, gist: answer.gist, outcome: answer.outcome, timestamp, sessionId };
+  const matches = (proposal: PreparedProposal) => proposal.kind === "profile" && proposal.fingerprint === fingerprint &&
+    proposal.target.root === target.root && proposal.target.path === target.path && proposal.target.mechanism === target.mechanism && proposal.gist === answer.gist;
+  if (answer.outcome !== "applied" && answer.publication !== undefined) throw new Error("only an applied profile edit cites a write");
+  if (answer.proposal !== undefined) {
+    const evidence = sessionToolEvidence(branch);
+    const deferral = overflowDeferral(answer.proposal, evidence);
+    if (answer.outcome !== "later" || answer.approval || !deferral) throw new Error("only eligible overflow can be recorded without a native answer; a report item is not a decision");
+    requireLatestReference(answer.proposal, evidence);
+    const { proposal } = preparedInPass(answer.proposal, evidence, branch);
+    if (!matches(proposal)) throw new Error("the cited proposal is not this exact profile target");
+    return { ...record, evidence: proposal.evidence, reoffer: answer.reoffer ? `${deferral} ${answer.reoffer}` : deferral };
+  }
+  const option = answer.outcome === "applied" ? "Apply" : answer.outcome === "later" ? "Later" : "Decline";
+  const { proposal, change, approval, answeredAt, note } = approvedProfile(answer.approval, branch, option);
+  if (!matches(proposal)) throw new Error("the answer does not name the exact profile edit reviewed in that Ask");
+  return {
+    ...record, evidence: proposal.evidence,
+    ...laterReoffer({ outcome: answer.outcome, reoffer: note }),
+    ...(answer.outcome === "applied" && { publication: checkProfilePublication(target, change, approval, answeredAt, answer.publication, branch) }),
+  };
+}
+
 interface PreparedRecord {
   record: LedgerRecord;
   publishedFiles?: string[];
-  removal?: HarnessRemoval & { approval: ProposalAnswerRef };
+  executable?: { change: ExecutableEdit; approval: ProposalAnswerRef };
 }
 
-/** A hook or companion answer keeps its prepared identity. An applied removal expands to all affected fixes at recording time. */
-function harnessRecord(answer: HarnessAnswer, cwd: string, branch: readonly SessionEntry[], timestamp: string, sessionId: string): PreparedRecord {
-  if (!PROPOSAL_OUTCOMES.includes(answer.outcome)) throw new Error("a harness answer is `applied`, `later` or `declined`");
-  if (answer.outcome === "applied") {
-    if (answer.approval === undefined || answer.proposal !== undefined) {
-      throw new Error("an applied hook or companion change cites the user's Apply of its code stage or removal through `approval`; an intent Apply authorises drafting only: record it as `later` until its code is approved");
+const EXECUTABLE_ACTIVATION = "Files left changed on disk can take effect the next time OMP loads this code. Apply did not activate, restart or deploy anything.";
+
+function executableFailure({ file, status, reason }: HarnessFileFailure): string {
+  return `\`${file}\`: ${status}: ${reason}.` +
+    (status === "untouched by this pass" ? "" : ` ${EXECUTABLE_ACTIVATION}`);
+}
+
+function harnessRecord(answer: HarnessAnswer, branch: readonly SessionEntry[], timestamp: string, sessionId: string): PreparedRecord | { failures: string[] } {
+  if (!PROPOSAL_OUTCOMES.includes(answer.outcome) || (answer.approval !== undefined && answer.proposal !== undefined)) {
+    throw new Error("an executable outcome cites either an exact native answer or eligible overflow");
+  }
+  const { outcome } = answer;
+  if (answer.approval !== undefined) {
+    const { proposal, change, answeredAt, note, approval } = approvedHarness(answer.approval, branch,
+      outcome === "applied" ? "Apply" : outcome === "later" ? "Later" : "Decline");
+    const base = { ...harnessIdentity(proposal), timestamp, sessionId };
+    if (outcome !== "applied") {
+      if (answer.publication !== undefined) throw new Error("only an applied executable change cites publication");
+      return { record: { ...base, outcome, ...laterReoffer({ outcome, reoffer: note }) } };
     }
-    const { proposal, change, answeredAt } = approvedHarness(answer.approval, ["code", "removal"], branch);
-    const identity = harnessIdentity(proposal);
-    if (change.stage === "removal") {
-      checkRemovedHook(change);
-      return {
-        record: { ...identity, outcome: "withdrawn", timestamp, sessionId },
-        removal: { ...change, approval: answer.approval },
-      };
-    }
-    checkHarnessPublication(change, answer.publication, cwd, branch, answeredAt);
+    const result = checkHarnessPublication(change, answer.publication, approval, branch, answeredAt);
+    if ("files" in result) return { failures: result.files.map(executableFailure) };
+    const removal = hookFileKey(proposal.target, proposal.fingerprint) !== undefined && change.files[0]?.afterHash === null;
     return {
-      record: { ...identity, outcome: "applied", publication: answer.publication!, timestamp, sessionId },
-      publishedFiles: change.files.map(({ path }) => join(change.root, path)),
+      record: { ...base, outcome: removal ? "withdrawn" : "applied", publication: result.publication },
+      executable: { change, approval }, publishedFiles: change.files.map(({ file }) => file),
     };
   }
-  if (!isProposalRef(answer.proposal) || answer.approval !== undefined) {
-    throw new Error("a Later or Decline of a hook or companion change cites its prepared proposal through `proposal`, its `reference` exactly as Prepare returned it");
+  if (outcome !== "later" || !isProposalRef(answer.proposal) || answer.publication !== undefined) {
+    throw new Error("cite the current native executable answer; no answer is not a Decline or Apply");
   }
   const evidence = sessionToolEvidence(branch);
   const { proposal } = preparedInPass(answer.proposal, evidence, branch);
   requireLatestReference(answer.proposal, evidence);
-  const note = answer.outcome === "later" && answer.reoffer === undefined ? laterNote(answer.proposal, evidence) : undefined;
-  const reoffer = answer.reoffer ?? note;
-  const drafted = "change" in proposal && proposal.change.operation === "harness" && proposal.change.stage === "code";
-  return { record: {
-    ...harnessIdentity(proposal), outcome: answer.outcome,
-    ...laterReoffer({ outcome: answer.outcome, reoffer: drafted ? `A draft existed: its code was shown and answered Later; ask the intent again before drafting anew.${reoffer === undefined ? "" : ` ${reoffer}`}` : reoffer }),
-    timestamp, sessionId,
-  } };
-}
-
-function checkRemovedHook({ root, file }: HarnessRemoval): void {
-  // A folder replaced by a symlink since Prepare would let another file's absence pass for this hook's.
-  const path = relative(root, file);
-  if (canonicalMissingPath(root) !== root) throw new Error(`\`${root}\` no longer resolves to the hooks directory where the user approved removing \`${file}\``);
-  if (canonicalPathIn(root, path, `\`${file}\``) !== path) throw new Error(`\`${file}\` now resolves to another file in its hooks directory than the one the user approved removing`);
-  if (existsSync(file)) throw new Error(`\`${file}\` is still there: after the user's Apply, delete it with your own tools, then record its removal; this tool deletes nothing`);
+  const deferred = overflowDeferral(answer.proposal, evidence);
+  if (!deferred || !("change" in proposal) || proposal.change.operation !== "harness" || proposal.change.stage !== "checked") {
+    throw new Error("only eligible checked executable overflow can be recorded without a native answer");
+  }
+  return { record: { ...harnessIdentity(proposal), outcome, timestamp, sessionId,
+    ...laterReoffer({ outcome, reoffer: answer.reoffer?.trim() ? `${deferred} ${answer.reoffer.trim()}` : deferred }) } };
 }
 
 /** A removed hook withdraws every fix for its scoped file, or uses its own identity if it held none. */
@@ -258,17 +352,19 @@ function harnessIdentity(proposal: PreparedProposal): HarnessIdentity {
   };
 }
 
-type FingerprintOwner = { fingerprint: string; skill: string; target?: never } | ProjectLedgerRecord | HarnessLedgerRecord;
+type FingerprintOwner = { fingerprint: string; skill: string; target?: never } | ProjectLedgerRecord | HarnessLedgerRecord | ProfileLedgerRecord;
 
 function sameOwner(a: FingerprintOwner, b: FingerprintOwner): boolean {
   const left = a.target;
   const right = b.target;
   if (!left || !right) return !left && !right && a.skill === b.skill;
-  if (left.scope === "project" && right.scope === "project") {
+  if (left.scope === right.scope && left.scope !== "harness" && right.scope !== "harness") {
     return left.root === right.root && left.path === right.path && normaliseText(left.mechanism) === normaliseText(right.mechanism);
   }
   if (left.scope !== "harness" || right.scope !== "harness" || left.root !== right.root) return false;
   if (left.root === "project-hooks" && (right.root !== "project-hooks" || left.project !== right.project)) return false;
+  if (left.root === "extension") return right.root === "extension" && left.source === right.source &&
+    left.checkout === right.checkout && normaliseText(left.mechanism) === normaliseText(right.mechanism);
   const file = hookFileKey(left, a.fingerprint);
   if (file !== undefined && removalFingerprint(file) === a.fingerprint) {
     return file === hookFileKey(right, b.fingerprint);
@@ -334,7 +430,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             kind: z.enum(["project"]),
             target: z.object({
               scope: z.enum(["project"]),
-              root: z.string().describe("Current working project root; symlink aliases are canonicalized."),
+              root: z.string().describe("The prepared canonical project root."),
               path: z.string().describe("Root-relative file path, including safe missing leaves."),
               mechanism: z.string().describe("One mechanism; identity normalizes case, punctuation and whitespace."),
             }),
@@ -343,7 +439,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             fingerprint: z.string().optional(),
             evidence: z.array(z.object({ quote: z.string(), count: z.number(), occurrenceIds: z.array(z.string()).optional() })).optional(),
             reoffer: z.string().optional().describe(REOFFER_DESCRIPTION),
-            approval: z.object(approvalShape(z)).optional().describe("Required for Applied: the exact native approval of this prepared project change."),
+            approval: z.object(approvalShape(z)).optional().describe("Native Ask receipt; required for Apply or a non-current checkout."),
             publication: z.object({
               writeToolCallId: z.string(),
               checkToolCallIds: z.array(z.string()),
@@ -351,14 +447,30 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
             }).optional().describe("Applied only: the authorized owner write and subsequent completed check in the target checkout. Resolve does not write project files."),
           }),
           z.object({
+            kind: z.enum(["project-group"]),
+            outcome: z.enum(PROPOSAL_OUTCOMES),
+            approval: z.object(approvalShape(z)).optional().describe("One native Ask receipt for every destination."),
+            proposal: proposalRefSchema(z).optional().describe("Later without an Ask, when deferred by the cap."),
+            reoffer: z.string().optional().describe("Reason to revisit an overflow deferral."),
+          }),
+          z.object({
+            kind: z.enum(["profile"]),
+            target: z.object({ scope: z.enum(["profile"]), root: z.string(), path: z.string(), mechanism: z.string() }),
+            gist: z.string(), outcome: z.enum(PROPOSAL_OUTCOMES),
+            approval: z.object(approvalShape(z)).optional().describe("Exact native answer."),
+            proposal: proposalRefSchema(z).optional().describe("Only for eligible overflow Later."),
+            publication: z.object({ writeToolCallId: z.string(), afterHash: z.string() }).optional().describe("Applied only: exact owner write and SHA-256; Resolve checks the published content."),
+            reoffer: z.string().optional(),
+          }),
+          z.object({
             kind: z.enum(["harness"]),
-            proposal: proposalRefSchema(z).optional().describe("`later` or `declined` only: the `reference` of the intent, code or removal proposal answered, from the pass's latest Prepare holding it, exactly as Prepare returned it."),
-            approval: z.object(approvalShape(z)).optional().describe("`applied` only, and required for it: where the user's Apply of the code stage, or of a hook removal, is saved."),
+            proposal: proposalRefSchema(z).optional().describe("Only for eligible overflow Later without a native answer."),
+            approval: z.object(approvalShape(z)).optional().describe("The exact native answer to the checked executable change."),
             publication: z.object({
               writeToolCallIds: z.array(z.string()), checkToolCallIds: z.array(z.string()),
-              files: z.array(z.object({ path: z.string().describe("Root-relative, as the code stage named it."), afterHash: z.string() })),
-            }).optional().describe("`applied` code only: the successful normal write of each approved file, the foreground checks after them with the target root as `cwd`, and each file's SHA-256 now. This tool does not write the files."),
-            outcome: z.enum(PROPOSAL_OUTCOMES).describe("One answer per hook or companion identity: `applied` when its approved code was written and checked, or its approved removal deleted the hook file (recorded as `withdrawn`); `declined` when either stage or the removal was declined; otherwise `later`."),
+              files: z.array(z.object({ path: z.string(), afterHash: z.unknown().describe("SHA-256 of approved result, or null for removal.") })),
+            }).optional().describe("Applied only: exact owner write or edit receipt for every file and one foreground check, in the reviewed executable root."),
+            outcome: z.enum(PROPOSAL_OUTCOMES),
             reoffer: z.string().optional().describe(REOFFER_DESCRIPTION),
           })]),
         )
@@ -407,14 +519,18 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const failures: string[] = [];
       const external = new Map<LedgerRecord, readonly string[]>();
       const refusedPublications = new Map<LedgerRecord, string>();
+      const projectGroups = new Map<LedgerRecord, ProjectEdit>();
+      const projectFailures: string[] = [];
+      const executableFailures: string[] = [];
       const refuseRecord = (record: LedgerRecord, reason: string) => {
         if (external.has(record)) refusedPublications.set(record, reason);
         else failures.push(reason);
       };
       const kept: string[] = [];
       let targetChanged = false;
-      const label = (answer: CitingAnswer | ProjectAnswer | HarnessAnswer) => answer.kind === "project" ? `\`${answer.target?.path}\` (${answer.gist})`
-        : answer.kind === "harness" || answer.gist === undefined ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
+      const label = (answer: ResolveParams["outcomes"][number]) => answer.kind === "project" || answer.kind === "profile" ? `\`${answer.target?.path}\` (${answer.gist})`
+        : answer.kind === "harness" || answer.kind === "project-group" || answer.gist === undefined
+          ? `proposal \`${(answer.approval?.proposal ?? answer.proposal)?.candidateId}\`` : `\`${answer.skill}\` (${answer.gist})`;
       // Fail visibly on an unreadable or unmigrated store without making any internal publication.
       let openError: string | undefined;
       let storeExists = false;
@@ -426,8 +542,22 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       const notAttempted = "not attempted because the observer store could not start recording";
 
       const validated = params.outcomes.flatMap((sent): ValidatedAnswer[] => {
+        if (sent.kind === "project-group") {
+          try {
+            for (const { record, edit } of projectGroupRecords(sent, ctx.sessionManager.getBranch(), timestamp, sessionId, projectFailures)) {
+              if (openError !== undefined && !record.publication) {
+                projectFailures.push(`\`${edit.file}\`: ${notAttempted}`);
+                continue;
+              }
+              outsideAmendments.push({ record });
+              projectGroups.set(record, edit);
+              if (record.publication) external.set(record, [edit.file]);
+            }
+          } catch (error) { projectFailures.push(`${label(sent)}: ${(error as Error).message}`); }
+          return [];
+        }
         if (openError !== undefined && (sent.outcome !== "applied" ||
-          (sent.kind !== "project" && sent.kind !== "harness" && sent.publication === undefined))) {
+          (sent.kind !== "project" && sent.kind !== "profile" && sent.kind !== "harness" && sent.publication === undefined))) {
           failures.push(`${label(sent)}: ${notAttempted}`);
           return [];
         }
@@ -440,12 +570,23 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
           return [];
         }
+        if (sent.kind === "profile") {
+          try {
+            const record = profileRecord(sent, ctx.sessionManager.getBranch(), timestamp, sessionId);
+            outsideAmendments.push({ record });
+            if (record.publication) external.set(record, [join(record.target.root, record.target.path)]);
+          } catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
+          return [];
+        }
         if (sent.kind === "harness") {
           try {
-            const prepared = harnessRecord(sent, ctx.cwd, ctx.sessionManager.getBranch(), timestamp, sessionId);
-            outsideAmendments.push(prepared);
-            if (prepared.publishedFiles) external.set(prepared.record, prepared.publishedFiles);
-          } catch (error) { failures.push(`${label(sent)}: ${(error as Error).message}`); }
+            const prepared = harnessRecord(sent, ctx.sessionManager.getBranch(), timestamp, sessionId);
+            if ("failures" in prepared) executableFailures.push(...prepared.failures);
+            else {
+              outsideAmendments.push(prepared);
+              if (prepared.publishedFiles) external.set(prepared.record, prepared.publishedFiles);
+            }
+          } catch (error) { executableFailures.push(`${label(sent)}: ${(error as Error).message}`); }
           return [];
         }
         let shown: CitingAnswer = sent;
@@ -594,26 +735,50 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
               else eligible.add(entry);
             }
             const harnessAnswered = new Set<string>();
-            for (const { record: first, removal } of outsideAmendments) {
-              if (removal) {
+            for (const { record: first, executable } of outsideAmendments) {
+              const projectEdit = projectGroups.get(first);
+              if (projectEdit && external.has(first)) {
                 try {
-                  approvedHarness(removal.approval, ["removal"], branch);
-                  checkRemovedHook(removal);
+                  checkProjectState(projectEdit, false);
                 } catch (error) {
-                  failures.push(`${targetLabel(first)}: ${(error as Error).message}`);
+                  external.delete(first);
+                  projectFailures.push(`\`${projectEdit.file}\`: written but unverified: ${(error as Error).message}`);
                   continue;
                 }
               }
-              const current = removal && first.kind === "harness" ? removalRecords(db, first) : [first];
+              if (executable) {
+                try {
+                  approvedHarness(executable.approval, branch);
+                  checkExecutableState(executable.change);
+                } catch (error) {
+                  external.delete(first);
+                  for (const { file } of executable.change.files) {
+                    executableFailures.push(executableFailure({ file, status: "written but unverified", reason: (error as Error).message }));
+                  }
+                  continue;
+                }
+              }
+              const current = executable && first.kind === "harness" && first.outcome === "withdrawn" ? removalRecords(db, first) : [first];
               const repeated = current.find((record) => record.kind === "harness" && harnessAnswered.has(record.fingerprint));
               if (repeated) {
-                refuseRecord(first, `${targetLabel(first)}: this call already answers \`${repeated.fingerprint}\`: send one answer per hook or companion identity`);
+                refuseRecord(first, `${targetLabel(first)}: this call already answers \`${repeated.fingerprint}\`: send one answer per scoped executable change`);
                 continue;
               }
-              const refusal = claim(current.includes(first) ? current : [first, ...current]);
+              let refusal: string | undefined;
+              try {
+                refusal = claim(current.includes(first) ? current : [first, ...current]);
+              } catch (error) {
+                if (!projectEdit || !db.inTransaction) throw error;
+                refusal = (error as Error).message;
+              }
               if (refusal) {
-                refuseRecord(first, `${targetLabel(first)}: ${refusal}`);
+                refuseRecord(first, `${projectEdit ? `\`${projectEdit.file}\`` : targetLabel(first)}: ${refusal}`);
                 continue;
+              }
+              if (!current.includes(first) && external.has(first)) {
+                const paths = external.get(first)!;
+                external.delete(first);
+                for (const record of current) external.set(record, paths);
               }
               records.push(...current);
               for (const record of current) if (record.kind === "harness") harnessAnswered.add(record.fingerprint);
@@ -630,7 +795,22 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
               const carried = record.evidence ? undefined : inheritedEvidence.get(record.fingerprint);
               if (carried) record.evidence = carried;
             }
-            if (records.length > 0) putLedgerRecords(db, records);
+            if (projectGroups.size === 0) {
+              if (records.length > 0) putLedgerRecords(db, records);
+            } else {
+              for (let i = 0; i < records.length;) {
+                const record = records[i]!;
+                try {
+                  putLedgerRecords(db, [record]);
+                  i++;
+                } catch (error) {
+                  const edit = projectGroups.get(record);
+                  if (!edit || !db.inTransaction) throw error;
+                  refuseRecord(record, `\`${edit.file}\`: ${(error as Error).message}`);
+                  records.splice(i, 1);
+                }
+              }
+            }
           });
         } catch (error) {
           status = error instanceof ObserverCommitUnknownError ? "unknown" : "unrecorded";
@@ -644,8 +824,8 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         for (const record of external.keys()) if (!refusedPublications.has(record)) records.push(record);
         for (const { rule, action } of params.stale ?? []) failures.push(`stale \`${rule}\` (${action}): ${notAttempted}`);
         for (const { skill } of params.compactions ?? []) failures.push(`compaction of \`${skill}\`: ${notAttempted}`);
-        for (const { record } of outsideAmendments) {
-          if (!external.has(record) && openError === undefined) records.push(record);
+        for (const { record, executable } of outsideAmendments) {
+          if (!executable && !external.has(record) && openError === undefined) records.push(record);
         }
         for (const { answer, directEdit } of approved.answers) {
           if (directEdit === undefined) failures.push(`${label(answer)}: ${notAttempted}`);
@@ -663,22 +843,23 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       targetChanged ||= approved.result.targetChanged;
       recording.rows = records.map(() => status);
       const line = (record: LedgerRecord, rule = record.rule) => {
-        const written = record.kind !== "project" && record.compaction && rule ? readReferenceFiles(referencesDir, record.skill) : [];
+        const written = record.target === undefined && record.compaction && rule ? readReferenceFiles(referencesDir, record.skill) : [];
         return (
-          `- ${record.outcome} ${targetLabel(record)}, fingerprint \`${record.fingerprint}\`: ${record.gist}` +
+          `- ${record.outcome} ${projectGroups.has(record) ? `\`${projectGroups.get(record)!.file}\` (project)` : targetLabel(record)}, fingerprint \`${record.fingerprint}\`: ${record.gist}` +
           (rule ? ` Rule file: \`${rule}\`.` : "") +
+          (record.kind === "profile" && record.publication ? ` Verified published bytes: ${record.publication.verification}.` : "") +
           referenceFilesSentence(written)
         );
       };
       const publicationLine = (record: LedgerRecord) => {
         const paths = external.get(record);
-        if (!paths) return line(record, record.kind === "project" || record.kind === "harness" ? undefined : internal.get(record)?.rule);
-        const receipt = record.kind === "project" || record.kind === "harness"
+        if (!paths) return line(record, record.target ? undefined : internal.get(record)?.rule);
+        const receipt = record.target
           ? `Published files: ${paths.map((path) => `\`${path}\``).join(", ")}`
           : `Publication: \`${paths[0]}\``;
-        return `${line(record)} ${receipt}.`;
+        return `${line(record)} ${receipt}.${record.kind === "harness" ? ` Verification passed. ${EXECUTABLE_ACTIVATION}` : ""}`;
       };
-      const recorded = status === "recorded" ? records.map((record) => line(record)) : [];
+      const recorded = status === "recorded" ? records.map((record) => record.kind === "harness" ? publicationLine(record) : line(record)) : [];
       const text = [`Recorded ${recorded.length} outcome(s) in \`${ledger}\`:`, ...recorded];
       const unsettled = recording.error !== undefined;
       if (unsettled) {
@@ -693,7 +874,7 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
           const unrecorded: string[] = [];
           const noPublication: string[] = [];
           for (const record of records) {
-            if (external.has(record) || (record.kind !== "project" && record.kind !== "harness" && internal.has(record))) {
+            if (external.has(record) || (record.target === undefined && internal.has(record))) {
               unrecorded.push(publicationLine(record));
             } else {
               noPublication.push(line(record));
@@ -736,6 +917,14 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
         text.push("", `Carried out as listed, but cleaning up after them failed, ${cleanup.length} deletion(s): don't call \`observer_resolve\` again for them; inspect what is left and report it to the user with the error:`);
         text.push(...cleanup.map((failure) => `- ${failure}`));
       }
+      if (projectFailures.length > 0) {
+        text.push("", "Project destinations not recorded. Report each status separately; do not redo completed writes:",
+          ...projectFailures.map(failure => `- ${failure}`));
+      }
+      if (executableFailures.length > 0) {
+        text.push("", "Executable destinations not recorded. Report each status separately; do not redo completed writes:",
+          ...executableFailures.map((failure) => `- ${failure}`));
+      }
       if (failures.length > 0) {
         text.push("", unsettled ? `Other refusals, ${failures.length} answer(s):` : `Not recorded, ${failures.length} answer(s); fix each and call again with only these:`);
         text.push(...failures.map((failure) => `- ${failure}`));
@@ -747,8 +936,8 @@ export function registerResolveTool(pi: ExtensionAPI, files: ObserverFiles): voi
       if (guidance.length > 0) text.push("", whatToDoNow(guidance));
       return {
         content: [{ type: "text", text: text.join("\n") }],
-        details: { ledger, records, recording, failures: [...failures, ...refusedPublications.values()], cleanup, deferred, approvals, publications: [...internal.values()] },
-        isError: failures.length > 0 || refusedPublications.size > 0 || cleanup.length > 0 || unsettled,
+        details: { ledger, records, recording, failures: [...failures, ...projectFailures, ...executableFailures, ...refusedPublications.values()], cleanup, deferred, approvals, publications: [...internal.values()] },
+        isError: failures.length > 0 || projectFailures.length > 0 || executableFailures.length > 0 || refusedPublications.size > 0 || cleanup.length > 0 || unsettled,
       };
     },
   });
@@ -798,7 +987,7 @@ function citedAnswer(answer: CitingAnswer, branch: readonly SessionEntry[]): Pro
   if (!isProposalRef(cited)) throw new Error("a cited proposal is its `reference`, exactly as Prepare returned it");
   const evidence = sessionToolEvidence(branch);
   const { proposal } = preparedInPass(cited, evidence, branch);
-  if (proposal.kind === "project" || proposal.kind === "harness") throw new Error(`the cited proposal is a ${proposal.kind} proposal, answered as a ${proposal.kind} outcome`);
+  if (proposal.target) throw new Error(`the cited proposal is a ${proposal.kind} proposal, answered as a ${proposal.kind} outcome`);
   const operation = "change" in proposal ? proposal.change.operation : "stale amendment";
   const citable = CITABLE.includes(operation) || (operation === "withdrawal" && answer.outcome === "declined");
   if (reference !== undefined && !citable) throw new Error(`the cited proposal is a ${operation}, which \`proposal\` does not answer`);

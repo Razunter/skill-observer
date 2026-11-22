@@ -1,5 +1,5 @@
 /** Checks an observer hook against sample events before it is published. */
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -18,12 +18,13 @@ interface Sample {
 }
 type Handler = (event: Record<string, unknown>, ctx: unknown) => unknown;
 
-const USAGE = `usage: bun --no-env-file scripts/check-hook.ts <hook-file> <samples-file>
+const USAGE = `usage: bun --no-env-file scripts/check-hook.ts [--absent] <hook-file> <samples-file>
 
 Loads the hook's default-exported factory against a stand-in host with no UI
 (ctx.cwd is the working directory), feeds the samples' events in file order to
 the handlers it registered, and prints one PASS/FAIL line per sample, then a
 verdict line. Exits 0 only when every sample's outcome is the expected one.
+With --absent, the hook file must not exist and all samples must be untouched.
 
 The samples file is a JSON array of samples:
 
@@ -51,11 +52,20 @@ runs against the same loaded hook. A sample without "toolCallId" gets an ID of
 its own, so give a tool_call and its tool_result the same "toolCallId" when the
 hook relates them by it.`;
 
-const [hookFile, samplesFile] = process.argv.slice(2);
-if (!hookFile || !samplesFile) fail(USAGE);
+const args = process.argv.slice(2);
+const absent = args[0] === "--absent";
+const [hookFile, samplesFile, extra] = absent ? args.slice(1) : args;
+if (!hookFile || !samplesFile || extra !== undefined) fail(USAGE);
 
 const samples = readSamples(samplesFile);
-const handlers = await loadHook(hookFile);
+let handlers: Map<string, Handler[]>;
+if (absent) {
+  if (lstatSync(resolve(hookFile), { throwIfNoEntry: false })) fail(`hook file ${hookFile} must be absent`);
+  if (samples.some((sample) => sample.expect !== "untouched")) fail("absence checks require untouched samples");
+  handlers = new Map();
+} else {
+  handlers = await loadHook(hookFile);
+}
 const ctx = {
   cwd: process.cwd(),
   hasUI: false,

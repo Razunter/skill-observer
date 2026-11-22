@@ -282,6 +282,7 @@ export interface ObservationLead {
 interface CustomMessageDetails {
   rules?: string[];
   observationLeads?: { cwd: string; sessionId: string; leads: ObservationLead[] };
+  projectScope?: { roots: string[]; worktrees: string[] };
 }
 
 /** A `pi.sendMessage` payload; it persists as a `custom_message` entry. */

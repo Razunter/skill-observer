@@ -34,6 +34,7 @@ import { hasReviewedPublication, registerReviewTool, reviewSelectionForForm, REV
 import { evidenceReport, renderEvidenceReport } from "./report.js";
 import { recordHookCall, recordHookResult, sessionToolEvidence } from "./session-tool-evidence.js";
 import { projectToolAuthorization } from "./project-publication.js";
+import { projectScopeNote } from "./project-scope.js";
 import { countPendingObservations, markObservationsShown, type Observation, readPendingObservations, recordObservation } from "./observations.js";
 import { ObserverCommitUnknownError, observerStorePath, readObserverStore } from "./observer-store.js";
 import { APPLY, hasApprovalNote, hasCustomInput, observationPassStart, STALE_OPTIONS } from "./proposal-approval.js";
@@ -130,7 +131,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
   });
 
   pi.on("tool_result", (event, ctx) => {
-    const isReceiptTool = ["write", "edit", "bash", "manage_skill", "ask", REVIEW_TOOL_NAME].includes(event.toolName);
+    const isReceiptTool = ["write", "edit", "bash", "manage_skill", "ask", REVIEW_TOOL_NAME, CHECK_TOOL_NAME].includes(event.toolName);
     const branch = ctx.sessionManager.getBranch();
     recordHookResult(pi, event, branch);
     if (event.isError || !isReceiptTool || !isObservable(ctx)) return;
@@ -254,7 +255,7 @@ export default function skillObserver(pi: ExtensionAPI): void {
       pi.sendMessage(
         {
           customType: OBSERVATION_MESSAGE_TYPE, content: payload.content, display: false, attribution: "user",
-          details: { observationLeads: { cwd, sessionId: sessionSource.id, leads: payload.leads } },
+          details: { observationLeads: { cwd, sessionId: sessionSource.id, leads: payload.leads }, projectScope: projectScopeNote(note, branch) },
         },
         { triggerTurn: true, deliverAs: "followUp" },
       );

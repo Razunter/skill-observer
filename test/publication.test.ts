@@ -1,9 +1,10 @@
 import { Database } from "bun:sqlite";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { PathLike } from "node:fs";
 import type * as NodeFS from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { registerResolveTool } from "../src/resolve.js";
@@ -18,9 +19,10 @@ import { replaceReferenceFiles } from "../src/references.js";
 import { buildDigest } from "../src/digest.js";
 import { AMENDMENT_DELIVERY_TYPE } from "../src/reminder.js";
 import { remedyOutcomes } from "../src/outcomes.js";
-import { INSTRUCTIONS_PATH, toolResultGuidance } from "../src/payload.js";
+import { HOOK_CHECK_PATH, INSTRUCTIONS_PATH, toolResultGuidance } from "../src/payload.js";
 import { createProvenanceResolver, skillHash } from "../src/provenance.js";
 import { projectToolAuthorization } from "../src/project-publication.js";
+import { observationPassStart } from "../src/proposal-approval.js";
 import { recordHookCall, recordHookResult } from "../src/session-tool-evidence.js";
 import { groundRepairs } from "./grounding.js";
 import { makeSkillHome } from "./skill-home.js";
@@ -64,11 +66,13 @@ function fixture() {
   const files = { storeFile: () => join(home, "observer.sqlite"), rulesDir: () => join(home, "rules"), amendmentsDir: () => join(home, "amendments"), referencesDir: () => join(home, "refs") };
   const pi = { zod, registerTool: (value: ToolDefinition<unknown, Details>) => { tools[value.name] = value; },
     appendEntry: (customType: string, data: SessionEntry["data"]) => { branch.push({ type: "custom", customType, data }); },
-    getAllTools: () => ["write", "bash"].map((name) => ({ name, sourceInfo: { source: "builtin", path: `<builtin:${name}>` } })),
+    getAllTools: () => ["write", "edit", "bash"].map((name) => ({ name, sourceInfo: { source: "builtin", path: `<builtin:${name}>` } })),
   } as unknown as ExtensionAPI;
   registerResolveTool(pi, files);
   registerReviewTool(pi, files, () => undefined);
-  let branch: SessionEntry[] = [{ type: "custom_message", customType: OBSERVATION_MESSAGE_TYPE, content: "Observation pass." }];
+  let branch: SessionEntry[] = [];
+  const startPass = () => branch.push({ type: "custom_message", customType: OBSERVATION_MESSAGE_TYPE, content: "Observation pass." });
+  startPass();
   const ctx = { cwd: roots.cwd, hasUI: true, sessionManager: { getSessionId: () => "test", getBranch: () => branch } } as unknown as ExtensionContext;
   /** Runs a registered tool, then saves its native call and result on the branch, as OMP does. */
   const call = async (name: string, params: unknown) => {
@@ -116,15 +120,18 @@ function fixture() {
     branch = [...branch, toolCall(id, name, args),
       { type: "message", message: { role: "toolResult", toolCallId: id, toolName: name, content: "ok", isError: false, ...(details && { details }) } }];
   };
-  const saveOwner = (toolCallId: string, toolName: string, input: Record<string, unknown>, details?: ToolResultDetails, run?: () => void) => {
+  const saveOwner = (toolCallId: string, toolName: string, input: Record<string, unknown>, details?: ToolResultDetails, run?: () => string | void) => {
     const event = { toolCallId, toolName, input };
-    const authorization = projectToolAuthorization(event, roots.cwd, branch, 0);
+    const authorization = projectToolAuthorization(event, roots.cwd, branch, observationPassStart(branch)!);
     expect(authorization).toBeTruthy();
     recordHookCall(pi, event, authorization);
-    run?.();
-    recordHookResult(pi, { ...event, details, content: [], isError: false }, branch);
+    branch.push(toolCall(toolCallId, toolName, input));
+    const output = run?.();
+    const content = typeof output === "string" ? [{ type: "text" as const, text: output }] : [];
+    recordHookResult(pi, { ...event, details, content, isError: false }, branch);
+    branch.push({ type: "message", message: { role: "toolResult", toolCallId, toolName, content, details, isError: false } });
   };
-  return { files, roots, run, add, approve, withdraw, compaction, saveTool, saveOwner, branch: () => branch };
+  return { files, roots, run, add, approve, withdraw, compaction, saveTool, saveOwner, startPass, branch: () => branch };
 }
 
 async function publishDirectEdit(f: ReturnType<typeof fixture>) {
@@ -153,6 +160,30 @@ async function publishProjectEdit(f: ReturnType<typeof fixture>) {
   f.saveOwner("check-config", "bash", { command: check, cwd: f.roots.cwd }, { exitCode: 0 });
   return { path, outcome: { kind: "project", target, gist, outcome: "applied", approval,
     publication: { writeToolCallId: "write-config", checkToolCallIds: ["check-config"], afterHash: createHash("sha256").update(content).digest("hex") } } };
+}
+
+async function approveHookRemoval(f: ReturnType<typeof fixture>, path: string, checkToolCallId: string) {
+  const target = { scope: "harness", root: "project-hooks", project: f.roots.cwd, path, mechanism: "Remove hook" } as const;
+  const scratch = mkdtempSync(join(realpathSync(tmpdir()), "omp-observe-check."));
+  homes.push(scratch);
+  const samples = join(scratch, "samples.json");
+  writeFileSync(samples, JSON.stringify(["mistake", "legitimate"].map((role) => ({
+    name: role, role, event: "tool_call", toolName: "bash", input: { command: role }, expect: "untouched",
+  }))));
+  const command = `bun --no-env-file '${HOOK_CHECK_PATH}' --absent '${path}' '${samples}'`;
+  const check = (id: string, cwd: string) => f.saveOwner(id, "bash", { command, cwd }, { exitCode: 0 }, () => {
+    const result = spawnSync("bash", ["-c", command], { cwd, encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
+    return result.stdout;
+  });
+  check(checkToolCallId, scratch);
+  const [approval] = await f.approve([{
+    kind: "harness", target, gist: target.mechanism, priority: "evidence", remedy: "Retire fixture hook",
+    change: { operation: "harness", stage: "checked", files: [{ path }], checkToolCallId, lowerRungs: "A wording change cannot retire an installed hook." },
+    evidence: [{ quote: "Hook no longer needed", count: 1 }],
+  }]);
+  if (!approval) throw new Error("checked hook removal was not selected");
+  return { approval, check };
 }
 const toolCall = (id: string, name: string, args: Record<string, unknown>): SessionEntry =>
   ({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name, arguments: args }] } });
@@ -206,7 +237,7 @@ it("rechecks affected decisions after replay without refusing independent answer
   await f.add("First fix");
   const file = f.files.storeFile();
   const [first] = readLedger(file);
-  if (!first || first.kind === "project" || first.kind === "harness") throw new Error("missing applied skill fix");
+  if (!first?.skill) throw new Error("missing applied skill fix");
   const other = (fingerprint: string, fields: Partial<typeof first> = {}): typeof first =>
     ({ ...first, fingerprint, gist: fingerprint, rule: undefined, outcome: "later", ...fields });
   const oldEvidence = [{ quote: "before replay", count: 1 }];
@@ -233,12 +264,10 @@ it("rechecks affected decisions after replay without refusing independent answer
     change: { operation: "rule", name: "jj-not-git", body: "Use jj.", pattern: "\\bgit commit\\b", scope: "tool:bash",
       matches: [{ command: "git commit -m x" }], spares: [{ command: "jj commit -m x" }] },
   }]);
-  const [removal] = await f.approve([{
-    kind: "harness", target: { scope: "harness", root: "project-hooks", path: basename(hook), mechanism: "Remove hook" },
-    gist: "Remove hook", priority: "evidence", remedy: "Retire fixture hook", change: { operation: "harness", stage: "removal" },
-    evidence: [{ quote: "Hook no longer needed", count: 1 }],
-  }]);
-  rmSync(hook);
+  const { approval: removal, check: checkRemoval } = await approveHookRemoval(f, basename(hook), "scratch-removal");
+  f.saveOwner("remove-hook", "edit", { input: `*** Begin Patch\n[${hook}#0000]\nREM\n*** End Patch` }, undefined, () => rmSync(hook));
+  checkRemoval("check-removed-hook", hookDir);
+  const publication = { writeToolCallIds: ["remove-hook"], checkToolCallIds: ["check-removed-hook"], files: [{ path: basename(hook), afterHash: null }] };
   const direct = await publishDirectEdit(f);
   const project = await publishProjectEdit(f);
   const directFingerprint = proposalFingerprint(direct.outcome.skill, direct.outcome.gist);
@@ -247,7 +276,7 @@ it("rechecks affected decisions after replay without refusing independent answer
   const pending = f.run({ outcomes: [
     ...outcomes,
     direct.outcome, project.outcome,
-    { kind: "harness", outcome: "applied", approval: removal },
+    { kind: "harness", outcome: "applied", approval: removal, publication },
     { skill: "ce-commit-jj", kind: "local", gist: "Commit with jj", outcome: "applied", approval: barrier },
     { skill: "tdd", kind: "upstream", gist: "Wrong owner", fingerprint: "claimed", outcome: "later" },
     { skill: "tdd", kind: "upstream", gist: "Keep applied", fingerprint: "applied", outcome: "declined" },
@@ -281,13 +310,15 @@ it("rechecks affected decisions after replay without refusing independent answer
   expect(text).toContain(`\`${direct.path}\``);
   expect(text).toContain(`\`${project.path}\``);
   expect(text).toMatch(/Don.t call `observer_resolve` again[\s\S]*redo/);
-  expect(result.details.failures).toHaveLength(4);
+  expect(result.details.failures, text).toHaveLength(4);
   expect(readFileSync(direct.path, "utf8")).toBe(direct.content);
-  expect(result.content[0]?.text).toContain("1 Decline(s) of a fix in force");
+  expect(readFileSync(project.path, "utf8")).toBe("new config\n");
+  expect(existsSync(hook)).toBe(false);
+  expect(text).toContain("1 Decline(s) of a fix in force");
   expect(result.details.records).toMatchObject([
-    { fingerprint: existingHook.fingerprint, outcome: "withdrawn" }, { fingerprint: lateHook.fingerprint, outcome: "withdrawn" },
+    { fingerprint: existingHook.fingerprint, outcome: "withdrawn", publication }, { fingerprint: lateHook.fingerprint, outcome: "withdrawn", publication },
     { gist: "Commit with jj", outcome: "later" },
-    { fingerprint: "evidence", evidence: newEvidence }, { gist: "Independent", outcome: "declined" },
+    { fingerprint: "evidence", outcome: "later", evidence: newEvidence }, { gist: "Independent", outcome: "declined" },
   ]);
   expect(result.details.recording.rows).toEqual(["recorded", "recorded", "recorded", "recorded", "recorded"]);
   expect(amendments.skillAmendment(f.files.amendmentsDir(), "tdd")?.body).toContain("First fix");
@@ -305,25 +336,37 @@ it("rechecks affected decisions after replay without refusing independent answer
   ]);
 });
 
-it("refuses a claimed hook removal identity without reporting the absent hook as published", async () => {
+it("does not record past hook approvals or claim publication when an absent hook has no owner receipt", async () => {
   const f = fixture();
   const target = { scope: "harness", root: "project-hooks", project: f.roots.cwd, path: "fixture.ts", mechanism: "Remove hook" } as const;
   const dir = join(f.roots.cwd, ".omp/hooks/pre");
   const path = join(dir, target.path);
   mkdirSync(dir, { recursive: true });
   writeFileSync(path, "export default function () {}\n");
-  const [approval] = await f.approve([{
-    kind: "harness", target, gist: "Remove hook", priority: "evidence", remedy: "Retire fixture hook",
-    change: { operation: "harness", stage: "removal" }, evidence: [{ quote: "Hook no longer needed", count: 1 }],
-  }]);
-  // A missing file can support recording an approved removal, not prove who removed it.
+  const { approval: past } = await approveHookRemoval(f, target.path, "past-scratch-removal");
+  f.startPass();
+  const { approval: current } = await approveHookRemoval(f, target.path, "current-scratch-removal");
+  // The reviewed postimage is present, but no approved tool removed the hook.
   rmSync(path);
   const fingerprint = removalFingerprint(hookFileKey(target, "")!);
   const claim = { skill: "tdd", kind: "upstream", gist: "Bind the fingerprint", outcome: "later", fingerprint };
-  const result = await f.run({ outcomes: [claim, { kind: "harness", outcome: "applied", approval }] });
-  expect(result.details.failures).toEqual([expect.stringContaining("belongs to another target")]);
+  const publication = { writeToolCallIds: ["missing-write"], checkToolCallIds: ["missing-check"], files: [{ path: target.path, afterHash: null }] };
+  const result = await f.run({ outcomes: [
+    claim,
+    { kind: "harness", outcome: "applied", approval: past, publication },
+    { kind: "harness", outcome: "applied", approval: current, publication },
+  ] });
+  expect(result.isError).toBe(true);
+  expect(result.details.failures).toHaveLength(2);
+  expect(result.details.failures).toEqual(expect.arrayContaining([
+    expect.stringContaining("earlier observation pass"),
+    expect.stringContaining(`\`${path}\`: write not confirmed`),
+  ]));
+  expect(result.details.records).toMatchObject([claim]);
+  expect(result.details.recording.rows).toEqual(["recorded"]);
   expect(readLedger(f.files.storeFile())).toMatchObject([claim]);
-  expect(result.content[0]?.text).not.toContain("Unrecorded publication");
+  expect(result.content[0]?.text).not.toMatch(/Published files:|Unrecorded publication/);
+  expect(existsSync(path)).toBe(false);
 });
 /** Writes half the data to a rule file, as a full disk would, then fails. */
 function failRuleWriteMidway(rulesDir: string) {

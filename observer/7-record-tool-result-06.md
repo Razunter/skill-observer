@@ -1,1 +1,0 @@
-**Custom input.** An answer of `Other: <text>` is the user's own text and never approves. When it asks for a change (another one, or this one narrowed or widened), prepare that change, select it and ask again with the new form. When it only declines or defers, record that outcome, a deferral's `reoffer` in the user's words.

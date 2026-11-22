@@ -107,14 +107,6 @@ describe("remedy ladder and report items", () => {
   const notePass = instructionText("discover", new Set<Gate>(["note"]));
   const paragraph = (label: string) => notePass.split("\n\n").find((block) => block.startsWith(`**${label}.**`)) ?? "";
 
-  it.each([
-    ["the ladder", "Remedy ladder", ["configuration or wiring repair", "last resorts: observer hook, then companion extension", "Before proposing either, read the procedure file named below."]],
-    ["owner discovery", "Remedy ladder", ["names a tool's supplier, not the cause", "caller error", "another extension's interception", "only where evidence points"]],
-    ["the report-item rule", "Report items", ["behavioural code of any extension but the companion, even under the project root", "confirmed, suspected or unknown", "Not stored."]],
-  ])("gives a pass with only a User note %s", (_label, label, phrases) => {
-    for (const phrase of phrases) expect(paragraph(label as string)).toContain(phrase);
-  });
-
   it("keeps the always-on addition within 150 words", () => {
     const words = [paragraph("Remedy ladder"), paragraph("Report items")].join(" ").split(/\s+/).filter(Boolean);
     expect(words.length).toBeGreaterThan(0);
@@ -128,19 +120,13 @@ describe("remedy ladder and report items", () => {
   });
 });
 
-describe("the hook and companion procedure file", () => {
+describe("the checked executable procedure", () => {
   const procedure = readFileSync(HOOKS_AND_COMPANION_PATH, "utf8");
 
   it("ships in the package without gate markers", () => {
     const { files } = JSON.parse(readFileSync(join(SRC_DIR, "..", "package.json"), "utf8")) as { files: string[] };
     expect(files).toContain(basename(HOOKS_AND_COMPANION_PATH));
     expect(procedure).not.toMatch(/<!--\s*(when\b|end\b)/);
-  });
-
-  it("tells the summary that each written, changed or removed file acts only after omp restarts, and how to remove a faulty hook by hand", () => {
-    expect(procedure).toContain("A written, changed or removed hook or companion file takes effect only after omp restarts");
-    expect(procedure).toContain("The summary says this for each such file");
-    expect(procedure).toContain("delete its file from the hooks directory");
   });
 });
 

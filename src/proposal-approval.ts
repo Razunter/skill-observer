@@ -33,7 +33,7 @@ import { isDeepStrictEqual } from "node:util";
 import { frontmatterField } from "./amendments.js";
 import { OBSERVATION_MESSAGE_TYPE } from "./digest.js";
 import type { AgentMessage, AskDetails, AskOptionNote, Schema, SchemaBuilder, SessionEntry } from "./omp.js";
-import { isProposalRef, type PreparedChange, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, preparedEntry, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, snapshot } from "./review.js";
+import { isProposalRef, type PreparedChange, type PreparedEntry, type PreparedProposal, type PreparedProposalRef, preparedEntry, preparedProjectEntries, proposalRefSchema, renderAskHtml, REVIEW_TOOL_NAME, snapshot } from "./review.js";
 import { hasUnlistedReferenceEntries, readReferenceFiles } from "./references.js";
 import { type CompletedToolCall, type SessionToolEvidence, sessionToolEvidence } from "./session-tool-evidence.js";
 
@@ -77,8 +77,7 @@ type ApprovedAnswer =
   | { skill: string; outcome: string; approval?: AnswerApproval };
 
 /** The prepared changes an approval lets `observer_resolve` carry out. */
-export type ApprovedChange = Exclude<PreparedChange, { operation: "direct-edit" | "project-edit" | "harness" }>;
-type HarnessChange = Extract<PreparedChange, { operation: "harness" }>;
+export type ApprovedChange = Exclude<PreparedChange, { operation: "direct-edit" | "project-edit" | "project-edits" | "profile-edit" | "harness" }>;
 /** The approved changes a reconciliation may revise. */
 type ReconcilableChange = Extract<PreparedChange, { operation: "on-read-append" | "rule" }>;
 
@@ -265,8 +264,9 @@ function approvedProposal<C>(ref: ProposalAnswerRef, evidence: SessionToolEviden
   }
   const details: unknown = selection.result.details;
   const chosen = details && typeof details === "object" && "selected" in details ? details.selected : undefined;
-  if (!Array.isArray(chosen) || !chosen.some((entry: { reference?: unknown } | undefined) => isDeepStrictEqual(entry?.reference, ref.proposal))) {
-    throw new Error(`Select \`${ref.selectionToolCallId}\` did not select this proposal`);
+  if (!Array.isArray(chosen) || !chosen.some((entry: Partial<PreparedEntry> | undefined) =>
+    isDeepStrictEqual(entry?.reference, ref.proposal) && isDeepStrictEqual(entry?.proposal, proposal))) {
+    throw new Error(`Select \`${ref.selectionToolCallId}\` did not select this exact prepared proposal`);
   }
   const askHtml = renderAskHtml(chosen.map(({ proposal }: { proposal: PreparedProposal }) => proposal));
   const { selected, note } = checkAnswer(ask, askHtml, proposal.candidateId, options);
@@ -278,50 +278,75 @@ function approvedProposal<C>(ref: ProposalAnswerRef, evidence: SessionToolEviden
   return { proposal, change: options.get(selected)!, selected, ...(note !== undefined && { note }), answeredAt: ask.result.position };
 }
 
-/**
- * The observer hook or companion proposal the user answered Apply at one of
- * `stages` in this pass, established from the saved Ask answer like any approval. An
- * approval note on this scope is custom input: the description or code is
- * revised by it and asked again, so a noted Apply approves nothing. A later
- * Prepare or answer of the same stage and identity supersedes the Apply.
- * Returns the branch position where the Apply was saved too.
- */
-export function approvedHarness<S extends HarnessChange["stage"]>(ref: Partial<ProposalAnswerRef> | undefined, stages: readonly S[], branch: readonly SessionEntry[]):
-  { proposal: PreparedProposal; change: Extract<HarnessChange, { stage: S }>; answeredAt: number } {
-  const approval = answerRef(ref);
-  const evidence = sessionToolEvidence(branch);
-  const { proposal, change, note, answeredAt } = approvedProposal(approval, evidence, branch, (prepared) => {
-    const change = "change" in prepared ? prepared.change : undefined;
-    if (change?.operation !== "harness" || !(stages as readonly string[]).includes(change.stage)) {
-      throw new Error(`the approved proposal is not a hook or companion ${stages.join(" or ")}${stages.includes("code" as S) ? ": an intent Apply authorises drafting only" : ""}`);
-    }
-    return new Map([[APPLY, change as Extract<HarnessChange, { stage: S }>]]);
-  });
-  if (note !== undefined) {
-    throw new Error(`the user chose Apply with the note ${JSON.stringify(note)}, which approves nothing for a hook or companion change: revise it by the note, prepare it and ask again`);
+export function approvedHarness(ref: Partial<ProposalAnswerRef> | undefined, branch: readonly SessionEntry[],
+    choice: "Apply" | "Later" | "Decline" = APPLY) {
+  const receipt = approvedOwner(ref, branch, sessionToolEvidence(branch), choice);
+  if (receipt.proposal.kind !== "harness" || receipt.change.operation !== "harness" || receipt.change.stage !== "checked") {
+    throw new Error("the answer does not approve checked executable code");
   }
-  checkLatestAnswer(approval, evidence, answeredAt);
-  return { proposal, change, answeredAt };
+  return { ...receipt, proposal: receipt.proposal, change: receipt.change };
 }
 
-export function approvedProject(ref: Partial<ProposalAnswerRef> | undefined, branch: readonly SessionEntry[], evidence = sessionToolEvidence(branch)) {
+export function approvedProject(ref: Partial<ProposalAnswerRef> | undefined, branch: readonly SessionEntry[], evidence = sessionToolEvidence(branch),
+    choice: "Apply" | "Later" | "Decline" = APPLY) {
+  const receipt = approvedOwner(ref, branch, evidence, choice);
+  if (receipt.proposal.kind !== "project" || (receipt.change.operation !== "project-edit" && receipt.change.operation !== "project-edits")) throw new Error("the approved proposal is not a project change");
+  return { ...receipt, proposal: receipt.proposal, change: receipt.change };
+}
+
+export function approvedProfile(ref: Partial<ProposalAnswerRef> | undefined, branch: readonly SessionEntry[], option: "Apply" | "Later" | "Decline" = APPLY) {
+  const receipt = approvedOwner(ref, branch, sessionToolEvidence(branch), option);
+  if (receipt.proposal.kind !== "profile" || receipt.change.operation !== "profile-edit") throw new Error("the approved proposal is not a profile change");
+  return { ...receipt, proposal: receipt.proposal, change: receipt.change };
+}
+
+function approvedOwner(ref: Partial<ProposalAnswerRef> | undefined, branch: readonly SessionEntry[], evidence = sessionToolEvidence(branch),
+    choice: "Apply" | "Later" | "Decline" = APPLY) {
   const approval = answerRef(ref);
   const { proposal, change, answeredAt, note } = approvedProposal(approval, evidence, branch, (prepared) => {
     const change = "change" in prepared ? prepared.change : undefined;
-    if (prepared.kind !== "project" || change?.operation !== "project-edit") {
-      throw new Error("this Apply does not cover an exact project change; prepare and ask again");
+    if (!(prepared.kind === "project" && (change?.operation === "project-edit" || change?.operation === "project-edits")) &&
+        !(prepared.kind === "profile" && change?.operation === "profile-edit") &&
+        !(prepared.kind === "harness" && change?.operation === "harness" && change.stage === "checked")) {
+      throw new Error("this answer does not cover an exact checked owner change; prepare and ask again");
     }
-    return new Map([[APPLY, change]]);
+    return new Map([[choice, change]]);
   });
-  if (proposal.kind !== "project") throw new Error("the approved proposal is not a project change");
-  if (note !== undefined && !/^(?:please )?verify(?: only)?[.!]?$/i.test(note)) {
+  if (choice === APPLY && note !== undefined && !/^(?:please )?verify(?: only)?[.!]?$/i.test(note)) {
     throw new Error("the Apply has a note that may change the approved work; prepare and ask again");
   }
   checkLatestAnswer(approval, evidence, answeredAt);
-  return { proposal, change, answeredAt, approval };
+  const files = new Set(ownerFiles(change));
+  const preparedAt = evidence.completedCall(approval.proposal.reviewToolCallId).result.position;
+  const askAt = evidence.completedCall(approval.askToolCallId).call.position;
+  if (branch.slice(preparedAt + 1, askAt).some(entry => isFromUser(entry.message))) {
+    throw new Error("the user spoke after the scope was prepared; Prepare and Ask again");
+  }
+  const superseded = preparedProjectEntries(evidence, observationPassStart(branch)!).some(({ reference, proposal: { change } }) =>
+    evidence.completedCall(reference.reviewToolCallId).result.position > preparedAt && ownerFiles(change).some(file => files.has(file)));
+  if (superseded) throw new Error("a destination appears in a newer review; Prepare and Ask for the exact current scope");
+  return { proposal, change, answeredAt, approval, note };
 }
 
-export function findProjectApproval(reference: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[], passStart: number) {
+function ownerFiles(change: PreparedChange): string[] {
+  switch (change.operation) {
+    case "project-edit": case "profile-edit": return [change.file];
+    case "project-edits": return change.edits.map(({ change }) => change.file);
+    case "harness": return change.files.map(({ file }) => file);
+    default: return [];
+  }
+}
+
+export function findProjectApproval(reference: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[], passStart: number,
+    choice: "Apply" | "Later" | "Decline" = APPLY) {
+  const receipt = findOwnerApproval(reference, evidence, branch, passStart, choice);
+  if (receipt?.proposal.kind === "project" && (receipt.change.operation === "project-edit" || receipt.change.operation === "project-edits")) {
+    return { ...receipt, proposal: receipt.proposal, change: receipt.change };
+  }
+}
+
+export function findOwnerApproval(reference: PreparedProposalRef, evidence: SessionToolEvidence, branch: readonly SessionEntry[], passStart: number,
+    choice: "Apply" | "Later" | "Decline" = APPLY) {
   const selections = evidence.completedCalls(REVIEW_TOOL_NAME).flatMap(({ call, result }) => {
     if (call.position <= passStart || call.args.action !== "select" || result.isError !== false) return [];
     const selected = (result.details as { selected?: PreparedEntry[] } | undefined)?.selected;
@@ -333,7 +358,7 @@ export function findProjectApproval(reference: PreparedProposalRef, evidence: Se
   if (!ask) return;
   const selectionToolCallId = selections.findLast((selected) => selected.position < ask.call.position && selected.html === ask.call.args.html)?.id;
   try {
-    return approvedProject({ proposal: reference, selectionToolCallId, askToolCallId: ask.call.id }, branch, evidence);
+    return approvedOwner({ proposal: reference, selectionToolCallId, askToolCallId: ask.call.id }, branch, evidence, choice);
   } catch {
     return undefined;
   }
@@ -403,7 +428,7 @@ export function preparedInPass(ref: PreparedProposalRef, evidence: SessionToolEv
 function approvingOptions(proposal: PreparedProposal): Map<string, ApprovedChange> {
   if ("alternatives" in proposal) return new Map(proposal.alternatives.map(({ change }) => [STALE_OPTIONS[change.operation], change]));
   const { change } = proposal;
-  if (change.operation === "direct-edit" || change.operation === "project-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself: cite its observed write as `publication`");
+  if (change.operation === "direct-edit" || change.operation === "project-edit" || change.operation === "project-edits" || change.operation === "profile-edit") throw new Error("the approved proposal is a direct edit, which the main agent makes itself: cite its observed write as `publication`");
   if (change.operation === "harness") throw new Error("the approved proposal is a hook or companion change, answered as a `harness` outcome");
   return new Map([[APPLY, change]]);
 }

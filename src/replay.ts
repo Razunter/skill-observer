@@ -31,6 +31,7 @@ export interface PatternDraft {
   matches?: Sample[];
   /** Legitimate counterparts: none may fire it. */
   spares?: Sample[];
+  ruleText?: string;
 }
 
 /** A pattern's scope: the agent's text, or one tool's calls. */
@@ -148,13 +149,13 @@ function fires(rule: string, scope: string, text: string, signal: AbortSignal | 
 }
 
 /** Replays every sample of `check` in parallel and reports those the pattern misjudged. */
-export async function replay(check: ReplayCase, signal?: AbortSignal): Promise<Verdict> {
+export async function replay(check: ReplayCase, signal?: AbortSignal, ruleText?: string): Promise<Verdict> {
   let dir: string | undefined;
   try {
     dir = mkdtempSync(join(tmpdir(), "skill-observer-replay-"));
     const rule = join(dir, "draft.md");
     const frontmatter = [frontmatterField("condition", check.condition), frontmatterField("scope", check.scope)];
-    writeFileSync(rule, ["---", ...frontmatter, "---", "", "Replay check.", ""].join("\n"));
+    writeFileSync(rule, ruleText ?? ["---", ...frontmatter, "---", "", "Replay check.", ""].join("\n"));
     const runs = [
       ...check.matches.map((text, index) => ({ sample: "matches" as const, index, text })),
       ...check.spares.map((text, index) => ({ sample: "spares" as const, index, text })),
@@ -215,13 +216,14 @@ export function registerCheckTool(pi: ExtensionAPI): void {
     name: CHECK_TOOL_NAME,
     label: "Observer Check",
     description:
-      "Replay drafted barrier-rule patterns through OMP's TTSR engine: each must fire on every `matches` sample and on no `spares` sample. Reports per draft whether it passed and which samples misfired. Writes nothing.",
+      "Replay rules through OMP's TTSR engine against a mistake and legitimate counterpart. For a hand-written rule, supply its exact replacement in `ruleText`. Writes only scratch.",
     parameters: z.object({
       drafts: z
         .array(
           z.object({
             name: z.string().describe("The rule's drafted name."),
             pattern: z.string().describe("Regex matching the mistake where `scope` watches."),
+            ruleText: z.string().optional().describe("Complete proposed profile rule file, including frontmatter."),
             ...sampleSchemas(z),
           }),
         )
@@ -240,7 +242,7 @@ export function registerCheckTool(pi: ExtensionAPI): void {
           } catch (error) {
             return { name: draft.name, verdict: "rejected", reason: (error as Error).message };
           }
-          return { name: draft.name, ...(await replay(check, signal)) };
+          return { name: draft.name, ...(await replay(check, signal, draft.ruleText)) };
         }),
       );
       const lines = results.map((result) =>

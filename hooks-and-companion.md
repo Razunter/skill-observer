@@ -1,97 +1,31 @@
-# Observer hooks and the companion extension
+# Checked hooks and extension changes
 
-This is the procedure for the last two rungs of the remedy ladder. The payload names the project hooks directory, the global hooks directory, the companion extension directory and the hook check script. `observer_review` and `observer_resolve` refuse a call that skips one of the steps they check.
+Use this route only when a configuration repair, guidance edit, rule or ordinary project check cannot fix the observed problem.
 
-## When each rung fits
+## Choose the owner
 
-- An **observer hook** fixes a mechanical mistake that a barrier rule, pattern amendment or project check cannot catch. It is one self-contained file. It may register event handlers and commands and keep state.
-- The **companion extension** is for a remedy a hook cannot carry: one that needs a registered tool, several modules or a dependency, or one that rewrites a call or its result. It is the one extension a pass may edit.
-- The intent says why each lower rung fails: configuration repair, skill text, barrier rule, pattern amendment, project check, and for the companion, a hook.
-- A fix in any other extension's code stays a report item.
+Use `kind: "harness"` and `target: { scope: "harness", root, mechanism }`. Keep the `mechanism` stable across drafts of the same remedy.
 
-## Scope and target
+- `project-hooks`: a hook specific to this checkout. `global-hooks`: a hook that applies across projects in this profile. Name an existing hook by its root-relative `path`, including for removal; omit `path` for a new `skill-observer-<fingerprint>.ts` hook. Use the same mechanism to retain the generated identity when revising it. For a new name, Prepare reports the expected path if the draft names a different one.
+- `extension`: an owned OMP extension source directory. Set `source` to its absolute canonical path; add `checkout` for a different checkout explicitly brought into scope by the user. An installed plugin or unrelated repository is not an owned source.
+- `companion`: the profile's companion extension. A new companion must declare its entries in `package.json` under `omp.extensions`.
 
-A candidate of these rungs has `kind: "harness"`, no skill name, and `target: { scope: "harness", root, mechanism }`. Its `mechanism` describes the mechanism in words and must contain letters or digits.
+## Check the draft
 
-- `root: "project-hooks"` fixes a mistake specific to this project. A project candidate whose path lies in the project's hooks directory is refused: propose that file here, as a project hook.
-- `root: "global-hooks"` runs in every project. Use it only when the mistake passes the skill-scope test: it would hold in another project and another task.
-- `root: "companion"` takes no `path`: its identity is the companion root and its mechanism.
-- A hook's `path` names an existing hook file relative to its hooks directory, hand-written ones included. It is a plain root-relative file path that stays inside the root. Leave it out for a new hook, which is named `skill-observer-<fingerprint>.ts` after the proposal's fingerprint.
+Create a private scratch directory with `mktemp -d "${TMPDIR:-/tmp}/omp-observe-check.XXXXXXXX"`. Use its canonical absolute path as the foreground Bash `cwd`. Use ordinary permissions. Do not write in the destination before Apply or shell-wrap the check.
 
-Keep the same target and mechanism from intent to code: together they are the identity both stages share.
+For a hook, put its one exact proposed file at its target-relative path in scratch. Replay the session's mistake and its nearest legitimate counterpart. The samples file is a JSON array of `{ name, role, event, toolName, input, toolCallId?, content?, isError?, expect }`. Use `role` of `mistake` or `legitimate`, `event` of `tool_call` or `tool_result`, and `expect` of `blocked`, `context` or `untouched`. To exercise a stateful sequence, order the events and give related calls and results the same `toolCallId`.
 
-## 1. The intent
+Run `bun --no-env-file '<bundled check-hook.ts path>' '<root-relative hook path>' '<absolute scratch sample path>'`. The bundled checker loads the hook and fails if it rewrites a tool call or result. For hook removal, leave the hook absent in scratch, use `--absent` before the hook path and expect both sampled events to be untouched.
 
-Prepare the described remedy with `change: { operation: "harness", stage: "intent", event, predicate, action, mistake, legitimate, scope, lowerRungs }`. Each field is non-blank:
+For an extension, copy the owned source into scratch, excluding `.git` and `node_modules`; apply the exact draft there. Run `bun --no-env-file test` against a suite that exercises the observed failure and its legitimate counterpart. Prepare compares the checked tree with the complete proposed postimage; do not omit unchanged source, config or test inputs. If a necessary check cannot run without widening permission, or the preview cannot match the checked inputs, report the finding, owner and next action. Do not Ask or record a decision.
 
-- `event`: the host event the hook handles, such as `tool_call` for one tool.
-- `predicate`: what in the event marks the mistake.
-- `action`: block the call, or add context. A hook that changes a call or its result fails the hook check; a remedy that must rewrite either goes to the companion extension, whose `bun test` can verify it.
-- `mistake`: the session's mistake as a sample event.
-- `legitimate`: its nearest legitimate counterpart, which the hook leaves untouched.
-- `scope`: why this project's hooks, the global hooks or the companion.
-- `lowerRungs`: why each lower rung fails.
+## Ask once, publish and record
 
-The intent goes through Prepare, Select and Ask in the main batch like any proposal. Its Apply authorises drafting only. Nothing is written on it, and it is never recorded as applied.
+Prepare `{ operation: "harness", stage: "checked", files: [{ path, text }], checkToolCallId, lowerRungs }`. Omit `text` only to remove a file. Cite the observed scratch Bash call ID and explain why a simpler remedy does not fit. Keep scratch unchanged and readable through Resolve. Select with the other eligible proposals and call the exact native Ask. Review shows each destination's before and after state, scratch command and result, blast radius and activation effect.
 
-## 2. Drafting
+Only the exact Apply authorizes publication. A `Verify only` note can preserve the reviewed change. For a note changing the work, or when the target or checked inputs change, refresh the check, Prepare and ask again.
 
-After the intent's Apply, give one subagent the intent text, both samples, the target file's root-relative path or the companion directory, and the hook check script's path. The subagent works in a new temporary directory, never in the target. It writes the draft there at the target's root-relative path, writes the samples file there, runs the check, and returns each file's exact text, the check command and the check's unedited output. When the session has no subagent tool, draft the same way yourself.
+Use `write` for each exact reviewed absolute path and complete result, or a single `edit` with its current read tag and only `REM` for a removal. After the writes, run the exact approved foreground Bash check in the reviewed root. Send one `kind: "harness"` outcome to Resolve. Cite `approval` for a native Apply, Later or Decline. For a verified Apply add `publication: { writeToolCallIds, checkToolCallIds, files: [{ path, afterHash }] }`; `afterHash` is the result's SHA-256 or `null` for removal. For eligible overflow use the `proposal` reference and `reoffer` instead of an approval. A missing approval, failed write or failed check does not become a ledger decision.
 
-A hook file default-exports a factory: `export default function (pi) { pi.on("tool_call", (event, ctx) => …) }`. A `tool_call` event carries `toolCallId`, `toolName` and `input`; a `tool_result` event adds `content` and `isError`. A handler blocks with `{ block: true, reason }` and adds context with `{ additionalContext }`. The hook check reports any other returned field, such as a changed `input` or `content`, as a failure.
-
-The hook samples file is a JSON array. Each sample is `{ name, role, event, toolName, input, toolCallId?, content?, isError?, expect }`:
-
-- `role` is `"mistake"` or `"legitimate"`. The file holds at least one of each.
-- `event` is `"tool_call"` or `"tool_result"`; `content` and `isError` belong to a `tool_result`.
-- `expect` is `"blocked"`, `"context"` or `"untouched"`.
-- A hook that keeps state gets the sequence its state needs, in order. Every sample runs against the same loaded hook.
-- `toolCallId` is the call's ID. A sample without one gets an ID of its own, so give a `tool_call` and its `tool_result` the same `toolCallId` when the hook relates them by it.
-
-Run the hook check from the temporary directory with `bun --no-env-file <hook check script> <hook path> <samples file>`: the script and samples file by absolute path, the hook by its root-relative path. The same command then reruns in the target root on the written hook, and Prepare refuses a hook check of any other form. It passes when it exits 0 and prints an `OK:` line. Run it with no arguments for its full usage.
-
-For the companion, copy the companion directory into the temporary directory when it exists, make the change there and run `bun test` there. A companion change:
-
-- lists every file it writes, each once, at a plain path relative to the companion directory;
-- writes or keeps a `package.json` whose `omp.extensions` names its entry files, since the host loads nothing else in the directory;
-- adds or keeps a test file named like `index.test.ts` (`.test`, `_test`, `.spec` or `_spec`) outside `node_modules`.
-
-When drafting or its check fails, ask no code question: record the intent as `later` (see Recording).
-
-## 3. The code
-
-Prepare the drafted code under the intent's target and mechanism, with `change: { operation: "harness", stage: "code", intent, files, check }`:
-
-- `intent`: the intent's Apply as you would cite an approval: `{ proposal: <its reference>, selectionToolCallId, askToolCallId }`. Prepare refuses the code when that Apply no longer holds, carries a note, or approved another identity.
-- `files`: `[{ path, text }]` with each file's exact text. A hook's code is its one file, at the target's `path` or `skill-observer-<fingerprint>.ts`, with non-blank text.
-- `check`: `{ command, output }`, the check the draft passed, exactly as run, and its unedited output. A hook's command is the hook check above; the companion's is `bun test`.
-
-Send the text and output with `\n` line ends only; a carriage return is refused because the Ask form cannot show it. Then Select the code proposal alone and Ask with its `askHtml`, apart from every other question. Call `ask` directly, as for every question: an Ask made through `eval` or by a hook approves nothing. The form shows each file, the check command and its result, with Apply, Later and Decline.
-
-## Approval notes
-
-On this scope an Apply with a note approves nothing: the note is custom input. Revise the description or the code by the note. For code, rerun the check. Prepare it again, Select it and Ask again.
-
-## 4. Publication
-
-After the code's Apply, write each approved file with the normal `write` tool at its path in the target root, byte for byte. Then rerun the approved check command exactly, in the foreground with `bash`, `cwd` set to the target root, after the last write. Use no `async` and no service name. Then take each written file's SHA-256, for example with `sha256sum`.
-
-## 5. Recording
-
-Send one `observer_resolve` outcome per identity, with `kind: "harness"`, in the pass's one resolve call:
-
-- `applied`, for published code: `approval` of the code's Apply (its reference, Select and Ask call IDs) and `publication: { writeToolCallIds, checkToolCallIds, files: [{ path, afterHash }] }`. Cite the actual `observerToolCallId` of each write and check. The resolver refuses the outcome unless each approved file has an observed write after the code's Apply, still holds its approved text, and has a stated hash equal to the hash of that text. It also refuses it unless each check ran the approved command and succeeded in the foreground in the target root after the writes. It writes no file. An intent's Apply never makes `applied`.
-- `declined`, when the user declined either stage: `proposal`, the reference of the proposal declined.
-- `later`, when the user answered Later at either stage, when drafting or its check failed, or when the code was never asked: `proposal`, the reference of the latest proposal of this identity, from the pass's latest Prepare that holds it. Give a `reoffer` for each `later` you record yourself. A code Later comes back as an intent question; the resolver notes that a draft existed.
-
-An answer is `applied`, `later` or `declined`. `approval` goes with `applied` alone and `proposal` with the others. The resolver refuses a second answer for the same identity in one call, and a hook or companion proposal sent as a skill or project outcome. The ledger record holds no file text, description or draft.
-
-## Removal
-
-To remove a hook file, prepare `change: { operation: "harness", stage: "removal" }` with the target naming the file by `path`, in either hooks directory. The companion is not removed this way. The form shows the file as it stands, with Apply and Decline only, asked once. After Apply, delete the file yourself, then send `applied` with the removal's `approval` and no `publication`. The resolver records the removal only once the file is gone. A declined removal is `declined` through `proposal`.
-
-## Activation and the summary
-
-A written, changed or removed hook or companion file takes effect only after omp restarts. A new session in the same process keeps the old set. The summary says this for each such file.
-
-The summary also says how to remove a faulty hook by hand: delete its file from the hooks directory, or the companion directory for the companion, and restart omp. A `tool_call` handler that throws or times out blocks the call, so a faulty hook can block the tools a pass would use to remove it.
+Report what was actually written and verified; do not repeat the writes if recording fails. The change takes effect on the next OMP load of the code, not on Apply. Publication does not activate code, restart OMP or deploy anything.

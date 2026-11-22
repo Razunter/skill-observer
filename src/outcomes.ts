@@ -11,7 +11,7 @@ export interface RemedyOutcome {
 /**
  * Report only what delivery receipts and explicit behavior evidence establish.
  * A skill fix counts exercises made after its amendment was delivered; a
- * project fix, hook or companion change has no amendment and counts
+ * project or profile fix, hook or companion change has no amendment and counts
  * exercises saved after its record.
  */
 export function remedyOutcomes(records: readonly LedgerRecord[], digest: SessionDigest): RemedyOutcome[] {
@@ -19,7 +19,7 @@ export function remedyOutcomes(records: readonly LedgerRecord[], digest: Session
   const outcomes: RemedyOutcome[] = [];
   for (const record of latest.values()) {
     if (!["applied", "updated", "kept"].includes(record.outcome) || record.compaction) continue;
-    const hasNoAmendment = record.kind === "project" || record.kind === "harness";
+    const hasNoAmendment = record.target !== undefined;
     // The ledger keeps the rule file's path; deliveries name the rule.
     const rule = record.rule && basename(record.rule, ".md");
     const delivered = !hasNoAmendment && rule && digest.skills.some((skill) =>
@@ -59,7 +59,7 @@ export function renderRemedyOutcomes(outcomes: readonly RemedyOutcome[], records
   const unlisted = outcomes.length - listed.length;
   return ["### Remedy outcomes", "", ...listed.map((outcome) => {
     const record = latest.get(outcome.fingerprint)!;
-    const target = record.kind === "project" ? ` (${record.target.path})` : record.kind === "harness" ? ` (${targetLabel(record)})` : "";
+    const target = record.kind === "project" ? ` (${record.target.path})` : record.target ? ` (${targetLabel(record)})` : "";
     return `- ${outcome.fingerprint}${target}: ${outcome.status}${outcome.evidence.length ? ` (evidence: ${outcome.evidence.join(", ")})` : "; missing relevant delivery/exercise evidence"}.`;
   }),
   ...(unlisted ? [`- ${unlisted} more ${unlisted === 1 ? "fix" : "fixes"} not listed: ${unlisted === 1 ? "its skill was" : "their skills were"} not loaded in this session.`] : [])].join("\n");

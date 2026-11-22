@@ -1185,9 +1185,15 @@ describe("observer_review selection", () => {
     mkdirSync(other);
     const project = { kind: "project", target: { scope: "project", root: other, path: "checks.json", mechanism: "Wire check" }, gist: "Wire check" };
     host.setCwd(other);
-    await host.callTool("observer_resolve", { outcomes: [{ ...project, outcome: "declined" }] });
+    const foreignDecline = await resolve(host, [{ ...project, outcome: "declined" }]);
+    expect(foreignDecline.isError, resultText(foreignDecline)).toBe(false);
     host.setCwd(root);
-    await host.callTool("observer_resolve", { outcomes: [outcome("tdd", "upstream", "Declined mechanism", "declined")] });
+    const skillDecline = await resolve(host, [outcome("tdd", "upstream", "Declined mechanism", "declined")]);
+    expect(skillDecline.isError, resultText(skillDecline)).toBe(false);
+    expect(ledgerRecords(host.ledgerFile)).toMatchObject([
+      { gist: project.gist, target: project.target, outcome: "declined" },
+      { gist: "Declined mechanism", outcome: "declined" },
+    ]);
     startPass(host);
     const result = await host.callTool("observer_review", { action: "prepare", candidates: [
       candidate("Declined mechanism"),
@@ -1206,7 +1212,16 @@ describe("observer_review selection", () => {
       judgeStates: {},
     });
     expect(JSON.stringify(result.details)).not.toContain("Declined mechanism");
-    await host.callTool("observer_resolve", { outcomes: [{ ...project, target: { ...project.target, root }, outcome: "declined" }] });
+    const proposal = reviewEntries(result)[1]!.reference;
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [proposal] });
+    expect(selection.isError, resultText(selection)).toBeFalsy();
+    const selectionToolCallId = lastCallId(host);
+    const askToolCallId = askUser(host, selection, () => "Decline");
+    const declined = await resolve(host, [{
+      ...project, target: { ...project.target, root }, outcome: "declined",
+      approval: { proposal, selectionToolCallId, askToolCallId },
+    }]);
+    expect(declined.isError, resultText(declined)).toBe(false);
     const suppressed = await host.callTool("observer_review", { action: "prepare", candidates: [
       { ...project, target: { ...project.target, root }, priority: "evidence", remedy: "Wire check", change: { operation: "project-edit", text: "{}\n", check: "bun test" } },
     ] });
@@ -1745,9 +1760,6 @@ describe("observer_review prepared proposals", () => {
     const json = JSON.stringify(entry?.proposal);
     expect(entry?.reference.contentHash).toBe(createHash("sha256").update(json).digest("hex"));
     expect(json).not.toContain("Seams");
-    // Pins the hash, with the temp home masked: Prepare keeps amendment sections out of the proposal.
-    expect(createHash("sha256").update(json.replaceAll(host.skillHome.home, "<home>")).digest("hex"))
-      .toBe("9b7475f73a21df123d098f59b350f20df2a1d781c058bc5658272c152addc5c6");
   });
 
   it("returns one Ask form that leads each fieldset with its action, gist and question, then details with inline formatting, then the preview whole, escaped and with hidden whitespace marked, with no option preselected", async () => {
@@ -2558,7 +2570,7 @@ describe("observer_resolve", () => {
 describe("exact project publication", () => {
   const regression = "import { expect, test } from 'bun:test';\nimport { total } from './invoice.js';\ntest('round the sum once', () => expect(total([5, 5])).toBe(5));\n";
   const command = "bun --no-env-file test invoice.test.js";
-  const targetOf = (root: string) => ({ scope: "project", root, path: "invoice.test.js", mechanism: "Keep invoice rounding covered" });
+  const targetOf = (root: string) => ({ scope: "project" as const, root, path: "invoice.test.js", mechanism: "Keep invoice rounding covered" });
   const candidate = (root: string, text: string | null = regression) => ({
     kind: "project", target: targetOf(root), gist: "Cover the 5-cent invoice", priority: "note",
     remedy: "Check the amount from the witnessed half-cent rounding regression",
@@ -2706,6 +2718,206 @@ describe("exact project publication", () => {
     },
   );
 
+  function checkoutGroup() {
+    const host = loadExtension();
+    const { home } = host.skillHome;
+    const roots = ["north", "south", "independent"].map(name => join(home, name));
+    const main = join(home, "repository");
+    const git = (...args: string[]) => {
+      const run = spawnSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args], {
+        cwd: home, encoding: "utf8", env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+          GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" },
+      });
+      expect(run.status, run.stderr).toBe(0);
+    };
+    git("init", main);
+    git("-C", main, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "--allow-empty", "-m", "Fixture");
+    git("-C", main, "worktree", "add", "-b", "north", roots[0]!);
+    git("-C", main, "worktree", "add", "-b", "south", roots[1]!);
+    git("init", "-b", "independent", roots[2]!);
+    host.setCwd(roots[0]!);
+    const before = roots.map((root, i) => {
+      const text = `// obsolete test ${i}\n`;
+      writeFileSync(join(root, "invoice.test.js"), text);
+      writeFileSync(join(root, "invoice.js"), "export const total = lines => Math.round(lines.reduce((a, b) => a + b, 0) / 2);\n");
+      return text;
+    });
+    const edits = roots.map((root, i) => ({ target: targetOf(root), text: `${regression}// checkout ${i}\n`, check: command }));
+    const { target: _, ...base } = candidate(roots[0]!);
+    const draft = { ...base, change: { operation: "project-edits", edits } };
+    const open = async (note: string) => {
+      await host.runCommand("observe", note);
+      await host.commitMessage(host.sent.at(-1)!.message);
+    };
+    const prepareGroup = () => host.callTool("observer_review", { action: "prepare", candidates: [draft] });
+    const askGroup = async (note: string, answer?: AnswerUser) => {
+      await open(note);
+      const prepared = await prepareGroup();
+      const proposed = reviewEntries(prepared);
+      expect(proposed, resultText(prepared)).toHaveLength(1);
+      const proposal = proposed[0]!.reference;
+      const selection = await host.callTool("observer_review", { action: "select", proposals: [proposal] });
+      const selectionToolCallId = lastCallId(host);
+      expect(reviewEntries(selection, "selected")).toHaveLength(1);
+      const askToolCallId = askUser(host, selection, answer);
+      return { approval: { proposal, selectionToolCallId, askToolCallId }, selection };
+    };
+    const writeArgs = (i: number) => ({ path: join(roots[i]!, "invoice.test.js"), content: edits[i]!.text });
+    const publish = async (i: number, failure?: "denied" | "mismatch" | "check failed") => {
+      const input = writeArgs(i);
+      expect(await host.toolCall("write", input, `write-${i}`)).toBeUndefined();
+      if (failure !== "denied") writeFileSync(input.path, input.content);
+      await postResult(host, "write", `write-${i}`, input, undefined, failure === "denied");
+      if (failure === "denied") return;
+      const cwd = failure === "mismatch" ? roots[2]! : roots[i]!;
+      const check = { command, cwd };
+      expect(await host.toolCall("bash", check, `check-${i}`)).toBeUndefined();
+      const run = spawnSync("bun", ["--no-env-file", "test", "invoice.test.js"], { cwd, encoding: "utf8" });
+      expect(run.status, run.stderr).toBe(failure === "check failed" ? 1 : 0);
+      await postResult(host, "bash", `check-${i}`, check, { exitCode: run.status }, run.status !== 0);
+    };
+    const resolveGroup = (approval: unknown, outcome = "applied") =>
+      host.callTool("observer_resolve", { outcomes: [{ kind: "project-group", approval, outcome }] });
+    const note = `Review invoice coverage.\nInclude worktree: south\nInclude project root: ${roots[2]}`;
+    return { host, roots, before, edits, draft, open, prepareGroup, askGroup, writeArgs, publish, resolveGroup, note };
+  }
+
+  it("checks both sibling worktrees and an explicitly scoped independent checkout under one exact Apply", async () => {
+    const { host, roots, edits, before, askGroup, publish, resolveGroup, note } = checkoutGroup();
+    const { approval, selection } = await askGroup(note);
+    const html = JSON.parse(resultText(selection)).askHtml;
+    for (const [i, root] of roots.entries()) {
+      expect(html).toContain(join(root, "invoice.test.js"));
+      expect(html).toContain(before[i]!.trim());
+      expect(html).toContain(`checkout ${i}`);
+      expect(html).toContain(`Verify in ${root}: ${command}`);
+      await publish(i);
+    }
+    const result = await resolveGroup(approval);
+    expect(result.isError, resultText(result)).toBe(false);
+    expect(ledgerRecords(host.ledgerFile)).toEqual(edits.map(({ target }) => expect.objectContaining({
+      target, fingerprint: projectFingerprint(target), outcome: "applied",
+    })));
+  });
+
+  it("takes scope from a live user instruction, not old prompts, path mentions or assistant and scout echoes", async () => {
+    const { host, roots, open, prepareGroup, note } = checkoutGroup();
+    await host.commitPrompt(`Include project root: ${roots[2]}`);
+    await host.commitPrompt("Review invoice coverage in the current repository only.");
+    host.getBranch().push(
+      { type: "message", message: { role: "assistant", content: note } },
+      { type: "message", message: { role: "toolResult", toolName: "task", content: note } },
+      { type: "custom_message", customType: "branch_summary", content: note },
+    );
+    await open(`Prior reports mentioned ${roots[2]}.\nInclude worktree: south\nInclude worktree: independent\n\`\`\`text\n${note}\n\`\`\``);
+    const refused = await prepareGroup();
+    expect(reviewEntries(refused)).toEqual([]);
+    expect(resultText(refused)).toContain("not in the user's project scope");
+    expect(await host.toolCall("write", { path: join(roots[2]!, "invoice.test.js"), content: "// unreviewed\n" }, "unscoped")).toMatchObject({ block: true });
+    expect(readFileSync(join(roots[2]!, "invoice.test.js"), "utf8")).toBe("// obsolete test 2\n");
+    await host.commitPrompt(`For the invoice fix:\nAlso apply this fix in \`${roots[2]}\``);
+    await open("Include worktree: south");
+    expect(reviewEntries(await prepareGroup())).toHaveLength(1);
+  });
+
+  it.each(["changed sibling", "removed sibling", "injected file", "retargeted link", "modified text", "extra destination",
+    "denied write", "wrong-cwd check", "failed check"] as const)(
+    "preserves exact scope and reports per checkout: %s", async failure => {
+      const { host, roots, before, askGroup, publish, resolveGroup, writeArgs, note } = checkoutGroup();
+      if (failure === "injected file") rmSync(writeArgs(1).path);
+      const { approval } = await askGroup(note);
+      if (failure === "denied write" || failure === "wrong-cwd check" || failure === "failed check") {
+        await publish(2);
+        if (failure === "failed check") writeFileSync(join(roots[1]!, "invoice.js"), "export const total = () => 6;\n");
+        await publish(1, failure === "denied write" ? "denied" : failure === "failed check" ? "check failed" : "mismatch");
+        await publish(0);
+        expect(await host.toolCall("write", writeArgs(2), "repeat")).toMatchObject({ block: true });
+        const result = await resolveGroup(approval);
+        expect(result.isError).toBe(true);
+        expect(resultText(result)).toContain(join(roots[1]!, "invoice.test.js"));
+        expect(resultText(result)).toContain(failure === "denied write" ? "untouched" : "written but unverified");
+        expect(ledgerRecords(host.ledgerFile).map(record => record.target?.root)).toEqual([roots[0], roots[2]]);
+        return;
+      }
+      const sibling = writeArgs(1).path;
+      if (failure === "changed sibling") writeFileSync(sibling, "// changed independently\n");
+      if (failure === "removed sibling") rmSync(sibling);
+      if (failure === "retargeted link") {
+        rmSync(sibling);
+        symlinkSync(writeArgs(2).path, sibling);
+      }
+      if (failure === "injected file") writeFileSync(sibling, "// appeared since review\n");
+      const input = failure === "modified text" ? { ...writeArgs(0), content: "// different change\n" } :
+        failure === "extra destination" ? { ...writeArgs(0), path: join(roots[2]!, "unreviewed.js") } : writeArgs(0);
+      expect(await host.toolCall("write", input, "blocked")).toMatchObject({ block: true });
+      expect(readFileSync(writeArgs(0).path, "utf8")).toBe(before[0]);
+      expect(existsSync(join(roots[2]!, "unreviewed.js"))).toBe(false);
+      expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+    },
+  );
+
+  it("does not reuse the original Apply after Prepare changes the target set", async () => {
+    const { host, draft, roots, edits, before, askGroup, writeArgs, note } = checkoutGroup();
+    await askGroup(note);
+    const revised = await host.callTool("observer_review", { action: "prepare", candidates: [{
+      ...draft, change: { operation: "project-edits", edits: edits.slice(0, 2) },
+    }] });
+    expect(reviewEntries(revised)).toHaveLength(1);
+    for (let i = 0; i < roots.length; i++) {
+      expect(await host.toolCall("write", writeArgs(i), `old-scope-${i}`)).toMatchObject({ block: true });
+      expect(readFileSync(writeArgs(i).path, "utf8")).toBe(before[i]);
+    }
+    expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+  });
+
+  it("reports an Unrecorded publication only for the destination whose ledger write fails", async () => {
+    const { host, roots, edits, askGroup, publish, resolveGroup, writeArgs, note } = checkoutGroup();
+    const { approval } = await askGroup(note);
+    for (let i = 0; i < roots.length; i++) await publish(i);
+    const refused = projectFingerprint(edits[1]!.target);
+    writeObserverStore(host.ledgerFile, new Date(), (db) => db.run(`
+      CREATE TRIGGER refuse_south BEFORE INSERT ON proposals
+      WHEN NEW.fingerprint = '${refused}'
+      BEGIN SELECT RAISE(ABORT, 'target row rejected'); END;
+    `));
+    const result = await resolveGroup(approval);
+    expect(result.isError).toBe(true);
+    expect(resultText(result)).toContain("Unrecorded publication");
+    expect(resultText(result)).toContain("target row rejected");
+    expect(resultText(result)).toContain(writeArgs(1).path);
+    expect(ledgerRecords(host.ledgerFile).map(record => record.target?.root)).toEqual([roots[0], roots[2]]);
+    expect(readFileSync(writeArgs(1).path, "utf8")).toBe(edits[1]!.text);
+  });
+
+  it("does not silently remove a declined destination or let it suppress an independent change", async () => {
+    const { host, roots, edits, draft, open, publish, note } = checkoutGroup();
+    host.setCwd(roots[1]!);
+    const south = candidate(roots[1]!);
+    const { approval } = await approveCandidates(host, [south], () => "Decline");
+    const declined = await host.callTool("observer_resolve", { outcomes: [{ kind: "project", target: south.target,
+      gist: south.gist, outcome: "declined", approval: approval(south.gist) }] });
+    expect(declined.isError, resultText(declined)).toBe(false);
+    host.setCwd(roots[0]!);
+    await open(note);
+    const north = candidate(roots[0]!, edits[0]!.text);
+    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [draft, north] });
+    expect(resultText(prepared)).toContain("was declined; review revised scope");
+    expect(reviewEntries(prepared)).toHaveLength(1);
+    expect(reviewEntries(prepared)[0]!.proposal.change.operation).toBe("project-edit");
+    const proposal = reviewEntries(prepared)[0]!.reference;
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [proposal] });
+    const selectionToolCallId = lastCallId(host);
+    const askToolCallId = askUser(host, selection);
+    await publish(0);
+    const result = await host.callTool("observer_resolve", { outcomes: [{ kind: "project", target: north.target,
+      gist: north.gist, outcome: "applied", approval: { proposal, selectionToolCallId, askToolCallId },
+      publication: { writeToolCallId: "write-0", checkToolCallIds: ["check-0"], afterHash: createHash("sha256").update(edits[0]!.text).digest("hex") },
+    }] });
+    expect(result.isError, resultText(result)).toBe(false);
+    expect(ledgerRecords(host.ledgerFile).map(record => [record.target?.root, record.outcome]))
+      .toEqual([[roots[1], "declined"], [roots[0], "applied"]]);
+  });
+
   it.each(["true", "git status", "bun test --help", "bun test; true", "bun test\ntrue"])("does not offer Apply for %s", async (check) => {
     const host = loadExtension();
     const draft = candidate(host.skillHome.roots.cwd);
@@ -2713,6 +2925,157 @@ describe("exact project publication", () => {
     const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [{ ...draft, change: { ...draft.change, check } }] });
     expect(reviewEntries(prepared)).toEqual([]);
     expect(resultText(prepared)).toContain("meaningful foreground check");
+  });
+});
+
+describe("exact profile publication", () => {
+  const profile = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.home, ".omp/agent");
+  const draftFor = (host: ReturnType<typeof loadExtension>, path: string, text: string, check: unknown) => ({
+    kind: "profile", target: { scope: "profile", root: profile(host), path, mechanism: "Prevent focused tests" },
+    gist: "Keep the full test suite in scope", priority: "note", remedy: "Avoid hiding the tests that reproduce the bug",
+    change: { operation: "profile-edit", text, check },
+    evidence: [{ quote: "The focused test hid the failing case.", count: 1 }],
+  });
+  const prepare = (host: ReturnType<typeof loadExtension>, draft: unknown) =>
+    host.callTool("observer_review", { action: "prepare", candidates: [draft] });
+  async function publish(host: ReturnType<typeof loadExtension>, draft: ReturnType<typeof draftFor>) {
+    const prepared = await prepare(host, draft);
+    expect(reviewEntries(prepared), rejectionReasons(prepared).join("; ")).toHaveLength(1);
+    const selection = await host.callTool("observer_review", { action: "select", proposals: [reviewEntries(prepared)[0]!.reference] });
+    const proposal = reviewEntries(selection, "selected")[0]!;
+    expect(proposal.proposal.preview).toContain("Profile-wide");
+    const selectionToolCallId = lastCallId(host);
+    const path = join(draft.target.root, draft.target.path);
+    const input = { path, content: draft.change.text };
+    expect(await host.toolCall("write", { ...input, content: "unreviewed" }, "wrong-content")).toMatchObject({ block: true });
+    expect(await host.toolCall("write", { path: join(draft.target.root, "other.md"), content: "extra" }, "extra-target")).toMatchObject({ block: true });
+    expect(await host.toolCall("write", input, "no-apply")).toMatchObject({ block: true });
+    const askToolCallId = askUser(host, selection);
+    const extraPatch = { input: `*** Begin Patch\n[${path}#1234]\nREM\n[${join(draft.target.root, "other.md")}#5678]\nREM\n*** End Patch\n` };
+    expect(await host.toolCall("edit", extraPatch, "extra-edit")).toMatchObject({ block: true });
+    expect(await host.toolCall("write", input, "profile-write")).toBeUndefined();
+    writeFileSync(path, input.content);
+    await host.toolResult({ toolName: "write", toolCallId: "profile-write", input, content: [], isError: false });
+    return resolve(host, [{
+      kind: draft.kind, target: draft.target, gist: draft.gist, outcome: "applied",
+      approval: { proposal: proposal.reference, selectionToolCallId, askToolCallId },
+      publication: { writeToolCallId: "profile-write", afterHash: createHash("sha256").update(input.content).digest("hex") },
+    }]);
+  }
+
+  it.skipIf(!ompAvailable)("requires both counterexamples in a real rule replay before exact Apply and preserves handwriting", async () => {
+    const host = loadExtension();
+    for (const key of ["OMP_PROFILE", "PI_PROFILE", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]) vi.stubEnv(key, undefined);
+    const root = profile(host);
+    const rule = (condition: string) => `---\ncondition: ${JSON.stringify(condition)}\nscope: text\n---\n\nRun all tests.\n`;
+    const pattern = "\\bit\\.only\\(";
+    const path = "rules/no-focused-tests.md";
+    mkdirSync(join(root, "rules"), { recursive: true });
+    const original = "\\.only\\b";
+    writeFileSync(join(root, path), rule(original));
+    await resolve(host, [{ kind: "project", target: { scope: "project", root: host.skillHome.roots.cwd, path, mechanism: "Prevent focused tests" },
+      gist: "Keep the full test suite in scope", outcome: "declined" }]);
+    await host.runCommand("observe", "Review the focused-test rule false positive.");
+    await host.commitMessage(host.sent.at(-1)!.message);
+    const draft = draftFor(host, path, rule(pattern), { kind: "pattern", replayToolCallId: "missing" });
+    expect(rejectionReasons(await prepare(host, draft))).toEqual([expect.stringMatching(/report item.*observer_check/i)]);
+    const samples = { name: "no-focused-tests", scope: "text", matches: ["it.only('adds')"], spares: ["Run the whole file, never .only ones."] };
+    const old = await host.callTool("observer_check", { drafts: [{ ...samples, pattern: original, ruleText: rule(original) }] });
+    expect(old.details).toMatchObject({ results: [{ verdict: "misfired", misfires: [{ sample: "spares", index: 0 }] }] });
+    const wrong = await host.callTool("observer_check", { drafts: [{ ...samples, pattern }] });
+    expect(wrong.details).toMatchObject({ results: [{ verdict: "passed" }] });
+    const unrelated = { ...draft, change: { ...draft.change, check: { kind: "pattern", replayToolCallId: lastCallId(host) } } };
+    expect(rejectionReasons(await prepare(host, unrelated))).toEqual([expect.stringContaining("exact drafted rule")]);
+    const replay = await host.callTool("observer_check", { drafts: [{ ...samples, pattern, ruleText: rule(pattern) }] });
+    expect(replay.details).toMatchObject({ results: [{ verdict: "passed" }] });
+    const replayToolCallId = lastCallId(host);
+    const result = await publish(host, { ...draft, change: { ...draft.change, check: { kind: "pattern", replayToolCallId } } });
+    expect(result.details).toMatchObject({ records: [{ kind: "profile", outcome: "applied" }], failures: [] });
+    expect(readFileSync(join(root, path), "utf8")).toBe(rule(pattern));
+    expect(ledgerRecords(host.ledgerFile).map(({ kind, outcome }) => [kind, outcome])).toEqual([["project", "declined"], ["profile", "applied"]]);
+  }, 30_000);
+
+  it.skipIf(!ompAvailable).each(["manual-only", "disable"])("uses the host's %s control without patching a noisy installed skill", async (mode) => {
+    const host = loadExtension();
+    const root = profile(host);
+    const skill = "noisy-fixture";
+    const plugin = installPlugin(host.skillHome.roots, "observer-fixture@fixtures", "1.0.0", [skill]);
+    const entry = join(plugin, "skills", skill, "SKILL.md");
+    const original = `---\nname: ${skill}\ndescription: Too broadly advertised.\n---\nReal guidance.\n`;
+    writeFileSync(entry, original);
+    const list = () => {
+      const run = spawnSync("omp", ["skill", "list", "--json"], {
+        cwd: host.skillHome.roots.cwd, encoding: "utf8",
+        env: { PATH: process.env.PATH, HOME: host.skillHome.home, XDG_CONFIG_HOME: host.skillHome.home, PI_CODING_AGENT_DIR: root },
+      });
+      expect(run.status, run.stderr).toBe(0);
+      const result: { skills: { name: string; hide: boolean; filePath: string }[] } = JSON.parse(run.stdout);
+      return result.skills.find(({ name }) => name === skill);
+    };
+    expect(list()).toMatchObject({ hide: false, filePath: entry });
+    startPass(host);
+    const text = mode === "manual-only" ? `skills:\n  manualSkills: [${skill}]\n` : `disabledExtensions: ["skill:${skill}"]\n`;
+    const unrelated = await prepare(host, draftFor(host, "config.yml", `${text}ttsr:\n  enabled: false\n`, { kind: "skill-control", skill, mode }));
+    expect(rejectionReasons(unrelated)).toEqual([expect.stringMatching(/unrelated settings/i)]);
+    const result = await publish(host, draftFor(host, "config.yml", text, { kind: "skill-control", skill, mode }));
+    expect(result.details).toMatchObject({ records: [{ kind: "profile", outcome: "applied" }], failures: [] });
+    if (mode === "manual-only") expect(list()).toMatchObject({ hide: true });
+    else expect(list()).toBeUndefined();
+    expect(readFileSync(entry, "utf8")).toBe(original);
+  }, 30_000);
+
+  it("reports generic and unrelated content checks and refuses a retargeted profile parent", async () => {
+    const host = loadExtension();
+    const nested = join(profile(host), "guides");
+    mkdirSync(nested, { recursive: true });
+    const draft = draftFor(host, "guides/review.md", "Run the whole suite.\n", { kind: "content", contains: "Run the whole suite." });
+    startPass(host);
+    for (const check of ["true", { kind: "content", contains: "missing" }]) {
+      expect(rejectionReasons(await prepare(host, { ...draft, change: { ...draft.change, check } }))).toEqual([expect.stringMatching(/report item.*next action/i)]);
+    }
+    await approveCandidates(host, [draft]);
+    renameSync(nested, `${nested}-old`);
+    symlinkSync(host.skillHome.roots.cwd, nested);
+    expect(await host.toolCall("write", { path: join(nested, "review.md"), content: draft.change.text }, "retargeted")).toMatchObject({ block: true });
+    expect(existsSync(join(host.skillHome.roots.cwd, "review.md"))).toBe(false);
+  });
+
+  it("records a profile guidance repair whose actual published content passes inspection", async () => {
+    const host = loadExtension();
+    const old = "Run only the failing test.";
+    const next = "Run all tests that exercise the behavior.";
+    writeFileSync(join(profile(host), "RULES.md"), `${old}\n`);
+    startPass(host);
+    const draft = draftFor(host, "RULES.md", `${next}\n`, { kind: "content", contains: next, excludes: old });
+    const recorded = await publish(host, draft);
+    expect(recorded.details).toMatchObject({ records: [{ kind: "profile", outcome: "applied" }], failures: [] });
+    expect(resultText(recorded)).toContain("Verified published bytes");
+    expect(readFileSync(join(profile(host), "RULES.md"), "utf8")).toBe(`${next}\n`);
+  });
+
+  it("only offers a diagnosed installed-copy edit after an explicit scoped User note", async () => {
+    const host = loadExtension();
+    const root = host.skillHome.home;
+    vi.stubEnv("PI_CODING_AGENT_DIR", root);
+    const skill = "ce-code-review";
+    const entry = join(installPlugin(host.skillHome.roots, CE_PLUGIN, "3.30.1", [skill]), "skills", skill, "SKILL.md");
+    const passage = "Review code changed in this checkout.";
+    const draft = { ...draftFor(host, relative(root, entry), readFileSync(entry, "utf8").replace("Fixture skill.", passage),
+      { kind: "content", contains: passage, installedCopy: { skill, why: "The source is unavailable; disabling would lose needed use, and an on-read fix cannot correct the catalog before selection." } }),
+      gist: "Correct the advertised review scope" };
+    draft.target.root = root;
+    startPass(host);
+    expect(rejectionReasons(await prepare(host, draft))).toEqual([expect.stringContaining("Only the user can opt into")]);
+    await host.runCommand("observe", `allow-installed-copy ${skill}`);
+    await host.commitMessage(host.sent.at(-1)!.message);
+    expect(rejectionReasons(await prepare(host, draft))).toEqual([expect.stringContaining("candidate diagnosis")]);
+    await host.callTool("observer_review", { action: "inspect", skill });
+    const diagnosed = { ...draft, diagnosis: { inspection: lastCallId(host), explanation: "The file does not describe the checkout scope.", delta: passage,
+      citations: [{ source: entry, lines: { from: 3, to: 3 } }] } };
+    expect(reviewEntries(await prepare(host, diagnosed))[0]?.proposal.preview).toContain("Updates can overwrite it");
+    const result = await publish(host, diagnosed);
+    expect(result.details).toMatchObject({ records: [{ kind: "profile", outcome: "applied" }], failures: [] });
+    expect(readFileSync(entry, "utf8")).toBe(draft.change.text);
   });
 });
 
@@ -2929,121 +3292,363 @@ describe("project proposal decisions", () => {
   });
 });
 
-describe("observer hook and companion intents", () => {
-  const agentDir = (host: ReturnType<typeof loadExtension>) => join(host.skillHome.home, ".omp/agent");
-  const projectHooks = (host: ReturnType<typeof loadExtension>) => join(realpathSync(host.skillHome.roots.cwd), ".omp/hooks/pre");
-  const intent = (root: string, mechanism: string, target: Record<string, unknown> = {}) => ({
-    kind: "harness", target: { scope: "harness", root, mechanism, ...target },
-    gist: mechanism, priority: "evidence", remedy: "Block the mistake in code",
-    change: {
-      operation: "harness", stage: "intent", event: "tool_call for bash", predicate: "the command runs `git commit` in a jj repository",
-      action: "block the call and name `jj commit`", mistake: "git commit -m fix", legitimate: "jj commit -m fix",
-      scope: "every jj repository", lowerRungs: "A barrier rule only reminds; no project check runs before the commit.",
-    },
-    evidence: [{ quote: "git commit again", count: 2 }],
-  });
-  /** Prepares and selects `candidates` in a new pass, has the user give each the answer, and returns the selected references. */
-  const asked = async (host: ReturnType<typeof loadExtension>, candidates: unknown[], answer: AnswerUser) => {
-    const selection = await prepareAndSelect(host, candidates);
-    askUser(host, selection, answer);
-    return reviewEntries(selection, "selected");
-  };
-  const answered = (entries: ReviewEntry[], outcome: string) => entries.map(({ reference }) => ({ kind: "harness", proposal: reference, outcome }));
-  const otherProject = (host: ReturnType<typeof loadExtension>) => {
-    const other = join(host.skillHome.home, "other-project");
-    mkdirSync(other, { recursive: true });
-    host.setCwd(other);
-    return other;
-  };
-  const hookText = "export default function (pi) {\n  pi.on(\"tool_call\", (event) => event.input.command?.startsWith(\"git commit\") ? { block: true, reason: \"use jj commit\" } : undefined);\n}\n";
-  const checkOutput = "mistake git commit -m fix: blocked\nlegitimate jj commit -m fix: untouched";
-  /** The hook check the draft passed, run on the hook at its root-relative `file` so the same command reruns in the root after the write. */
-  const hookCheck = (file: string) => ({ command: `bun --no-env-file ${HOOK_CHECK_PATH} ${file} /tmp/draft/samples.json`, output: checkOutput });
-  const sha = (text: string) => createHash("sha256").update(text).digest("hex");
-  const evidence = [{ quote: 'Tool error in `bash` "git commit -m fix": "fatal: not a git repository"', count: 2 }];
-  const code = (root: string, mechanism: string, approval: unknown, files: Array<{ path: string; text: string }>, target: Record<string, unknown> = {}, check = hookCheck(files[0]?.path ?? "")) => ({
-    ...intent(root, mechanism, target), evidence, change: { operation: "harness", stage: "code", intent: approval, files, check },
-  });
-  /** Starts a pass in which the user answers `candidate` alone with `answer`; returns its form, proposal and where the answer is saved. */
-  const askIntent = async (host: ReturnType<typeof loadExtension>, candidate: unknown, answer: AnswerUser = () => "Apply") => {
-    const selection = await prepareAndSelect(host, [candidate]);
-    const selectionToolCallId = lastCallId(host);
-    const askToolCallId = askUser(host, selection, answer);
-    const [entry] = reviewEntries(selection, "selected");
-    return { selection, proposal: entry!.proposal, approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } };
-  };
-  /** Prepares, selects and asks the code candidate in the current pass. */
-  const askCode = async (host: ReturnType<typeof loadExtension>, candidate: unknown, answer: AnswerUser = () => "Apply") => {
-    const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [candidate] });
-    expect(failures(prepared)).toEqual([]);
+describe("exact executable publication", () => {
+  const hookText = `export default pi => pi.on("tool_call", ({ input }) =>
+  input.command === "run focused suite" ? { block: true, reason: "run full suite" } : undefined);
+`;
+  const lowerRungs = "The shell call bypasses project checks, and a profile pattern cannot distinguish the actual tool event.";
+  const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+  async function bashReceipt(host: ReturnType<typeof loadExtension>, cwd: string, command: string, id: string) {
+    const input = { cwd, command };
+    expect(await host.toolCall("bash", input, id)).toBeUndefined();
+    const run = spawnSync("bash", ["-c", command], { cwd, encoding: "utf8" });
+    const output = run.stdout + run.stderr;
+    host.getBranch().push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", id, name: "bash", arguments: input }] } });
+    await host.toolResult({ toolName: "bash", toolCallId: id, input, isError: run.status !== 0,
+      content: [{ type: "text", text: output }], details: { exitCode: run.status } });
+    host.getBranch().push({ type: "message", message: { role: "toolResult", toolName: "bash", toolCallId: id, isError: run.status !== 0,
+      content: [{ type: "text", text: output }], details: { exitCode: run.status ?? undefined } } });
+    return { status: run.status, output };
+  }
+
+  async function hookDraft(host: ReturnType<typeof loadExtension>, options: { removal?: boolean; unavailable?: boolean; failed?: boolean } = {}) {
+    const cwd = host.skillHome.roots.cwd;
+    const scratch = mkdtempSync(join(tmpdir(), "omp-observe-check."));
+    const target = { scope: "harness", root: "project-hooks", project: cwd, mechanism: "Stop focused suite in this checkout" } as const;
+    const path = `skill-observer-${harnessFingerprint(target)}.ts`;
+    const root = join(cwd, ".omp/hooks/pre");
+    mkdirSync(root, { recursive: true });
+    const file = join(root, path);
+    const samples = join(scratch, "samples.json");
+    writeFileSync(samples, JSON.stringify([
+      { name: "focused suite", role: "mistake", event: "tool_call", toolName: "bash", input: { command: "run focused suite" },
+        expect: options.removal || options.failed ? "untouched" : "blocked" },
+      { name: "full suite", role: "legitimate", event: "tool_call", toolName: "bash", input: { command: "run full suite" }, expect: "untouched" },
+    ]));
+    if (options.removal) writeFileSync(file, hookText);
+    else writeFileSync(join(scratch, path), hookText, { mode: 0o600 });
+    const command = `bun --no-env-file '${HOOK_CHECK_PATH}' ${options.removal ? "--absent " : ""}${path} '${samples}'`;
+    const files = [{ path, ...(options.removal ? {} : { text: hookText }) }];
+    if (!options.unavailable) {
+      const result = await bashReceipt(host, scratch, command, "scratch-hook-check");
+      expect(result.status, result.output).toBe(options.failed ? 1 : 0);
+    }
+    const draft = { kind: "harness", target: { ...target, ...(options.removal && { path }) },
+      gist: "Keep the full suite in scope", priority: "note", remedy: "Handle focused suite calls as witnessed",
+      change: { operation: "harness", stage: "checked", files, checkToolCallId: "scratch-hook-check", lowerRungs },
+      evidence: [{ quote: "run focused suite", count: 1 }],
+    };
+    return { draft, file, root, path, scratch, samples, command };
+  }
+
+  const prepare = (host: ReturnType<typeof loadExtension>, ...candidates: unknown[]) =>
+    host.callTool("observer_review", { action: "prepare", candidates });
+
+  async function ask(host: ReturnType<typeof loadExtension>, prepared: ToolResult<unknown>, answer?: AnswerUser) {
+    expect(rejectionReasons(prepared)).toEqual([]);
     const selection = await host.callTool("observer_review", { action: "select", proposals: reviewEntries(prepared).map(({ reference }) => reference) });
     const selectionToolCallId = lastCallId(host);
     const askToolCallId = askUser(host, selection, answer);
-    const [entry] = reviewEntries(selection, "selected");
-    return { selection, entry: entry!, approval: { proposal: entry!.reference, selectionToolCallId, askToolCallId } };
-  };
-  /** Saves a native write of `text` to `file` and a foreground check in `cwd` after it, as the pass publishes an approved hook; writes the file too. */
-  const publish = (host: ReturnType<typeof loadExtension>, file: string, text: string, cwd: string,
-    { checkFirst = false, checkFails = false, command = hookCheck(basename(file)).command } = {}) => {
+    const chosen = reviewEntries(selection, "selected");
+    return { chosen, approval: { proposal: chosen.find(({ proposal }) => proposal.kind === "harness")!.reference, askToolCallId, selectionToolCallId } };
+  }
+
+  async function ownerWrite(host: ReturnType<typeof loadExtension>, file: string, content: string, id: string) {
+    const input = { path: file, content };
+    expect(await host.toolCall("write", input, id)).toBeUndefined();
     mkdirSync(dirname(file), { recursive: true });
-    writeFileSync(file, text);
-    const n = host.getBranch().length;
-    const write = [
-      { type: "message", id: `call-write-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `write-${n}`, name: "write", arguments: { path: file, content: text } }] } },
-      { type: "message", id: `result-write-${n}`, message: { role: "toolResult", toolName: "write", toolCallId: `write-${n}`, isError: false, content: [{ type: "text", text: "Written" }] } },
-    ];
-    const run = [
-      { type: "message", id: `call-check-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `check-${n}`, name: "bash", arguments: { command, cwd } }] } },
-      { type: "message", id: `result-check-${n}`, message: { role: "toolResult", toolName: "bash", toolCallId: `check-${n}`, isError: checkFails, details: { exitCode: checkFails ? 1 : 0 }, content: [{ type: "text", text: checkOutput }] } },
-    ];
-    host.getBranch().push(...(checkFirst ? [...run, ...write] : [...write, ...run]) as SessionEntry[]);
-    return { writeToolCallIds: [`write-${n}`], checkToolCallIds: [`check-${n}`] };
-  };
-  const applied = (approval: unknown, publication: unknown) => ({ kind: "harness", outcome: "applied", approval, publication });
+    writeFileSync(file, content);
+    await host.toolResult({ toolName: "write", toolCallId: id, input, isError: false, content: [], details: {} });
+  }
 
-  it("prepares a project hook, a global hook and a companion intent, and the form shows each description with its root kind and path", async () => {
-    const host = loadExtension();
-    const selection = await prepareAndSelect(host, [
-      intent("project-hooks", "Block git commit here"), intent("global-hooks", "Block git commit everywhere"),
-      intent("global-hooks", "Fix my hand-written hook", { path: "mine.ts" }), intent("companion", "Register a jj tool"),
-    ]);
-    expect(selection.isError).toBeFalsy();
-    const [project, global, edited, companion] = reviewEntries(selection, "selected").map(({ proposal }) => proposal);
-    const { askHtml } = JSON.parse(resultText(selection));
-    expect(askHtml).toContain(`<legend>Plan hook change · <code>skill-observer-${project!.fingerprint}.ts</code> (project hook)</legend>\n<p><b>Block git commit here</b></p>`);
-    expect(askHtml).toContain(`<legend>Plan hook change · <code>skill-observer-${global!.fingerprint}.ts</code> (global hook)</legend>`);
-    expect(askHtml).toContain("<legend>Plan hook change · <code>mine.ts</code> (global hook)</legend>");
-    expect(askHtml).toContain("<legend>Plan companion change · <code>skill-observer-companion</code> (companion extension)</legend>");
-    expect(project!.preview).toContain(shown(join(projectHooks(host), `skill-observer-${project!.fingerprint}.ts`)));
-    expect(global!.preview).toContain(shown(join(agentDir(host), "hooks/pre", `skill-observer-${global!.fingerprint}.ts`)));
-    expect(edited!.preview).toContain(shown(join(agentDir(host), "hooks/pre/mine.ts")));
-    expect(companion!.preview).toContain(shown(join(agentDir(host), "extensions/skill-observer-companion")));
-    for (const line of ["Event: tool_call for bash", "Predicate: the command runs `git commit` in a jj repository", "Action: block the call and name `jj commit`",
-      "Mistake sample: git commit -m fix", "Legitimate sample: jj commit -m fix", "Scope: every jj repository",
-      "Why each lower rung fails: A barrier rule only reminds; no project check runs before the commit."]) {
-      expect(askHtml.split(line)).toHaveLength(5);
-    }
-    expect(askHtml.split("An Apply with a note is asked again.")).toHaveLength(5);
-    expect(new Set([project, global, edited, companion].map((proposal) => proposal!.fingerprint)).size).toBe(4);
-  });
+  async function historyFor(host: ReturnType<typeof loadExtension>, fingerprint: string) {
+    const result = await host.callTool("observer_review", { action: "evidence", key: { fingerprint } });
+    expect(result.isError, resultText(result)).not.toBe(true);
+    return JSON.parse(resultText(result)).matches;
+  }
 
-  it.each<[string, Record<string, unknown>, string]>([
-    ["another root kind", { root: "user-extensions" }, "needs a root"],
-    ["a path escaping its root", { path: "../escape.ts" }, "plain root-relative"],
-    ["an absolute path", { path: "/tmp/escape.ts" }, "plain root-relative"],
-    ["a path through a symlink out of its root", { path: "out/escape.ts" }, "escapes its root"],
-    ["a companion change naming a file", { root: "companion", path: "index.ts" }, "not by a file"],
-  ])("refuses a target with %s", async (_label, target, reason) => {
+  it("checks a project hook in scratch, shares one main Ask with a project edit, and verifies the exact owner writes", async () => {
     const host = loadExtension();
     startPass(host);
-    const hooks = join(agentDir(host), "hooks/pre");
-    mkdirSync(hooks, { recursive: true });
-    symlinkSync(host.skillHome.home, join(hooks, "out"));
-    const { root = "global-hooks", ...rest } = target;
-    const result = await host.callTool("observer_review", { action: "prepare", candidates: [intent(String(root), "Escape", rest)] });
-    expect(result.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining(reason) }] });
+    const { draft, file, root, path, command } = await hookDraft(host);
+    const checkout = host.skillHome.roots.cwd;
+    const other = { kind: "project", target: { scope: "project", root: checkout, path: "check.test.js", mechanism: "Check the parser" },
+      priority: "evidence", gist: "Cover the parser", remedy: "Exercise the observed error",
+      change: { operation: "project-edit", text: "import 'bun:test';\n", check: "bun test check.test.js" } };
+    const prepared = await prepare(host, draft, other);
+    expect(reviewEntries(prepared), rejectionReasons(prepared).join("\n")).toHaveLength(2);
+    expect(await host.toolCall("write", { path: file, content: hookText }, "no-apply")).toMatchObject({ block: true });
+    const { approval, chosen } = await ask(host, prepared, proposal => proposal.kind === "harness" ? "Apply" : "Later");
+    expect(chosen.find(({ proposal }) => proposal.kind === "harness")?.proposal.preview).toContain("OK: 2 of 2");
+    expect(await host.toolCall("write", { path: file, content: hookText + "// unreviewed\n" }, "changed")).toMatchObject({ block: true });
+    await ownerWrite(host, file, hookText, "write-hook");
+    expect((await bashReceipt(host, root, command, "published-hook-check")).status).toBe(0);
+    const result = await resolve(host, [{ kind: "harness", outcome: "applied", approval,
+      publication: { writeToolCallIds: ["write-hook"], checkToolCallIds: ["published-hook-check"], files: [{ path, afterHash: hash(hookText) }] } }]);
+    expect(failures(result)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toMatchObject([{ kind: "harness", target: draft.target, outcome: "applied" }]);
+    expect(readFileSync(file, "utf8")).toBe(hookText);
   });
 
+  it("keeps a global hook Decline separate from Later for the same hook in this checkout", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const { draft, path, file } = await hookDraft(host);
+    const global = { ...draft, target: { scope: "harness", root: "global-hooks", path, mechanism: draft.target.mechanism } };
+    const globalFile = join(host.skillHome.home, ".omp/agent/hooks/pre", path);
+    const { approval: decline } = await ask(host, await prepare(host, global), () => "Decline");
+    expect(failures(await resolve(host, [{ kind: "harness", outcome: "declined", approval: decline }]))).toEqual([]);
+    expect(reviewEntries(await prepare(host, global))).toEqual([]);
+
+    const { approval: later } = await ask(host, await prepare(host, draft), () => "Later");
+    expect(failures(await resolve(host, [{ kind: "harness", outcome: "later", approval: later }]))).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toMatchObject([
+      { kind: "harness", target: global.target, outcome: "declined" },
+      { kind: "harness", target: draft.target, outcome: "later" },
+    ]);
+    expect(existsSync(globalFile)).toBe(false);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("withdraws only the prior fixes for the exact removed hook in this project", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const { draft, file, root, path, command } = await hookDraft(host, { removal: true });
+    const foreignProject = join(host.skillHome.home, "other-checkout");
+    const foreignFile = join(foreignProject, ".omp/hooks/pre", path);
+    mkdirSync(dirname(foreignFile), { recursive: true });
+    writeFileSync(foreignFile, hookText);
+    const prior = [draft.target.project, draft.target.project, foreignProject].map((project, index) => {
+      const gist = `Prior hook fix ${index + 1}`;
+      const target = { ...draft.target, project, path, mechanism: gist };
+      return { kind: "harness", target, fingerprint: harnessFingerprint(target), gist, outcome: "applied",
+        timestamp: "2026-11-21T12:00:00.000Z", sessionId: "earlier-hook-pass" } as const;
+    });
+    seedLedger(host.ledgerFile, prior);
+    const { approval, chosen } = await ask(host, await prepare(host, draft));
+    expect(chosen[0]!.proposal.preview).toContain(JSON.stringify(hookText));
+    const input = { input: `*** Begin Patch\n[${file}#0000]\nREM\n*** End Patch` };
+    expect(await host.toolCall("edit", input, "remove-hook")).toBeUndefined();
+    rmSync(file);
+    await host.toolResult({ toolName: "edit", toolCallId: "remove-hook", input, isError: false, content: [], details: {} });
+    expect((await bashReceipt(host, root, command, "check-removed-hook")).status).toBe(0);
+    const result = await resolve(host, [{ kind: "harness", outcome: "applied", approval,
+      publication: { writeToolCallIds: ["remove-hook"], checkToolCallIds: ["check-removed-hook"], files: [{ path, afterHash: null }] } }]);
+    expect(failures(result)).toEqual([]);
+    for (const { target, fingerprint, gist } of prior.slice(0, 2)) {
+      expect(result.details).toMatchObject({ records: expect.arrayContaining([
+        expect.objectContaining({ kind: "harness", outcome: "withdrawn", target, fingerprint, gist }),
+      ]) });
+      expect(await historyFor(host, fingerprint)).toEqual([expect.objectContaining({ kind: "harness", scope: "project", outcome: "withdrawn" })]);
+    }
+    const foreign = prior[2]!;
+    expect(ledgerRecords(host.ledgerFile)).toHaveLength(3);
+    expect(await historyFor(host, foreign.fingerprint)).toEqual([]);
+    host.setCwd(foreignProject);
+    expect(await historyFor(host, foreign.fingerprint)).toEqual([expect.objectContaining({ kind: "harness", scope: "project", outcome: "applied" })]);
+    expect(await historyFor(host, prior[0]!.fingerprint)).toEqual([]);
+    expect(readFileSync(foreignFile, "utf8")).toBe(hookText);
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("refuses a legacy intent and a check run before the current pass", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const { draft, file } = await hookDraft(host);
+    const prior = await prepare(host, { ...draft, change: { operation: "harness", stage: "intent" } });
+    expect(reviewEntries(prior)).toEqual([]);
+    expect(rejectionReasons(prior)).toEqual([expect.stringContaining("legacy approvals")]);
+    startPass(host);
+    const current = await prepare(host, draft);
+    expect(reviewEntries(current)).toEqual([]);
+    expect(rejectionReasons(current)).toEqual([expect.stringContaining("after this pass began")]);
+    expect(existsSync(file)).toBe(false);
+  });
+
+
+  it.each(["absent", "failed", "changed code", "changed samples"])("does not ask for an executable check that is %s", async (failure) => {
+    const host = loadExtension();
+    startPass(host);
+    const { draft, file, samples } = await hookDraft(host, { unavailable: failure === "absent", failed: failure === "failed" });
+    if (failure === "changed code") draft.change.files = [{ ...draft.change.files[0]!, text: hookText + "// changed\n" }];
+    if (failure === "changed samples") writeFileSync(samples, "[]\n");
+    const result = await prepare(host, draft);
+    expect(reviewEntries(result)).toEqual([]);
+    expect(rejectionReasons(result).join("\n")).toMatch(/scratch|checked|check receipt|observed/i);
+    expect(existsSync(file)).toBe(false);
+    expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+  });
+
+  it.each(["verify only", "change what the hook does"])("distinguishes the note %j from authority to edit code", async (note) => {
+    const host = loadExtension();
+    startPass(host);
+    const { draft, file } = await hookDraft(host);
+    await ask(host, await prepare(host, draft), () => ({ option: "Apply", note }));
+    const result = await host.toolCall("write", { path: file, content: hookText }, "noted-apply");
+    if (note === "verify only") expect(result).toBeUndefined();
+    else expect(result).toMatchObject({ block: true });
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("creates and verifies every file of a new companion under one exact Apply", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const root = join(host.skillHome.home, ".omp/agent/extensions/skill-observer-companion");
+    const scratch = mkdtempSync(join(tmpdir(), "omp-observe-check."));
+    const target = { scope: "harness", root: "companion", mechanism: "Report the queue limit on demand" } as const;
+    const files = [
+      { path: "package.json", text: '{"omp":{"extensions":["./index.ts"]}}\n' },
+      { path: "index.ts", text: 'export default function register(pi) {\n  pi.registerCommand("queue-limit", { handler: () => 3 });\n}\n' },
+      { path: "index.test.ts", text: [
+        'import {expect, test} from "bun:test";',
+        'import register from "./index";',
+        'test("reports the configured queue limit", () => {',
+        '  let limit;',
+        '  register({ registerCommand: (name, { handler }) => { if (name === "queue-limit") limit = handler(); } });',
+        '  expect(limit).toBe(3);',
+        '});',
+        '',
+      ].join("\n") },
+    ];
+    const command = "bun --no-env-file test";
+    try {
+      for (const { path, text } of files) writeFileSync(join(scratch, path), text);
+      expect((await bashReceipt(host, scratch, command, "scratch-companion")).status).toBe(0);
+      const draft = { kind: "harness", target, priority: "note", gist: "Expose the queue limit", remedy: "Register a queue command",
+        change: { operation: "harness", stage: "checked", files, checkToolCallId: "scratch-companion",
+          lowerRungs: "A hook cannot register a command, and text guidance cannot read the runtime limit." },
+        evidence: [{ quote: "reports the configured queue limit", count: 1 }] };
+      const prepared = await prepare(host, draft);
+      expect(existsSync(root)).toBe(false);
+      const { approval, chosen } = await ask(host, prepared);
+      expect(chosen).toHaveLength(1);
+      for (const { path } of files) expect(chosen[0]!.proposal.preview).toContain(`Create ${join(root, path)}`);
+      expect(existsSync(root)).toBe(false);
+      const writeToolCallIds = [];
+      for (const { path, text } of files) {
+        const id = `companion-write-${path}`;
+        await ownerWrite(host, join(root, path), text, id);
+        writeToolCallIds.push(id);
+      }
+      expect((await bashReceipt(host, root, command, "published-companion")).status).toBe(0);
+      const publication = { writeToolCallIds, checkToolCallIds: ["published-companion"],
+        files: files.map(({ path, text }) => ({ path, afterHash: hash(text) })) };
+      const result = await resolve(host, [{ kind: "harness", outcome: "applied", approval, publication }]);
+      expect(failures(result)).toEqual([]);
+      expect(ledgerRecords(host.ledgerFile)).toMatchObject([{ kind: "harness", target, outcome: "applied", publication }]);
+      for (const { path, text } of files) expect(readFileSync(join(root, path), "utf8")).toBe(text);
+      const otherCheckout = join(host.skillHome.home, "other-checkout");
+      mkdirSync(otherCheckout);
+      host.setCwd(otherCheckout);
+      expect(await historyFor(host, chosen[0]!.proposal.fingerprint)).toEqual([
+        expect.objectContaining({ kind: "harness", scope: "global", outcome: "applied" }),
+      ]);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses successful owner receipts from before Apply or from an unrelated destination", async () => {
+    const host = loadExtension();
+    const { draft, file, root, path, scratch, command } = await hookDraft(host, { unavailable: true });
+    await ownerWrite(host, file, hookText, "before-apply");
+    rmSync(file);
+    startPass(host);
+    expect((await bashReceipt(host, scratch, command, draft.change.checkToolCallId)).status).toBe(0);
+    const { approval } = await ask(host, await prepare(host, draft));
+    const unrelated = join(host.skillHome.home, "unrelated.txt");
+    await ownerWrite(host, unrelated, "Ordinary project notes.\n", "unrelated-write");
+    const record = (write: string, check: string) => resolve(host, [{ kind: "harness", outcome: "applied", approval,
+      publication: { writeToolCallIds: [write], checkToolCallIds: [check], files: [{ path, afterHash: hash(hookText) }] } }]);
+    for (const receipt of ["before-apply", "unrelated-write"]) {
+      const result = await record(receipt, draft.change.checkToolCallId);
+      expect(result.isError).toBe(true);
+      expect(failures(result), receipt).toEqual([expect.stringContaining(`${file}\`: untouched by this pass`)]);
+      expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+    }
+    expect(existsSync(file)).toBe(false);
+    await ownerWrite(host, file, hookText, "approved-write");
+    expect((await bashReceipt(host, root, command, "approved-check")).status).toBe(0);
+    expect(failures(await record("approved-write", "approved-check"))).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toMatchObject([{ target: draft.target, outcome: "applied" }]);
+  });
+
+  it("distinguishes a written hook without verification from a verified hook the ledger could not record", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const { draft, file, root, path, scratch, command } = await hookDraft(host);
+    const { approval } = await ask(host, await prepare(host, draft));
+    await ownerWrite(host, file, hookText, "write-hook");
+    const record = (check: string) => resolve(host, [{ kind: "harness", outcome: "applied", approval,
+      publication: { writeToolCallIds: ["write-hook"], checkToolCallIds: [check], files: [{ path, afterHash: hash(hookText) }] } }]);
+
+    expect((await bashReceipt(host, scratch, command, "wrong-cwd-check")).status).toBe(0);
+    const unverified = await record("wrong-cwd-check");
+    expect(unverified.isError).toBe(true);
+    expect(failures(unverified)).toEqual([expect.stringContaining(`${file}\`: written but unverified`)]);
+    expect(resultText(unverified)).not.toContain("Unrecorded publication");
+    expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+    expect(readFileSync(file, "utf8")).toBe(hookText);
+
+    expect((await bashReceipt(host, root, command, "published-hook-check")).status).toBe(0);
+    writeObserverStore(host.ledgerFile, new Date(), (db) => db.run(`
+      CREATE TRIGGER refuse_hook BEFORE INSERT ON proposals
+      WHEN NEW.fingerprint = '${harnessFingerprint(draft.target)}'
+      BEGIN SELECT RAISE(ABORT, 'hook row rejected'); END;
+    `));
+    const unrecorded = await record("published-hook-check");
+    expect(unrecorded.isError).toBe(true);
+    expect(unrecorded.details).toMatchObject({ recording: { rows: ["unrecorded"] } });
+    expect(resultText(unrecorded)).toContain("Unrecorded publication");
+    expect(resultText(unrecorded)).toContain("hook row rejected");
+    expect(resultText(unrecorded)).toContain(file);
+    expect(resultText(unrecorded)).not.toContain("written but unverified");
+    expect(ledgerRecords(host.ledgerFile)).toEqual([]);
+    expect(readFileSync(file, "utf8")).toBe(hookText);
+    expect(await host.toolCall("write", { path: file, content: hookText }, "repeat-hook-write")).toMatchObject({ block: true });
+  });
+
+  it("publishes a checked change to an owned extension other than the companion", async () => {
+    const host = loadExtension();
+    startPass(host);
+    const checkout = host.skillHome.roots.cwd;
+    const source = join(checkout, "extensions/queue-helper");
+    const scratch = mkdtempSync(join(tmpdir(), "omp-observe-check."));
+    const manifest = '{"omp":{"extensions":["./index.ts"]}}\n';
+    const test = 'import {test, expect} from "bun:test";\nimport {retries} from "./index";\ntest("uses the configured retry count", () => expect(retries).toBe(3));\n';
+    const before = "export const retries = 2;\n";
+    const text = "export const retries = 3;\n";
+    mkdirSync(source, { recursive: true });
+    for (const root of [scratch, source]) {
+      writeFileSync(join(root, "package.json"), manifest);
+      writeFileSync(join(root, "index.test.ts"), test);
+      writeFileSync(join(root, "index.ts"), root === scratch ? text : before);
+    }
+    const command = "bun --no-env-file test";
+    expect((await bashReceipt(host, scratch, command, "extension-scratch")).status).toBe(0);
+    const draft = { kind: "harness", target: { scope: "harness", root: "extension", source, mechanism: "Keep queue retry default" },
+      priority: "note", gist: "Restore three queue retries", remedy: "Test the extension default",
+      change: { operation: "harness", stage: "checked", files: [{ path: "index.ts", text }], checkToolCallId: "extension-scratch", lowerRungs },
+      evidence: [{ quote: "uses the configured retry count", count: 1 }] };
+    const { approval, chosen } = await ask(host, await prepare(host, draft));
+    expect(chosen[0]!.proposal.preview).toContain(source);
+    expect(readFileSync(join(source, "index.ts"), "utf8")).toBe(before);
+    await ownerWrite(host, join(source, "index.ts"), text, "write-extension");
+    expect((await bashReceipt(host, source, command, "published-extension-check")).status).toBe(0);
+    const result = await resolve(host, [{ kind: "harness", outcome: "applied", approval,
+      publication: { writeToolCallIds: ["write-extension"], checkToolCallIds: ["published-extension-check"], files: [{ path: "index.ts", afterHash: hash(text) }] } }]);
+    expect(failures(result)).toEqual([]);
+    expect(ledgerRecords(host.ledgerFile)).toMatchObject([{ kind: "harness", target: { root: "extension", source, checkout }, outcome: "applied" }]);
+    const fingerprint = chosen[0]!.proposal.fingerprint;
+    expect(await historyFor(host, fingerprint)).toEqual([expect.objectContaining({ outcome: "applied" })]);
+    const otherCheckout = join(host.skillHome.home, "other-checkout");
+    mkdirSync(otherCheckout);
+    host.setCwd(otherCheckout);
+    expect(await historyFor(host, fingerprint)).toEqual([]);
+  });
+});
+
+describe("executable routing", () => {
   it.each<[string, string, string, (root: string) => void]>([
     ["the project's hooks directory", ".omp/hooks/pre/block.ts", "as a project hook", () => {}],
     ["the project's hooks directory through a symlink to another project directory", ".omp/hooks/pre/block.ts", "as a project hook", (root) => {
@@ -3066,521 +3671,16 @@ describe("observer hook and companion intents", () => {
     const resolved = await resolve(host, [{ kind: "project", target, gist: "Block git commit", outcome: "later" }]);
     expect(failures(resolved)).toEqual([expect.stringContaining(`\`harness\` target scope, ${scope}`)]);
   });
-
-  it("keeps a declined global hook out of another project's pass, and a declined project hook out of view there", async () => {
-    const host = loadExtension();
-    const candidates = [intent("global-hooks", "Block git commit everywhere"), intent("project-hooks", "Block git commit here")];
-    const declined = await asked(host, candidates, () => "Decline");
-    expect(failures(await resolve(host, answered(declined, "declined")))).toEqual([]);
-    expect(ledgerRecords(host.ledgerFile).map(({ outcome }) => outcome)).toEqual(["declined", "declined"]);
-    const here = await host.callTool("observer_review", { action: "prepare", candidates });
-    expect(reviewEntries(here)).toEqual([]);
-    otherProject(host);
-    const there = await host.callTool("observer_review", { action: "prepare", candidates });
-    expect(reviewEntries(there).map(({ proposal }) => proposal.gist)).toEqual(["Block git commit here"]);
-  });
-
-  it("brings a Later intent back in the next pass of its scope, which names the three directories", async () => {
-    const host = loadExtension();
-    const later = await asked(host, [intent("global-hooks", "Block git commit everywhere"), intent("project-hooks", "Block git commit here")],
-      () => ({ option: "Later", note: "After the jj migration." }));
-    expect(failures(await resolve(host, answered(later, "later")))).toEqual([]);
-    await host.runCommand("observe", "Review hooks");
-    const here = String(host.sent.at(-1)?.message.content);
-    expect(here).toContain("Block git commit everywhere Re-offer when: After the jj migration.");
-    expect(here).toContain("Block git commit here Re-offer when: After the jj migration.");
-    expect(here).toContain(`Project hooks directory: \`${projectHooks(host)}\``);
-    expect(here).toContain(`Global hooks directory: \`${join(agentDir(host), "hooks/pre")}\``);
-    expect(here).toContain(`Companion extension directory: \`${join(agentDir(host), "extensions/skill-observer-companion")}\``);
-    otherProject(host);
-    await host.runCommand("observe", "Review hooks");
-    const there = String(host.sent.at(-1)?.message.content);
-    expect(there).toContain("Block git commit everywhere");
-    expect(there).not.toContain("Block git commit here");
-  });
-
-  it("names the hook and companion procedure file and the hook check script in a pass with only a User note, without the procedure's text", async () => {
+  it("names the executable procedure and hook checker in a pass with only a User note, without inlining the procedure", async () => {
     const host = loadExtension();
     await host.runCommand("observe", "Review hooks");
     const payload = String(host.sent.at(-1)?.message.content);
-    expect(payload).toContain(`Hook and companion procedure file: \`${HOOKS_AND_COMPANION_PATH}\`. Hook check script: \`${HOOK_CHECK_PATH}\`.`);
-    expect(payload).toContain("read the procedure file named below");
+    expect(payload).toContain(`\`${HOOKS_AND_COMPANION_PATH}\``);
+    expect(payload).toContain(`\`${HOOK_CHECK_PATH}\``);
     const procedure = readFileSync(HOOKS_AND_COMPANION_PATH, "utf8").split(/\n{2,}/).filter((block) => !block.startsWith("#"));
     expect(procedure.filter((block) => payload.includes(block.trim()))).toEqual([]);
   });
 
-  it("writes no file and records nothing as applied for an intent Apply alone", async () => {
-    const host = loadExtension();
-    const approved = await asked(host, [intent("project-hooks", "Block git commit here"), intent("global-hooks", "Block git commit everywhere")], () => "Apply");
-    const applied = await resolve(host, answered(approved, "applied"));
-    expect(applied.isError).toBe(true);
-    expect(failures(applied)).toEqual([expect.stringContaining("drafting only"), expect.stringContaining("drafting only")]);
-    expect(existsSync(host.ledgerFile)).toBe(false);
-    expect(existsSync(projectHooks(host))).toBe(false);
-    expect(existsSync(join(agentDir(host), "hooks"))).toBe(false);
-    expect(existsSync(join(agentDir(host), "extensions"))).toBe(false);
-  });
-
-  describe("at the code stage", () => {
-    it.each<[string, (host: ReturnType<typeof loadExtension>, candidate: unknown) => Promise<unknown>, string]>([
-      ["no intent approval cited", async () => undefined, "needs `approval`"],
-      ["an intent answered Later", async (host, candidate) => (await askIntent(host, candidate, () => "Later")).approval, "selected `Later`"],
-      ["an intent Apply with a note", async (host, candidate) => (await askIntent(host, candidate, () => ({ option: "Apply", note: "Only on main." }))).approval, "Only on main."],
-      ["an intent Apply of an earlier pass", async (host, candidate) => { const { approval } = await askIntent(host, candidate); startPass(host); return approval; }, "earlier observation pass"],
-      ["an intent Apply of another hook", async (host) => (await askIntent(host, intent("global-hooks", "Block git push everywhere"))).approval, "another"],
-    ])("refuses a code stage with %s", async (_label, cite, reason) => {
-      const host = loadExtension();
-      const candidate = intent("global-hooks", "Block git commit everywhere");
-      const approval = await cite(host, candidate);
-      if (host.getBranch().length === 0) startPass(host);
-      const fingerprint = harnessFingerprint({ scope: "harness", root: "global-hooks", mechanism: "Block git commit everywhere" });
-      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
-        code("global-hooks", "Block git commit everywhere", approval, [{ path: `skill-observer-${fingerprint}.ts`, text: hookText }]),
-      ] });
-      expect(prepared.details).toMatchObject({ eligible: [], rejected: [{ reason: expect.stringContaining(reason) }] });
-    });
-
-    it("shows the hook file's exact text, the check command and its result in an Ask of its own", async () => {
-      const host = loadExtension();
-      const { proposal, approval } = await askIntent(host, intent("project-hooks", "Block git commit here"));
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const candidate = code("project-hooks", "Block git commit here", approval, [{ path: file, text: hookText }]);
-      const { selection, entry } = await askCode(host, candidate);
-      const { askHtml } = JSON.parse(resultText(selection));
-      expect(askHtml).toContain(`<legend>Write hook code · <code>${file}</code> (project hook)</legend>`);
-      expect(askHtml).toContain(shown(join(projectHooks(host), file)));
-      expect(askHtml).toContain('export default function (pi) {<br>··pi.on("tool_call", (event) =&gt; event.input.command?.startsWith("git commit")');
-      expect(askHtml).toContain(`Check command: ${hookCheck(file).command}`);
-      expect(askHtml).toContain("mistake git commit -m fix: blocked<br>legitimate jj commit -m fix: untouched");
-      expect(askHtml).toContain("An Apply with a note is asked again.");
-      expect(entry.proposal.fingerprint).toBe(proposal.fingerprint);
-
-      const other = await host.callTool("observer_review", { action: "prepare", candidates: [onReadCandidate({ gist: "Name the seam.", section: "## Seams\n\nName the seam." })] });
-      const together = await host.callTool("observer_review", { action: "select", proposals: [entry.reference, ...reviewEntries(other).map(({ reference }) => reference)] });
-      expect(together.isError).toBe(true);
-      expect(failures(together)).toEqual([expect.stringContaining("its own Select and Ask")]);
-    });
-
-    it("records an applied hook from its write and check receipts, writing nothing itself and keeping no file text", async () => {
-      const host = loadExtension();
-      const { proposal, approval: intentApproval } = await askIntent(host, intent("global-hooks", "Block git commit everywhere"));
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const { approval } = await askCode(host, code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]));
-      const hooks = join(agentDir(host), "hooks/pre");
-      expect(existsSync(join(hooks, file))).toBe(false);
-      const receipts = publish(host, join(hooks, file), hookText, hooks);
-      const publication = { ...receipts, files: [{ path: file, afterHash: sha(hookText) }] };
-      const result = await resolve(host, [applied(approval, publication)]);
-      expect(failures(result)).toEqual([]);
-      expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ kind: "harness", fingerprint: proposal.fingerprint, outcome: "applied", publication })]);
-      const ledger = readFileSync(host.ledgerFile, "utf8");
-      for (const text of ["export default", checkOutput.split("\n")[0]!, "Predicate"]) expect(ledger).not.toContain(text);
-
-      const noted = await askCode(host, code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]), () => ({ option: "Apply", note: "Also block git push." }));
-      const refused = await resolve(host, [applied(noted.approval, { ...publish(host, join(hooks, file), hookText, hooks), files: [{ path: file, afterHash: sha(hookText) }] })]);
-      expect(failures(refused)).toEqual([expect.stringContaining("Also block git push.")]);
-    });
-
-    it.each([
-      ["its code prepared and asked again", "code", true],
-      ["its code asked again", "code", false],
-      ["its intent prepared and asked again", "intent", true],
-    ] as const)("refuses an Apply the user answered again later in the pass, %s, with Decline", async (_label, stage, reprepared) => {
-      const host = loadExtension();
-      const candidate = intent("global-hooks", "Block git commit everywhere");
-      const { proposal, approval: intentApproval } = await askIntent(host, candidate);
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const codeCandidate = code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]);
-      if (stage === "intent") {
-        await askCode(host, candidate, () => "Decline");
-        const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [codeCandidate] });
-        expect(rejectionReasons(prepared)).toEqual([expect.stringContaining("superseded")]);
-        return;
-      }
-      const { entry, approval } = await askCode(host, codeCandidate);
-      if (reprepared) await askCode(host, codeCandidate, () => "Decline");
-      else askUser(host, await host.callTool("observer_review", { action: "select", proposals: [entry.reference] }), () => "Decline");
-      const hooks = join(agentDir(host), "hooks/pre");
-      const result = await resolve(host, [applied(approval, { ...publish(host, join(hooks, file), hookText, hooks), files: [{ path: file, afterHash: sha(hookText) }] })]);
-      expect(failures(result)).toEqual([expect.stringContaining("superseded")]);
-      expect(existsSync(host.ledgerFile)).toBe(false);
-    });
-
-    it("refuses an applied hook whose write and check came before the code's Apply", async () => {
-      const host = loadExtension();
-      const { proposal, approval: intentApproval } = await askIntent(host, intent("global-hooks", "Block git commit everywhere"));
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const hooks = join(agentDir(host), "hooks/pre");
-      const early = publish(host, join(hooks, file), hookText, hooks);
-      const { approval } = await askCode(host, code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]));
-      const result = await resolve(host, [applied(approval, { ...early, files: [{ path: file, afterHash: sha(hookText) }] })]);
-      expect(failures(result)).toEqual([expect.stringContaining("before the user's Apply")]);
-      expect(existsSync(host.ledgerFile)).toBe(false);
-    });
-
-    it.each([
-      ["an unrelated command", () => "true"],
-      ["the hook check on the draft outside the target", () => `bun --no-env-file ${HOOK_CHECK_PATH} /tmp/draft/hook.ts /tmp/draft/samples.json`],
-      ["the hook check followed by another command", (file: string) => `bun --no-env-file ${HOOK_CHECK_PATH} ${file} /tmp/draft/samples.json; true`],
-      ["the hook check with another command on the next line", (file: string) => `bun --no-env-file ${HOOK_CHECK_PATH} ${file}\n/usr/bin/true`],
-      ["the hook check with another command after a carriage return", (file: string) => `bun --no-env-file ${HOOK_CHECK_PATH} ${file}\r/usr/bin/true`],
-      ["another script on the hook", (file: string) => `bun --no-env-file /tmp/draft/check.ts ${file} /tmp/draft/samples.json`],
-    ] as const)("refuses hook code whose check is %s, since the check rerun after the write must test the written hook", async (_label, command) => {
-      const host = loadExtension();
-      const { proposal, approval } = await askIntent(host, intent("global-hooks", "Block git commit everywhere"));
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [
-        code("global-hooks", "Block git commit everywhere", approval, [{ path: file, text: hookText }], {}, { command: command(file), output: checkOutput }),
-      ] });
-      expect(rejectionReasons(prepared)).toEqual([expect.stringContaining(HOOK_CHECK_PATH)]);
-    });
-
-    it.each([
-      ["no publication", "needs `publication`"], ["no write", "no observed write"], ["a write of another file", "no observed write"],
-      ["a check before the write", "after its write"], ["a check in another directory", "in the target root"], ["a failed check", "no successful observed tool call"],
-      ["a missing file hash", "afterHash"], ["an unrelated successful command as its check", "not the approved check"],
-    ] as const)(
-      "refuses an applied hook with %s", async (scenario, reason) => {
-        const host = loadExtension();
-        const { proposal, approval: intentApproval } = await askIntent(host, intent("global-hooks", "Block git commit everywhere"));
-        const file = `skill-observer-${proposal.fingerprint}.ts`;
-        const { approval } = await askCode(host, code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]));
-        const hooks = join(agentDir(host), "hooks/pre");
-        const target = scenario === "a write of another file" ? join(hooks, "other.ts") : join(hooks, file);
-        if (scenario === "a write of another file") {
-          mkdirSync(hooks, { recursive: true });
-          writeFileSync(join(hooks, file), hookText);
-        }
-        const receipts = publish(host, target, hookText, scenario === "a check in another directory" ? host.skillHome.roots.cwd : hooks, {
-          checkFirst: scenario === "a check before the write", checkFails: scenario === "a failed check",
-          ...(scenario === "an unrelated successful command as its check" && { command: "true" }),
-        });
-        const publication = scenario === "no publication" ? undefined : {
-          ...receipts, ...(scenario === "no write" && { writeToolCallIds: [] }),
-          files: scenario === "a missing file hash" ? [] : [{ path: file, afterHash: sha(hookText) }],
-        };
-        const result = await resolve(host, [applied(approval, publication)]);
-        expect(result.isError).toBe(true);
-        expect(failures(result)).toEqual([expect.stringContaining(reason)]);
-        expect(existsSync(host.ledgerFile)).toBe(false);
-      },
-    );
-
-    it.each(["the hash it states", "the approved text's hash"] as const)("refuses an applied hook whose written file differs from the approved text, stating %s", async (stated) => {
-      const host = loadExtension();
-      const { proposal, approval: intentApproval } = await askIntent(host, intent("global-hooks", "Block git commit everywhere"));
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const { approval } = await askCode(host, code("global-hooks", "Block git commit everywhere", intentApproval, [{ path: file, text: hookText }]));
-      const hooks = join(agentDir(host), "hooks/pre");
-      const written = hookText.replace("jj commit", "jj describe");
-      const receipts = publish(host, join(hooks, file), written, hooks);
-      const result = await resolve(host, [applied(approval, { ...receipts, files: [{ path: file, afterHash: sha(stated === "the hash it states" ? written : hookText) }] })]);
-      expect(failures(result)).toEqual([expect.stringContaining(file)]);
-      expect(existsSync(host.ledgerFile)).toBe(false);
-      expect(readFileSync(join(hooks, file), "utf8")).toBe(written);
-    });
-
-    it("leaves one later record for an intent Apply and a code Later, which comes back as an intent question saying a draft existed", async () => {
-      const host = loadExtension();
-      const { proposal, approval: intentApproval } = await askIntent(host, intent("project-hooks", "Block git commit here"));
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const { entry } = await askCode(host, code("project-hooks", "Block git commit here", intentApproval, [{ path: file, text: hookText }]), () => "Later");
-      const twice = await resolve(host, [{ kind: "harness", proposal: entry.reference, outcome: "later" }, { kind: "harness", proposal: intentApproval.proposal, outcome: "later" }]);
-      expect(failures(twice)).toEqual([expect.stringContaining("one answer")]);
-      expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ fingerprint: proposal.fingerprint, outcome: "later", reoffer: expect.stringContaining("A draft existed") })]);
-      expect(readFileSync(host.ledgerFile, "utf8")).not.toContain("export default");
-      expect(existsSync(projectHooks(host))).toBe(false);
-
-      await host.runCommand("observe", "Review hooks");
-      startPass(host);
-      expect(String(host.sent.at(-1)?.message.content)).toMatch(/Block git commit here Re-offer when: A draft existed/);
-      const again = await host.callTool("observer_review", { action: "prepare", candidates: [code("project-hooks", "Block git commit here", intentApproval, [{ path: file, text: hookText }])] });
-      expect(rejectionReasons(again)).toEqual([expect.stringContaining("earlier observation pass")]);
-      const asIntent = await host.callTool("observer_review", { action: "prepare", candidates: [intent("project-hooks", "Block git commit here")] });
-      expect(reviewEntries(asIntent).map(({ proposal: { fingerprint } }) => fingerprint)).toEqual([proposal.fingerprint]);
-    });
-
-    it("changes an existing hand-written hook through both stages", async () => {
-      const host = loadExtension();
-      const hooks = join(agentDir(host), "hooks/pre");
-      mkdirSync(hooks, { recursive: true });
-      writeFileSync(join(hooks, "mine.ts"), "export default function () {}\n");
-      const { approval: intentApproval } = await askIntent(host, intent("global-hooks", "Fix my hand-written hook", { path: "mine.ts" }));
-      const { selection, approval } = await askCode(host, code("global-hooks", "Fix my hand-written hook", intentApproval, [{ path: "mine.ts", text: hookText }], { path: "mine.ts" }));
-      expect(JSON.parse(resultText(selection)).askHtml).toContain(`Replace \`${shown(join(hooks, "mine.ts"))}\``);
-      const receipts = publish(host, join(hooks, "mine.ts"), hookText, hooks);
-      const result = await resolve(host, [applied(approval, { ...receipts, files: [{ path: "mine.ts", afterHash: sha(hookText) }] })]);
-      expect(failures(result)).toEqual([]);
-      expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ outcome: "applied", target: expect.objectContaining({ root: "global-hooks", path: "mine.ts" }) })]);
-    });
-
-    it("lists an applied hook under remedy outcomes in a later pass, counting exercises after its record", async () => {
-      const host = loadExtension();
-      const { proposal, approval: intentApproval } = await askIntent(host, intent("project-hooks", "Block git commit here"));
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const { approval } = await askCode(host, code("project-hooks", "Block git commit here", intentApproval, [{ path: file, text: hookText }]));
-      const receipts = publish(host, join(projectHooks(host), file), hookText, projectHooks(host));
-      expect(failures(await resolve(host, [applied(approval, { ...receipts, files: [{ path: file, afterHash: sha(hookText) }] })]))).toEqual([]);
-
-      const later = new Date(Date.now() + 60_000).toISOString();
-      host.setBranch([...fx.plainUserMessage,
-        { type: "message", id: "call-commit", timestamp: later, message: { role: "assistant", content: [{ type: "toolCall", id: "commit", name: "bash", arguments: { command: "git commit -m fix" } }] } },
-        { type: "message", id: "result-commit", timestamp: later, message: { role: "toolResult", toolCallId: "commit", toolName: "bash", isError: false, content: [{ type: "text", text: "ok" }] } },
-      ] as SessionEntry[]);
-      await host.runCommand("observe", "Did the hook help?");
-      const blocks = String(host.sent.at(-1)?.message.content).split("\n\n");
-      expect(blocks[blocks.indexOf("### Remedy outcomes") + 1]).toBe(`- ${proposal.fingerprint} (\`${file}\` (project hook)): exercised-clean (evidence: tool-result:commit).`);
-      await host.runCommand("observe-report");
-      expect(host.notices.at(-1)).toContain(`- ${proposal.fingerprint}: exercised-clean (\`${file}\` (project hook))`);
-    });
-  });
-
-  describe("companion changes", () => {
-    const companionDir = (host: ReturnType<typeof loadExtension>) => join(agentDir(host), "extensions/skill-observer-companion");
-    const manifest = '{ "name": "skill-observer-companion", "omp": { "extensions": ["./index.ts"] } }\n';
-    const entry = "export default function (pi) {\n  pi.registerTool({ name: \"jj_status\" });\n}\n";
-    const testFile = "import { expect, it } from \"bun:test\";\nit(\"registers jj_status\", () => expect(1).toBe(1));\n";
-    const companionFiles = [{ path: "package.json", text: manifest }, { path: "index.ts", text: entry }, { path: "index.test.ts", text: testFile }];
-    const bunTest = { command: "bun test", output: "index.test.ts:\n(pass) registers jj_status\n\n 1 pass\n 0 fail" };
-    const companionCode = (approval: unknown, files: Array<{ path: string; text: string }>, checked = bunTest) => ({ ...code("companion", "Register a jj tool", approval, files), change: { operation: "harness", stage: "code", intent: approval, files, check: checked } });
-    /** Saves a native write of each file and then one check, as the pass publishes an approved companion change; writes the files too. */
-    const publishAll = (host: ReturnType<typeof loadExtension>, root: string, files: ReadonlyArray<{ path: string; text: string }>,
-      { command = "bun test", cwd = root, checkFirst = false, checkFails = false, async = false } = {}) => {
-      const n = host.getBranch().length;
-      const writes = files.flatMap(({ path, text }, i) => {
-        mkdirSync(dirname(join(root, path)), { recursive: true });
-        writeFileSync(join(root, path), text);
-        return [
-          { type: "message", id: `call-write-${n}-${i}`, message: { role: "assistant", content: [{ type: "toolCall", id: `write-${n}-${i}`, name: "write", arguments: { path: join(root, path), content: text } }] } },
-          { type: "message", id: `result-write-${n}-${i}`, message: { role: "toolResult", toolName: "write", toolCallId: `write-${n}-${i}`, isError: false, content: [{ type: "text", text: "Written" }] } },
-        ];
-      });
-      const run = [
-        { type: "message", id: `call-check-${n}`, message: { role: "assistant", content: [{ type: "toolCall", id: `check-${n}`, name: "bash", arguments: { command, cwd, ...(async && { async: true }) } }] } },
-        { type: "message", id: `result-check-${n}`, message: { role: "toolResult", toolName: "bash", toolCallId: `check-${n}`, isError: checkFails, details: { exitCode: checkFails ? 1 : 0 }, content: [{ type: "text", text: bunTest.output }] } },
-      ];
-      host.getBranch().push(...(checkFirst ? [...run, ...writes] : [...writes, ...run]) as SessionEntry[]);
-      return { writeToolCallIds: files.map((_, i) => `write-${n}-${i}`), checkToolCallIds: [`check-${n}`], files: files.map(({ path, text }) => ({ path, afterHash: sha(text) })) };
-    };
-
-    it("shows every file and the bun test result in an Ask of its own, and the first applied change creates the directory and its manifest", async () => {
-      const host = loadExtension();
-      const { proposal, approval: intentApproval } = await askIntent(host, intent("companion", "Register a jj tool"));
-      const { selection, approval } = await askCode(host, companionCode(intentApproval, companionFiles));
-      const { askHtml } = JSON.parse(resultText(selection));
-      expect(askHtml).toContain("<legend>Write companion code · <code>skill-observer-companion</code> (companion extension)</legend>");
-      for (const { path } of companionFiles) expect(askHtml).toContain(`Create \`${shown(join(companionDir(host), path))}\` with:`);
-      expect(askHtml).toContain("pi.registerTool({ name: \"jj_status\" });");
-      expect(askHtml).toContain("it(\"registers jj_status\"");
-      expect(askHtml).toContain('"omp": { "extensions": ["./index.ts"] }');
-      expect(askHtml).toContain("Check command: bun test");
-      expect(askHtml).toContain("(pass) registers jj_status");
-      expect(existsSync(companionDir(host))).toBe(false);
-
-      const publication = publishAll(host, companionDir(host), companionFiles);
-      const result = await resolve(host, [applied(approval, publication)]);
-      expect(failures(result)).toEqual([]);
-      expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({ kind: "harness", fingerprint: proposal.fingerprint, outcome: "applied", publication })]);
-      expect(readFileSync(host.ledgerFile, "utf8")).not.toContain("registerTool");
-    });
-
-    it("accepts a later change of one file that keeps the companion's manifest and test file", async () => {
-      const host = loadExtension();
-      for (const { path, text } of companionFiles) {
-        mkdirSync(companionDir(host), { recursive: true });
-        writeFileSync(join(companionDir(host), path), text);
-      }
-      const changed = [{ path: "index.ts", text: entry.replace("jj_status", "jj_log") }];
-      const { approval: intentApproval } = await askIntent(host, intent("companion", "Register a jj tool"));
-      const { selection, approval } = await askCode(host, companionCode(intentApproval, changed));
-      expect(JSON.parse(resultText(selection)).askHtml).toContain(`Replace \`${shown(join(companionDir(host), "index.ts"))}\` with:`);
-      expect(failures(await resolve(host, [applied(approval, publishAll(host, companionDir(host), changed))]))).toEqual([]);
-    });
-
-    it.each<[string, Array<{ path: string; text: string }>, typeof bunTest, string]>([
-      ["a file escaping the companion directory", [...companionFiles, { path: "../other/index.ts", text: entry }], bunTest, "plain root-relative"],
-      ["a file through a symlink out of the companion directory", [...companionFiles, { path: "out/index.ts", text: entry }], bunTest, "escapes its root"],
-      ["no test file, kept or added", companionFiles.filter(({ path }) => path !== "index.test.ts"), bunTest, "test file"],
-      ["a test file only under node_modules", [...companionFiles.filter(({ path }) => path !== "index.test.ts"), { path: "node_modules/dep/a.test.ts", text: testFile }], bunTest, "test file"],
-      ["no manifest in a new companion", companionFiles.filter(({ path }) => path !== "package.json"), bunTest, "package.json"],
-      ["a manifest declaring no entry", [{ path: "package.json", text: '{ "name": "skill-observer-companion" }' }, ...companionFiles.slice(1)], bunTest, "omp.extensions"],
-      ["a check other than bun test", companionFiles, { command: "bunx vitest run", output: "1 passed" }, "bun test"],
-      ["bun test followed by another command", companionFiles, { ...bunTest, command: "bun test ; true" }, "bun test"],
-      ["bun test with another command on the next line", companionFiles, { ...bunTest, command: "bun test \n/usr/bin/true" }, "bun test"],
-      ["bun test --help, which runs no test", companionFiles, { ...bunTest, command: "bun test --help" }, "bun test"],
-      ["bun test with a preload the form does not show as companion code", companionFiles, { ...bunTest, command: "bun test --preload /tmp/x.ts" }, "bun test"],
-    ])("refuses companion code with %s", async (_label, files, checked, reason) => {
-      const host = loadExtension();
-      mkdirSync(agentDir(host), { recursive: true });
-      if (files.some(({ path }) => path.startsWith("out/"))) {
-        mkdirSync(companionDir(host), { recursive: true });
-        symlinkSync(host.skillHome.home, join(companionDir(host), "out"));
-      }
-      const { approval } = await askIntent(host, intent("companion", "Register a jj tool"));
-      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [companionCode(approval, files, checked)] });
-      expect(rejectionReasons(prepared)).toEqual([expect.stringContaining(reason)]);
-    });
-
-    it.each([
-      ["a check other than bun test", { command: "bun run lint" }, "bun test"],
-      ["a check in another directory", { cwd: "elsewhere" }, "in the target root"],
-      ["a check before the writes", { checkFirst: true }, "after its write"],
-      ["a background check", { async: true }, "foreground"],
-      ["a failed check", { checkFails: true }, "no successful observed tool call"],
-      ["a written file differing from its approved text", { differs: true }, "index.test.ts"],
-      ["a file now lying outside the companion directory", { escapes: true }, "escapes its root"],
-    ] as const)("refuses an applied companion change with %s", async (_label, scenario, reason) => {
-      const host = loadExtension();
-      const files = [...companionFiles, { path: "lib/util.ts", text: "export const x = 1;\n" }];
-      const { approval: intentApproval } = await askIntent(host, intent("companion", "Register a jj tool"));
-      const { approval } = await askCode(host, companionCode(intentApproval, files));
-      const root = companionDir(host);
-      if ("escapes" in scenario) {
-        mkdirSync(root, { recursive: true });
-        mkdirSync(join(host.skillHome.home, "outside"), { recursive: true });
-        symlinkSync(join(host.skillHome.home, "outside"), join(root, "lib"));
-      }
-      const options = { ...scenario, ...("cwd" in scenario && { cwd: host.skillHome.roots.cwd }) };
-      const publication = publishAll(host, root, files, options);
-      if ("differs" in scenario) writeFileSync(join(root, "index.test.ts"), testFile.replace("toBe(1)", "toBe(2)"));
-      const result = await resolve(host, [applied(approval, publication)]);
-      expect(result.isError).toBe(true);
-      expect(failures(result)).toEqual([expect.stringContaining(reason)]);
-      expect(existsSync(host.ledgerFile)).toBe(false);
-    });
-
-    it("keeps declined and Later companion records in view in every project", async () => {
-      const host = loadExtension();
-      const declined = await asked(host, [intent("companion", "Register a jj tool")], () => "Decline");
-      expect(failures(await resolve(host, answered(declined, "declined")))).toEqual([]);
-      const later = await asked(host, [intent("companion", "Register a jj log tool")], () => ({ option: "Later", note: "After the jj migration." }));
-      expect(failures(await resolve(host, answered(later, "later")))).toEqual([]);
-      otherProject(host);
-      await host.runCommand("observe", "Review the companion");
-      expect(String(host.sent.at(-1)?.message.content)).toContain("Register a jj log tool Re-offer when: After the jj migration.");
-      const there = await host.callTool("observer_review", { action: "prepare", candidates: [intent("companion", "Register a jj tool"), intent("companion", "Register a jj log tool")] });
-      expect(reviewEntries(there).map(({ proposal }) => proposal.gist)).toEqual(["Register a jj log tool"]);
-    });
-  });
-
-  describe("removing a hook", () => {
-    const handText = "export default function (pi) {\n\tpi.on(\"tool_call\", () => ({ block: true }));\n}\n";
-    const removal = (root: string, path: string | undefined, gist = "Remove the misfiring hook") => ({
-      kind: "harness", target: { scope: "harness", root, mechanism: "remove the hook", ...(path !== undefined && { path }) },
-      gist, priority: "evidence", remedy: "It blocks legitimate commits", change: { operation: "harness", stage: "removal" },
-      evidence: [{ quote: "the hook blocked jj commit", count: 1 }],
-    });
-    /** Writes a hook no pass wrote, `mine.ts`, in the `root` hooks directory; returns its path. */
-    const handWritten = (host: ReturnType<typeof loadExtension>, root: "project-hooks" | "global-hooks") => {
-      const dir = root === "project-hooks" ? projectHooks(host) : join(agentDir(host), "hooks/pre");
-      mkdirSync(dir, { recursive: true });
-      writeFileSync(join(dir, "mine.ts"), handText);
-      return join(dir, "mine.ts");
-    };
-    const removed = (approval: unknown) => ({ kind: "harness", outcome: "applied", approval });
-
-    it("shows the hook file as it stands, offering Apply and Decline only", async () => {
-      const host = loadExtension();
-      const file = handWritten(host, "project-hooks");
-      const { selection } = await askIntent(host, removal("project-hooks", "mine.ts"));
-      const { askHtml } = JSON.parse(resultText(selection));
-      expect(askHtml).toContain("<legend>Remove hook · <code>mine.ts</code> (project hook)</legend>");
-      expect(askHtml).toContain(shown(file));
-      expect(askHtml).toContain('export default function (pi) {<br>→pi.on("tool_call", () =&gt; ({ block: true }));<br>}');
-      expect(askHtml).toContain(">Apply</label>");
-      expect(askHtml).toContain(">Decline</label>");
-      expect(askHtml).not.toContain(">Later</label>");
-    });
-
-    it.each([
-      ["a hook file that is not there", "global-hooks", "gone.ts", "no hook file"],
-      ["the companion extension", "companion", undefined, "only a hook file"],
-    ] as const)("refuses removing %s", async (_label, root, path, reason) => {
-      const host = loadExtension();
-      startPass(host);
-      const prepared = await host.callTool("observer_review", { action: "prepare", candidates: [removal(root, path)] });
-      expect(rejectionReasons(prepared)).toEqual([expect.stringContaining(reason)]);
-    });
-
-    it("refuses recording a removal once a folder above the hook leads out of the hooks directory", async () => {
-      const host = loadExtension();
-      const hooks = join(agentDir(host), "hooks/pre");
-      mkdirSync(join(hooks, "sub"), { recursive: true });
-      writeFileSync(join(hooks, "sub/hook.ts"), handText);
-      const { approval } = await askIntent(host, removal("global-hooks", "sub/hook.ts"));
-      const outside = join(host.skillHome.home, "outside");
-      mkdirSync(outside, { recursive: true });
-      rmSync(join(hooks, "sub"), { recursive: true });
-      symlinkSync(outside, join(hooks, "sub"));
-      const result = await resolve(host, [removed(approval)]);
-      expect(failures(result)).toEqual([expect.stringContaining("escapes its root")]);
-      expect(existsSync(host.ledgerFile)).toBe(false);
-    });
-
-    it("refuses recording a removal once its hooks directory leads somewhere other than where Prepare found it", async () => {
-      const host = loadExtension();
-      const hooks = join(agentDir(host), "hooks/pre");
-      mkdirSync(hooks, { recursive: true });
-      writeFileSync(join(hooks, "hook.ts"), handText);
-      const { approval } = await askIntent(host, removal("global-hooks", "hook.ts"));
-      const outside = join(host.skillHome.home, "outside");
-      mkdirSync(outside, { recursive: true });
-      renameSync(hooks, join(host.skillHome.home, "moved-pre"));
-      symlinkSync(outside, hooks);
-      const result = await resolve(host, [removed(approval)]);
-      expect(failures(result)).toEqual([expect.stringContaining("no longer resolves")]);
-      expect(existsSync(host.ledgerFile)).toBe(false);
-    });
-
-    it("records an approved removal only once the file is gone, and a hand-written hook's without a prior applied record", async () => {
-      const host = loadExtension();
-      const file = handWritten(host, "global-hooks");
-      const { proposal, approval } = await askIntent(host, removal("global-hooks", "mine.ts"));
-      const early = await resolve(host, [removed(approval)]);
-      expect(failures(early)).toEqual([expect.stringContaining("still there")]);
-      expect(readFileSync(file, "utf8")).toBe(handText);
-      expect(existsSync(host.ledgerFile)).toBe(false);
-
-      rmSync(file);
-      const result = await resolve(host, [removed(approval)]);
-      expect(failures(result)).toEqual([]);
-      expect(resultText(result)).toContain(`- withdrawn \`mine.ts\` (global hook), fingerprint \`${proposal.fingerprint}\`: Remove the misfiring hook`);
-      expect(ledgerRecords(host.ledgerFile)).toEqual([expect.objectContaining({
-        kind: "harness", outcome: "withdrawn", fingerprint: proposal.fingerprint, target: expect.objectContaining({ root: "global-hooks", path: "mine.ts" }),
-      })]);
-    });
-
-    it("records removing an observer hook as a withdrawal of its applied record", async () => {
-      const host = loadExtension();
-      const { proposal, approval: intentApproval } = await askIntent(host, intent("project-hooks", "Block git commit here"));
-      const file = `skill-observer-${proposal.fingerprint}.ts`;
-      const { approval: codeApproval } = await askCode(host, code("project-hooks", "Block git commit here", intentApproval, [{ path: file, text: hookText }]));
-      const receipts = publish(host, join(projectHooks(host), file), hookText, projectHooks(host));
-      expect(failures(await resolve(host, [applied(codeApproval, { ...receipts, files: [{ path: file, afterHash: sha(hookText) }] })]))).toEqual([]);
-
-      const { approval } = await askIntent(host, removal("project-hooks", file));
-      rmSync(join(projectHooks(host), file));
-      const result = await resolve(host, [removed(approval)]);
-      expect(failures(result)).toEqual([]);
-      expect(resultText(result)).toContain(`- withdrawn \`${file}\` (project hook), fingerprint \`${proposal.fingerprint}\`: Block git commit here`);
-      expect(ledgerRecords(host.ledgerFile).map(({ fingerprint, outcome }) => [fingerprint, outcome])).toEqual([[proposal.fingerprint, "withdrawn"]]);
-      await host.runCommand("observe", "Is the hook gone?");
-      expect(String(host.sent.at(-1)?.message.content)).not.toContain("### Remedy outcomes");
-    });
-
-    it("leaves a declined removal's file and does not offer it again, while a change to the same hook is still offered", async () => {
-      const host = loadExtension();
-      const file = handWritten(host, "global-hooks");
-      const { approval } = await askIntent(host, removal("global-hooks", "mine.ts"), () => "Decline");
-      expect(failures(await resolve(host, [{ kind: "harness", proposal: approval.proposal, outcome: "declined" }]))).toEqual([]);
-      expect(readFileSync(file, "utf8")).toBe(handText);
-      startPass(host);
-      const again = await host.callTool("observer_review", { action: "prepare", candidates: [removal("global-hooks", "mine.ts", "Remove it after all")] });
-      expect(reviewEntries(again)).toEqual([]);
-      const change = await host.callTool("observer_review", { action: "prepare", candidates: [intent("global-hooks", "Fix my hand-written hook", { path: "mine.ts" })] });
-      expect(reviewEntries(change).map(({ proposal: { gist } }) => gist)).toEqual(["Fix my hand-written hook"]);
-    });
-  });
 });
 
 describe("/observe with answers from earlier passes", () => {
@@ -7119,10 +7219,10 @@ describe("evidence-gated instructions", () => {
 });
 
 describe("error-path guidance in tool results", () => {
-  const CONDITIONS: readonly ToolResultCondition[] = ["changed-target", "ledger-recording-failed", "cleanup-failed", "custom-input", "approval-note"];
-  /** Each `## What to do now` section of `text`, as the conditions whose guidance paragraphs it holds, in order; any other paragraph stays text. */
-  const whatToDoNow = (text: string) => text.split("\n## What to do now\n\n").slice(1)
-    .map((section) => section.split("\n\n").map((paragraph) => CONDITIONS.find((condition) => toolResultGuidance(condition) === paragraph) ?? paragraph));
+  function expectGuidance(text: string, sections: ToolResultCondition[][]) {
+    expect(text.split("\n## What to do now\n\n").slice(1))
+      .toEqual(sections.map((conditions) => conditions.map(toolResultGuidance).join("\n\n")));
+  }
 
   it.each<[string, number, (host: ReturnType<typeof loadExtension>) => Promise<Record<string, unknown>>]>([
     ["two on-read appends", 2, async (host) => {
@@ -7142,7 +7242,7 @@ describe("error-path guidance in tool results", () => {
     const host = loadExtension();
     const result = await host.callTool("observer_resolve", await changed(host));
     expect(failures(result)).toEqual(Array.from({ length: refused }, () => expect.stringContaining("changed since Prepare")));
-    expect(whatToDoNow(resultText(result))).toEqual([["changed-target"]]);
+    expectGuidance(resultText(result), [["changed-target"]]);
   });
 
   it("adds no guidance to a clean resolve, nor to a refusal whose target did not change", async () => {
@@ -7151,7 +7251,8 @@ describe("error-path guidance in tool results", () => {
     const declined = await approveOnRead(host, [{ gist: "A red is an assertion diff.", section: RED }], () => "Decline");
     const refused = await resolve(host, declined);
     expect(failures(refused)).toEqual([expect.stringContaining("selected `Decline`")]);
-    expect([whatToDoNow(resultText(clean)), whatToDoNow(resultText(refused))]).toEqual([[], []]);
+    expectGuidance(resultText(clean), []);
+    expectGuidance(resultText(refused), []);
   });
 
   it.each<[string, string[], ToolResultCondition[][], boolean?, string?]>([
@@ -7172,7 +7273,7 @@ describe("error-path guidance in tool results", () => {
       ...(note && { notes: [{ name: "proposal:0", question: "Apply this change?", option: answers[0], value: `proposal:0=${answers[0]}`, text: note }] }) };
     const result = await host.toolResult({ toolName: "ask", toolCallId: "ask-answered", content: [{ type: "text", text: "User answers" }], details, isError: false });
     expect(result.content[0]).toEqual({ type: "text", text: "User answers" });
-    expect(whatToDoNow(result.content.map((block) => block.text).join("\n"))).toEqual(expected);
+    expectGuidance(result.content.map((block) => block.text).join("\n"), expected);
   });
 });
 

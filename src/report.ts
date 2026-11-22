@@ -50,7 +50,7 @@ export function evidenceReport({ digest, ledger, stale, observations, catalog }:
   const loaded = new Set(digest.skills.map((skill) => skill.name));
   // Later records win, as in remedyOutcomes, so each outcome names its own record's target.
   const targets = new Map(ledger.map((record) => [record.fingerprint,
-    record.kind === "project" ? record.target.path : record.kind === "harness" ? targetLabel(record) : record.skill]));
+    record.kind === "project" ? record.target.path : record.target ? targetLabel(record) : record.skill]));
   return {
     signals,
     dropped: droppedSignalCount(digest),

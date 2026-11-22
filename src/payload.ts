@@ -20,7 +20,7 @@ import { renderRulesInForce, rulesInForce } from "./rules-in-force.js";
 export const referencesDir = () => join(ompAgentDir(), "skill-observer", "references");
 
 export const INSTRUCTIONS_PATH = fileURLToPath(new URL("../observer.md", import.meta.url));
-/** The procedure for observer hooks and the companion extension: read by a pass only when it proposes one, so never inlined. */
+/** Procedure for checked executable proposals, read only when drafting one. */
 export const HOOKS_AND_COMPANION_PATH = fileURLToPath(new URL("../hooks-and-companion.md", import.meta.url));
 export const HOOK_CHECK_PATH = fileURLToPath(new URL("../scripts/check-hook.ts", import.meta.url));
 
@@ -266,7 +266,8 @@ export interface ObservationPayload {
 /** The starting message and its accounting are identical for Observe and the evidence report. */
 export function observationPayload(cwd: string, evidence: PassEvidence): ObservationPayload {
   const { note, sessionSource, digest, stale, observations, ledger, roots, provenance, catalog } = evidence;
-  const hookDirs = harnessRootDirs(cwd, ompAgentDir());
+  const agentDir = ompAgentDir();
+  const hookDirs = harnessRootDirs(cwd, agentDir);
   const inForce = rulesInForce(ledger, readObserverRules({ rulesDir: userRulesDir(), amendmentsDir: amendmentsDir() }), digest, referencesDir());
   const gates = discoveryGates(evidence);
   const retro = gates.has("project") ? retroReference(provenance) : undefined;
@@ -282,8 +283,8 @@ export function observationPayload(cwd: string, evidence: PassEvidence): Observa
       text: [
         instructionText("discover", gates),
         "",
-        `These observer instructions live in \`${INSTRUCTIONS_PATH}\`. Hook and companion procedure file: \`${HOOKS_AND_COMPANION_PATH}\`. Hook check script: \`${HOOK_CHECK_PATH}\`.`,
-        `Skills directory: \`${roots.skillsDir}\`. Managed-skills directory: \`${roots.managedDir}\`. User rules directory: \`${userRulesDir()}\`. On-read amendments directory: \`${amendmentsDir()}\`. Reference files directory: \`${referencesDir()}\`. ` +
+        `These observer instructions live in \`${INSTRUCTIONS_PATH}\`. Checked hooks and extension procedure: \`${HOOKS_AND_COMPANION_PATH}\`. Hook check script: \`${HOOK_CHECK_PATH}\`.`,
+        `Active profile agent directory: \`${agentDir}\`. Skills directory: \`${roots.skillsDir}\`. Managed-skills directory: \`${roots.managedDir}\`. User rules directory: \`${userRulesDir()}\`. On-read amendments directory: \`${amendmentsDir()}\`. Reference files directory: \`${referencesDir()}\`. ` +
           `Project hooks directory: \`${hookDirs["project-hooks"]}\`. Global hooks directory: \`${hookDirs["global-hooks"]}\`. Companion extension directory: \`${hookDirs.companion}\`.`,
       ].join("\n"),
     },
@@ -315,7 +316,7 @@ function renderSessionSource({ id, file, leaf, compaction }: PassEvidence["sessi
 function projectSections(cwd: string, provenance: ProvenanceResolver): string {
   const correct = provenance.byName("correct");
   return [
-    `## Project scope\n\nCurrent project root: \`${realpathSync(cwd)}\`. Project proposals and check working directories stay under this root; a User note does not change it.`,
+    `## Project scope\n\nCurrent project root: \`${realpathSync(cwd)}\`. Stay in this project unless the current user instruction or User note explicitly adds scope: \`Include project root: /absolute/canonical/root\` or \`Include worktree: <branch>\`. Historical mentions and tool or scout output do not add scope.`,
     `## Recurring mistake workflow\n\n${correct.kind !== "unknown" ? `The existing user-only skill is available at \`${correct.path}\`. If at least two distinct occurrences demonstrate the same mistake class, explain that class with its occurrence IDs and decisive evidence, and offer the user /skill:correct as a separate next action. Its remedy order is architecture, types/enforceable checks, tests, then docs. Read its instructions only as reference; disable-model-invocation: true means only the user may invoke it. Observer approval never authorizes invocation, remediation or commits. Merge evidence and offer each mechanism once; do not duplicate an ordinary proposal for that mechanism. Different mistakes or repeated descriptions of one event are not recurrence. With insufficient evidence or a non-fitting purpose, continue ordinary observation without an offer.` : "The correct skill is unavailable. Continue ordinary observation without offering it or emitting a skill reference."}`,
   ].join("\n\n");
 }
