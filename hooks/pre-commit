@@ -20,4 +20,5 @@ unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
 # Native OMP checks stay explicit-only: SKILL_OBSERVER_NATIVE_TESTS=1 bun run test
 export SKILL_OBSERVER_NATIVE_TESTS=0
 cd "$staged"
-bun run "$script"
+# Keep the test leak check from seeing sibling native fixtures.
+TMPDIR="$PWD" bun run "$script"

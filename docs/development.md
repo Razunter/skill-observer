@@ -318,4 +318,6 @@ Do not pass `--no-extensions`: it also turns off hook discovery. The check shows
 
 Enable the bundled hooks in each clone with `git config core.hooksPath hooks`. `pre-commit` exports the staged files to a temp folder, links the clone's `node_modules` there, and runs `bun run check` (typecheck, then tests) on that export, so unstaged edits and untracked files neither block the commit nor reach the check. It sets `SKILL_OBSERVER_NATIVE_TESTS=0` so a `1` inherited from the shell cannot enable native OMP checks. Missing Bun/dependencies or a failing check blocks the commit. `commit-msg` refuses a subject without a conventional type, as in `fix: …` or `feat(scope): …`.
 
+The hook uses that export as its private `TMPDIR`. The leak check still detects fixture directories left outside the test run's directory, without counting fixtures from unrelated runs.
+
 For a handoff after staging your changes, run `hooks/pre-commit --typecheck` from the extension root. It typechecks the same staged export without running tests.
