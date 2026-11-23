@@ -61,7 +61,7 @@ let customEntryIds = 0;
  * available judge role unless `judge` is false. Given another host's
  * `skillHome`, it is a second session of the same agent dir and project.
  */
-function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; sessionId?: string; sessionFile?: string; allTools?: ExtensionAPI["getAllTools"]; systemPrompt?: string[]; onSend?: () => void; validateToolArguments?: boolean } = {}) {
+function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | "unknown"; judge?: boolean; skillHome?: ReturnType<typeof makeSkillHome>; sessionId?: string; sessionFile?: string; allTools?: ExtensionAPI["getAllTools"]; systemPrompt?: string[]; onSend?: () => void; validateToolArguments?: boolean; getCommands?: ExtensionAPI["getCommands"] } = {}) {
   const skillHome = options.skillHome ?? makeSkillHome();
   mkdirSync(skillHome.roots.cwd, { recursive: true });
   vi.stubEnv("HOME", skillHome.home);
@@ -93,6 +93,7 @@ function loadExtension(options: { hasUI?: boolean; agentKind?: "main" | "sub" | 
     setActiveTools: async (names) => {
       activeTools = [...names];
     },
+    getCommands: options.getCommands,
     sendMessage: (message, sendOptions) => {
       sent.push({ message, options: sendOptions });
       options.onSend?.();
@@ -8924,6 +8925,82 @@ describe("observer_review inspect and grounded repairs", () => {
   type Inspection = { skill: string; kind: string; sources: Array<{ role: string; path: string; status: string; sha256: string; lines: number; sections: string[] }>; referenceInventory: Array<{ path: string }> };
   const inspectionOf = (result: ToolResult<unknown>) => (result.details as { inspection?: Inspection }).inspection;
 
+  it.each([false, true])("inspects a checkout skill without a skill command, with a same-named profile copy present: %s", async (profileCopy) => {
+    const skillHome = makeSkillHome();
+    const skill = "verify-santehnica";
+    const folder = join(skillHome.roots.cwd, ".agents/skills", skill);
+    const filePath = join(folder, "SKILL.md");
+    writeSkill(folder, skill);
+    if (profileCopy) writeSkill(join(skillHome.roots.skillsDir, skill), skill);
+    const host = loadExtension({ skillHome });
+    startPass(host);
+
+    const { result } = await inspect(host, { skill });
+
+    expect(failures(result)).toEqual([]);
+    expect(inspectionOf(result)).toMatchObject({
+      kind: "project", sources: [{ role: "skill", path: filePath, status: "active" }],
+    });
+  });
+
+  it("uses the current checkout's skill when a session command names a collision alias", async () => {
+    const skillHome = makeSkillHome();
+    const folder = join(skillHome.roots.cwd, ".agents/skills", GUIDE);
+    writeSkill(folder, GUIDE);
+    const host = loadExtension({
+      skillHome, getCommands: () => [{ name: `skill:agents/${GUIDE}`, source: "skill", path: join(folder, "SKILL.md") }],
+    });
+    startPass(host);
+
+    const { result } = await inspect(host, { skill: `agents/${GUIDE}` });
+
+    expect(inspectionOf(result)?.sources).toMatchObject([{ role: "skill", path: join(folder, "SKILL.md") }]);
+  });
+
+  it("does not inspect a project skill command whose file links to another checkout", async () => {
+    const skillHome = makeSkillHome();
+    const folder = join(skillHome.roots.cwd, ".agents/skills", GUIDE);
+    const foreign = join(skillHome.home, "other-project/.agents/skills", GUIDE);
+    writeSkill(foreign, GUIDE);
+    mkdirSync(folder, { recursive: true });
+    const path = join(folder, "SKILL.md");
+    symlinkSync(join(foreign, "SKILL.md"), path);
+    const host = loadExtension({ skillHome, getCommands: () => [{ name: `skill:${GUIDE}`, source: "skill", path }] });
+
+    const { result } = await inspect(host);
+
+    expect(result.isError).toBe(true);
+    expect(inspectionOf(result)).toBeUndefined();
+  });
+
+  it("inspects a project skill even if a same-named profile amendment is malformed", async () => {
+    const host = loadExtension();
+    installGuide(host);
+    const folder = join(host.skillHome.roots.cwd, ".agents/skills", GUIDE);
+    writeSkill(folder, GUIDE);
+    mkdirSync(host.amendmentsDir, { recursive: true });
+    writeFileSync(join(host.amendmentsDir, `${GUIDE}-amendment.md`), "Not an amendment.\n");
+    startPass(host);
+
+    const { result } = await inspect(host);
+
+    expect(failures(result)).toEqual([]);
+    expect(inspectionOf(result)?.sources).toMatchObject([{ role: "skill", path: join(folder, "SKILL.md") }]);
+  });
+
+  it("does not propose a new managed skill over a checkout skill omitted from the prompt", async () => {
+    const skillHome = makeSkillHome();
+    const folder = join(skillHome.roots.cwd, ".agents/skills", GUIDE);
+    const filePath = join(folder, "SKILL.md");
+    writeSkill(folder, GUIDE);
+    const host = loadExtension({ skillHome });
+    startPass(host);
+
+    const { result } = await inspect(host, { terms: ["Fixture skill"] });
+
+    expect(failures(result)).toEqual([expect.stringContaining(`a skill named \`${GUIDE}\` already exists (project \`${filePath}\`)`)]);
+  });
+
   it("reports each current guidance source with its status and fingerprint, a stale pin still active, and leaves unrequested references uninspected", async () => {
     const host = loadExtension();
     installGuide(host);
@@ -9525,6 +9602,7 @@ describe("observer_review new-skill search", () => {
     const receipt = searchOf(result)!;
     expect(receipt).toMatchObject({ skill: NEW, terms: ["Release Notes"], fingerprint: expect.stringMatching(/^[0-9a-f]{64}$/) });
     expect(receipt.coverage).toEqual([
+      { source: "project skill directories", path: roots.cwd, status: "absent" },
       { source: "skills directory", path: roots.skillsDir, status: "present" },
       { source: "managed skills", path: roots.managedDir, status: "present" },
       { source: "plugin registry", path: roots.pluginsRegistry, status: "present" },

@@ -383,6 +383,7 @@ export interface ExtensionAPI {
   getActiveTools(): string[];
   /** Every configured tool with its supplier, read from the host's registry at call time. */
   getAllTools(): ToolInfo[];
+  getCommands?(): Array<{ name: string; source: string; path?: string }>;
   setActiveTools(toolNames: string[]): Promise<void>;
   sendMessage(message: CustomMessage, options?: SendMessageOptions): void;
   /** Persists a `custom` entry on the session's current branch; the model never sees it. */

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 - 2026-11-23
+
+### Fixed
+
+- `/observe` can inspect project-local skills and recognizes them when checking for a duplicate managed skill. Edits use the existing project approval path.
+
 ## 0.4.0 - 2026-11-22
 
 ### Added

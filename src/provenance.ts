@@ -5,7 +5,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 
@@ -182,15 +182,57 @@ function listSkillFiles(root: string): string[] {
 
 export interface SourceCoverage { source: string; path: string; status: "present" | "absent" | "unavailable"; reason?: string }
 
-export interface ScannedSkill { provenance: InstalledProvenance; bytes: Buffer }
+export interface ProjectSkill {
+  kind: "project";
+  name: string;
+  path: string;
+}
+
+export function projectSkillByName(roots: SkillRoots, name: string, loadedPath: string | undefined): ProjectSkill | undefined {
+  const directories = projectSkillDirectories(roots);
+  if (loadedPath !== undefined) {
+    if (basename(loadedPath) !== "SKILL.md" || !directories.includes(dirname(dirname(loadedPath)))) return undefined;
+    if (!projectSkillFile(loadedPath)) throw new Error(`the project skill \`${name}\` does not point to a plain checkout file`);
+    return { kind: "project", name, path: loadedPath };
+  }
+  const matches = directories.flatMap((dir) => projectSkillFiles(dir).filter((path) => skillName(path) === name));
+  if (matches.length > 1) throw new Error(`more than one checkout skill is named \`${name}\`; read the exact SKILL.md before proposing a project edit`);
+  const [path] = matches;
+  return path === undefined ? undefined : { kind: "project", name, path };
+}
+
+function projectSkillDirectories({ cwd, home }: SkillRoots): string[] {
+  const start = resolve(cwd);
+  const roots: string[] = [];
+  for (let dir = start; dir !== home; dir = dirname(dir)) {
+    if (dirname(dir) === dir) {
+      roots.splice(1);
+      break;
+    }
+    roots.push(dir);
+    if (existsSync(join(dir, ".git"))) break;
+  }
+  return roots.flatMap((root) => [".omp", ".claude", ".agent", ".agents"].map((provider) => join(root, provider, "skills")));
+}
+
+function projectSkillFiles(dir: string): string[] {
+  if (!existsSync(dir) || !lstatSync(dir).isDirectory() || !lstatSync(dirname(dir)).isDirectory()) return [];
+  return skillFiles(dir).filter(projectSkillFile);
+}
+
+function projectSkillFile(path: string): boolean {
+  return lstatSync(path).isFile() && [dirname(path), dirname(dirname(path)), dirname(dirname(dirname(path)))]
+    .every((directory) => lstatSync(directory).isDirectory());
+}
+
+export interface ScannedSkill { provenance: InstalledProvenance | ProjectSkill; bytes: Buffer }
 
 export interface InstalledSkillScan { coverage: SourceCoverage[]; skills: ScannedSkill[] }
 
 /**
- * Every installed skill of the user's skills directory, the managed-skills
- * directory and each enabled plugin, with each source's coverage. Unlike the
- * resolver, which reads such a source as empty, a root or registry that exists
- * but can't be read is `unavailable`.
+ * The observer's searchable inventory includes conventional checkout skills,
+ * which do not belong to the profile publication resolver.
+ * A source that exists but can't be read is `unavailable`.
  */
 export function scanInstalledSkills(roots: SkillRoots): InstalledSkillScan {
   const coverage: SourceCoverage[] = [];
@@ -211,6 +253,17 @@ export function scanInstalledSkills(roots: SkillRoots): InstalledSkillScan {
       coverage.push({ source, path: root, status: "unavailable", reason: failure(error) });
     }
   };
+  const projectSource = { source: "project skill directories", path: roots.cwd };
+  try {
+    const files = projectSkillDirectories(roots).flatMap((dir) => projectSkillFiles(dir).sort());
+    skills.push(...files.map((path) => {
+      const bytes = readFileSync(path);
+      return { provenance: { kind: "project" as const, name: nameIn(path, bytes.toString("utf8")), path }, bytes };
+    }));
+    coverage.push({ ...projectSource, status: files.length ? "present" : "absent" });
+  } catch (error) {
+    coverage.push({ ...projectSource, status: "unavailable", reason: failure(error) });
+  }
   scan("skills directory", roots.skillsDir, inRoot);
   scan("managed skills", roots.managedDir, inRoot);
   const registry = { source: "plugin registry", path: roots.pluginsRegistry };

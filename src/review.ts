@@ -29,7 +29,7 @@ import { withdrawal } from "./on-read-amendment-transitions.js";
 import { APPLY, approvalShape, checkReconciliation, checkTarget, isReconcilable, observationPassStart, preparedInPass, type ProposalReconciliation, STALE_OPTIONS } from "./proposal-approval.js";
 import { DRAFT_RECORD_GATES, type Gate, instructionText } from "./payload.js";
 import {
-  createProvenanceResolver, defaultSkillRoots, type InstalledSkillScan, ompAgentDir, type ProvenanceResolver, scanInstalledSkills, skillHash, type SkillProvenance, type SkillRoots, type SourceCoverage,
+  createProvenanceResolver, defaultSkillRoots, type InstalledSkillScan, ompAgentDir, projectSkillByName, type ProvenanceResolver, scanInstalledSkills, skillHash, type SkillProvenance, type SkillRoots, type SourceCoverage,
 } from "./provenance.js";
 import { checkProjectState, prepareProjectEdit, type ProjectEdit } from "./project-publication.js";
 import { checkExecutableState, prepareExecutableEdit, type ExecutableEdit } from "./executable-publication.js";
@@ -83,7 +83,7 @@ export interface GuidanceSource {
 
 export interface GuidanceInspection {
   skill: string;
-  kind: Exclude<SkillProvenance["kind"], "unknown">;
+  kind: Exclude<SkillProvenance["kind"], "unknown"> | "project";
   sources: GuidanceSource[];
   /** The reference folder's files by path: membership only, since an unrequested body is never inspected. */
   referenceInventory: Array<{ path: string }>;
@@ -221,6 +221,7 @@ interface GuidanceContext {
   referencesDir: string;
   provenance: ProvenanceResolver;
   roots: SkillRoots;
+  skillCommandPath: (name: string) => string | undefined;
   branch: readonly SessionEntry[];
   systemPrompt?: string[];
 }
@@ -382,7 +383,7 @@ export function registerReviewTool(
       action: z.enum(["draft", "inspect", "catalog", "evidence", "source", "prepare", "select", "record"]),
       key: z.object({ skill: z.string().optional(), rule: z.string().optional(), fingerprint: z.string().optional() }).optional()
         .describe("Evidence: one exact skill name, rule name or proposal fingerprint."),
-      skill: z.string().optional().describe("Inspect only: the installed skill whose current guidance to read; with `terms`, the name of the proposed new skill. Catalog: the exact skill name to look up, instead of `terms`."),
+      skill: z.string().optional().describe("Inspect: the skill whose current guidance to read, including skills in the current checkout; with `terms`, the proposed new skill's name. Catalog: the exact skill name to look up, instead of `terms`."),
       references: z.array(z.string()).optional()
         .describe("Inspect only: file names in the skill's observer reference folder to read too; the others are only listed by fingerprint and are not inspected."),
       terms: z.array(z.string()).optional()
@@ -409,13 +410,13 @@ export function registerReviewTool(
         return { content: [{ type: "text", text: JSON.stringify(source) }], details: emptyDetails(), isError: passStart === undefined };
       }
       if (params?.action === "inspect" || params?.action === "catalog" || params?.action === "evidence") {
-        return readOnlyActionResult(params, files, ctx, catalogGap);
+        return readOnlyActionResult(params, files, ctx, pi, catalogGap);
       }
       const details = emptyDetails();
       const amendmentSections = new Map<string, string[]>();
       let next: string | undefined;
       try {
-        const guidance = receiptContext(ctx, files);
+        const guidance = receiptContext(ctx, files, pi);
         if (params?.action === "draft" || params?.action === "record") {
           if (!ctx.hasUI || ctx.agent?.kind === "sub" || guidance.passStart === undefined) {
             throw new Error("only the main agent in a current observation pass can request that procedure");
@@ -645,16 +646,17 @@ export function preparedProjectEntries(evidence: SessionToolEvidence, passStart:
   return [...entries.values()].reverse();
 }
 
-function guidanceContext(ctx: ExtensionContext, files: ObserverFiles): GuidanceContext {
+function guidanceContext(ctx: ExtensionContext, files: ObserverFiles, pi: ExtensionAPI): GuidanceContext {
   const roots = defaultSkillRoots(ctx.cwd);
   return {
     dirs: { rulesDir: files.rulesDir(), amendmentsDir: files.amendmentsDir() }, referencesDir: files.referencesDir(),
     provenance: createProvenanceResolver(roots), roots, branch: ctx.sessionManager.getBranch(), systemPrompt: ctx.getSystemPrompt?.(),
+    skillCommandPath: (name) => pi.getCommands?.().find((command) => command.source === "skill" && command.name === `skill:${name}`)?.path,
   };
 }
 
-function receiptContext(ctx: ExtensionContext, files: ObserverFiles): ReceiptContext {
-  const guidance = guidanceContext(ctx, files);
+function receiptContext(ctx: ExtensionContext, files: ObserverFiles, pi: ExtensionAPI): ReceiptContext {
+  const guidance = guidanceContext(ctx, files, pi);
   const evidence = sessionToolEvidence(guidance.branch);
   let inventory: SearchInventory | undefined;
   return {
@@ -665,7 +667,7 @@ function receiptContext(ctx: ExtensionContext, files: ObserverFiles): ReceiptCon
 
 const searchInventory = (roots: SkillRoots, evidence: SessionToolEvidence): SearchInventory => ({ installed: scanInstalledSkills(roots), created: createdSkills(evidence) });
 
-function readOnlyActionResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext, catalogGap: (branch: readonly SessionEntry[]) => string | undefined) {
+function readOnlyActionResult(params: ReviewParams, files: ObserverFiles, ctx: ExtensionContext, pi: ExtensionAPI, catalogGap: (branch: readonly SessionEntry[]) => string | undefined) {
   const details = emptyDetails();
   const ok = (text: string) => ({ content: [{ type: "text" as const, text }], details, isError: false });
   try {
@@ -682,12 +684,12 @@ function readOnlyActionResult(params: ReviewParams, files: ObserverFiles, ctx: E
     if (params.candidates !== undefined || params.proposals !== undefined) throw new Error("Inspect takes a `skill` and optional `references`, not candidates or proposal references");
     if (params.terms !== undefined) {
       if (params.references !== undefined) throw new Error("A new-skill search takes `skill` and `terms`; a new skill has no reference files yet");
-      const { roots, branch, systemPrompt } = guidanceContext(ctx, files);
-      const { search, text } = searchGuidance(params.skill, params.terms, () => searchInventory(roots, sessionToolEvidence(branch)), systemPrompt);
+      const context = guidanceContext(ctx, files, pi);
+      const { search, text } = searchGuidance(params.skill, params.terms, () => searchInventory(context.roots, sessionToolEvidence(context.branch)), context.systemPrompt);
       details.search = search;
       return ok(text);
     }
-    const { inspection, text } = inspectGuidance(params.skill, params.references, guidanceContext(ctx, files));
+    const { inspection, text } = inspectGuidance(params.skill, params.references, guidanceContext(ctx, files, pi));
     details.inspection = inspection;
     return ok(text);
   } catch (error) {
@@ -701,34 +703,40 @@ function inspectGuidance(skill: unknown, requested: unknown, context: GuidanceCo
   const { sources, referenceInventory } = inspection;
   const unread = referenceInventory.filter(({ path }) => !sources.some((source) => source.path === path)).map(({ path }) => `\`${basename(path)}\``);
   const text = [
-    `Current guidance of \`${inspection.skill}\` (${inspection.kind}). Cite this call's ID as the diagnosis \`inspection\`, and each source by its path with \`lines\` or a \`section\`.`,
-    `Reference folder \`${folder}\`: ${referenceInventory.length} file(s)${unread.length > 0 ? `; not inspected: ${unread.join(", ")}` : ""}.`,
+    inspection.kind === "project"
+      ? `Current guidance of \`${inspection.skill}\` (project). Propose changes to this file as a project edit when it is in scope, not as a profile skill repair.`
+      : `Current guidance of \`${inspection.skill}\` (${inspection.kind}). Cite this call's ID as the diagnosis \`inspection\`, and each source by its path with \`lines\` or a \`section\`.`,
+    ...(folder === undefined ? [] : [`Reference folder \`${folder}\`: ${referenceInventory.length} file(s)${unread.length > 0 ? `; not inspected: ${unread.join(", ")}` : ""}.`]),
     ...sources.map((source, i) => `\n### ${source.role} \`${source.path}\` (${source.status}, ${source.lines} lines)\n${sourceLines(texts[i]!).map((line, n) => `${n + 1}| ${line}`).join("\n")}`),
   ].join("\n");
   return { inspection, text };
 }
 
-function guidanceReceipt(skill: unknown, requested: unknown, { dirs, referencesDir, provenance }: Pick<GuidanceContext, "dirs" | "referencesDir" | "provenance">):
-  { inspection: GuidanceInspection; folder: string; texts: string[] } {
+function guidanceReceipt(skill: unknown, requested: unknown, { dirs, referencesDir, provenance, roots, skillCommandPath }: GuidanceContext):
+  { inspection: GuidanceInspection; folder?: string; texts: string[] } {
   if (typeof skill !== "string" || !skill.trim()) throw new Error("Inspect needs the `skill` whose guidance to read");
   if (requested !== undefined && (!Array.isArray(requested) || requested.some((name) => typeof name !== "string"))) {
     throw new Error("`references` lists file names in the skill's observer reference folder");
   }
   const names: string[] = requested ?? [];
   checkReferenceFiles(names.map((name) => ({ name, body: "" })));
-  const installed = provenance.byName(skill);
-  if (installed.kind === "unknown") throw new Error(`no installed skill is named \`${skill}\``);
-  const read: Array<{ source: GuidanceSource; text: string }> = [];
-  const skillBytes = readGuidance(installed.path);
-  if (!parseFrontmatter(skillBytes.toString("utf8"))) throw new Error(`\`${installed.path}\` has no frontmatter block, so its guidance can't be read as a skill`);
-  read.push(guidanceSource("skill", installed.path, "active", skillBytes));
+  const target = projectSkillByName(roots, skill, skillCommandPath(skill)) ?? provenance.byName(skill);
+  if (target.kind === "unknown") throw new Error(`no installed skill is named \`${skill}\``);
+  const skillBytes = readGuidance(target.path);
+  if (!parseFrontmatter(skillBytes.toString("utf8"))) throw new Error(`\`${target.path}\` has no frontmatter block, so its guidance can't be read as a skill`);
+  const entry = guidanceSource("skill", target.path, "active", skillBytes);
+  if (target.kind === "project") {
+    if (names.length > 0) throw new Error("Project skills do not have an observer reference folder; read references from the project instead");
+    return { inspection: { skill, kind: "project", sources: [entry.source], referenceInventory: [] }, texts: [entry.text] };
+  }
 
+  const read = [entry];
   const rules = readSkillRules(dirs, skill);
   const amendmentFile = join(dirs.amendmentsDir, `${skillAmendmentName(skill)}.md`);
   if (existsSync(amendmentFile) && !rules.some((rule) => rule.path === amendmentFile)) {
     throw new Error(`\`${amendmentFile}\` is not an on-read amendment skill-observer can read: its frontmatter is missing, malformed or another author's`);
   }
-  const pin = rules.some(isPinned) ? skillHash(installed) : undefined;
+  const pin = rules.some(isPinned) ? skillHash(target) : undefined;
   for (const rule of rules) read.push(guidanceSource("rule", rule.path, isPinned(rule) && rule.skillHash !== pin ? "stale" : "active", readGuidance(rule.path)));
 
   const folder = referenceFolder(referencesDir, skill);
@@ -740,7 +748,7 @@ function guidanceReceipt(skill: unknown, requested: unknown, { dirs, referencesD
     if (!path) throw new Error(`the requested reference file \`${name}\` is not in \`${folder}\``);
     read.push(guidanceSource("reference", path, "active", readGuidance(path)));
   }
-  const inspection = { skill, kind: installed.kind, sources: read.map(({ source }) => source), referenceInventory: inventory.map((path) => ({ path })) };
+  const inspection = { skill, kind: target.kind, sources: read.map(({ source }) => source), referenceInventory: inventory.map((path) => ({ path })) };
   return { inspection, folder, texts: read.map(({ text }) => text) };
 }
 
@@ -1128,6 +1136,7 @@ function candidateDiagnosis({ skill, kind, diagnosis: draft }: ReviewCandidate &
   }
   const receipt = inspectionReceipt(inspection, context);
   if (receipt.skill !== skill) throw new Error(`inspection \`${inspection}\` read \`${receipt.skill}\`, not \`${skill}\`: inspect \`${skill}\` and cite that receipt`);
+  if (receipt.kind === "project") throw new Error(`inspection \`${inspection}\` read the project skill \`${skill}\`: propose a project edit, not a profile skill repair`);
   if (receipt.kind !== kind) {
     const owner = isPinKind(receipt.kind) ? ", whose fixes are amendment rules, never a direct edit" : "";
     throw new Error(`inspection \`${inspection}\` read \`${skill}\` as a ${receipt.kind} skill, not ${kind}: propose it as the ${receipt.kind} skill it is${owner}`);
